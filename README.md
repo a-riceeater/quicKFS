@@ -19,7 +19,7 @@ cargo run -p quickfs-server-daemon -- serve --bind 127.0.0.1:4433 --export-root 
 cargo run -p quickfs-client-cli -- --server 127.0.0.1:4433 --cert ./certs/server.crt --token development-token list /
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [the roadmap](docs/roadmap.md).
+Start with the [setup guide](docs/setup.md) and [command reference](docs/usage.md). The [documentation index](docs/README.md) links architecture, development, protocol, troubleshooting, security, and roadmap material. Contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 > **Security warning:** this is an experimental prototype. The development token scheme is not production authentication. Do not expose it to the public Internet.
 
