@@ -1,0 +1,16 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+body:
+  - type: textarea
+    id: description
+    attributes: { label: Description }
+    validations: { required: true }
+  - type: textarea
+    id: reproduction
+    attributes: { label: Reproduction steps }
+    validations: { required: true }
+  - type: input
+    id: environment
+    attributes: { label: OS and Rust version }
+    validations: { required: true }
+

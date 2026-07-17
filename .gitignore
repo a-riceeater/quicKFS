@@ -1,0 +1,5 @@
+/target/
+/certs/
+.DS_Store
+*.log
+/a.md

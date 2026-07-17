@@ -1,0 +1,16 @@
+[package]
+name="quickfs-client-cli"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+publish.workspace=true
+[dependencies]
+anyhow.workspace=true
+clap.workspace=true
+tokio.workspace=true
+quickfs-client-core={path="../../../crates/client-core"}
+quickfs-protocol={path="../../../crates/protocol"}
+quickfs-transport-quic={path="../../../crates/transport-quic"}
+[lints]
+workspace=true
+

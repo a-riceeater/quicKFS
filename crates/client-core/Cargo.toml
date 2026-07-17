@@ -1,0 +1,15 @@
+[package]
+name="quickfs-client-core"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+publish.workspace=true
+[dependencies]
+async-trait.workspace=true
+thiserror.workspace=true
+tokio.workspace=true
+quickfs-protocol={path="../protocol"}
+quickfs-transport-quic={path="../transport-quic"}
+[lints]
+workspace=true
+

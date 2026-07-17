@@ -1,0 +1,17 @@
+[package]
+name="quickfs-transport-quic"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+publish.workspace=true
+[dependencies]
+bytes.workspace=true
+quinn.workspace=true
+rustls.workspace=true
+rustls-pemfile.workspace=true
+serde.workspace=true
+thiserror.workspace=true
+tokio.workspace=true
+quickfs-protocol={path="../protocol"}
+[lints]
+workspace=true
