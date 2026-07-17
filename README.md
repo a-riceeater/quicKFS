@@ -10,7 +10,7 @@ Implemented: authenticated sessions with a development token, metadata, director
 
 ## Build and run
 
-Requires the current stable Rust toolchain (Rust 2024 edition).
+Requires Rust 1.85 or newer (Rust 2024 edition). The repository's rustup toolchain file selects current stable Rust.
 
 ```sh
 cargo build --workspace
@@ -19,7 +19,7 @@ cargo run -p quickfs-server-daemon -- serve --bind 127.0.0.1:4433 --export-root 
 cargo run -p quickfs-client-cli -- --server 127.0.0.1:4433 --cert ./certs/server.crt --token development-token list /
 ```
 
-Start with the [setup guide](docs/setup.md) and [command reference](docs/usage.md). The [documentation index](docs/README.md) links architecture, development, protocol, troubleshooting, security, and roadmap material. Contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
+Start with the [setup guide](docs/setup.md), [command reference](docs/usage.md), and [authentication explanation](docs/authentication.md). The [documentation index](docs/README.md) links architecture, development, protocol, troubleshooting, security, and roadmap material. Contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 > **Security warning:** this is an experimental prototype. The development token scheme is not production authentication. Do not expose it to the public Internet.
 

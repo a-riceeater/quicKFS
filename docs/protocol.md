@@ -6,3 +6,4 @@ Requests: `Hello`, `Authenticate`, `GetMetadata`, `ListDirectory`, `OpenFile`, `
 
 Except for hello, authentication, and ping, operations require successful authentication. Nodes and handles are opaque UUIDs. `ReadRange` supplies handle, offset, and length. `ReadData` supplies actual length and file revision, followed immediately by that many raw stream bytes. Reads are bounded and may be shorter at EOF. Checksums and notifications are reserved for later versions.
 
+TLS server authentication occurs before application protocol messages. The current application authentication request carries one shared development token over the established encrypted connection. This token model does not provide usernames or per-user authorization. See [Authentication and server trust](authentication.md).

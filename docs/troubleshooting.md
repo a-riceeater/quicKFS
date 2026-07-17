@@ -89,6 +89,34 @@ Native mounting is not implemented in the current repository. `clients/macos/fil
 
 ## Build or test failures
 
+### `feature edition2024 is required`
+
+The project uses the stable Rust 2024 edition and requires Rust/Cargo 1.85 or newer. This error commonly occurs when Linux invokes an older Cargo package supplied by the distribution, such as Cargo 1.75.
+
+Do not add `cargo-features = ["edition2024"]` to the manifests. That suggestion applies to Cargo versions from before the edition was stabilized and would not make the project build correctly on stable Cargo 1.75.
+
+Install or update the rustup-managed stable toolchain:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup update stable
+rustup show active-toolchain
+rustc --version
+cargo --version
+cargo build --workspace
+```
+
+If `cargo --version` still reports the old version:
+
+```sh
+command -v cargo
+```
+
+Ensure `$HOME/.cargo/bin` precedes `/usr/bin` in `PATH`, then open a new shell or source `$HOME/.cargo/env` again. The repository's `rust-toolchain.toml` is honored only when Cargo is launched through rustup's proxy.
+
+### Other build failures
+
 Verify that rustup is honoring the repository toolchain:
 
 ```sh
@@ -106,4 +134,3 @@ cargo doc --workspace --no-deps
 ```
 
 When reporting a problem, include the failing command, operating system, Rust version, and sanitized logs.
-

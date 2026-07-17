@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use quickfs_common::{DEFAULT_MAX_READ_SIZE, Limits, init_logging};
 use quickfs_protocol::*;
@@ -52,9 +52,12 @@ async fn main() -> Result<()> {
     }
 }
 async fn serve(c: Serve) -> Result<()> {
-    let cert = load_certificate(&c.cert)?;
-    let key = load_private_key(&c.key)?;
-    let endpoint = server_endpoint(c.bind, cert, key)?;
+    validate_configuration(&c)?;
+
+    let cert = load_certificate(&c.cert)
+        .with_context(|| format!("failed to load certificate '{}'", c.cert.display()))?;
+    let key = load_private_key(&c.key)
+        .with_context(|| format!("failed to load private key '{}'", c.key.display()))?;
     let export = Arc::new(
         Export::new(
             &c.export_root,
@@ -64,11 +67,26 @@ async fn serve(c: Serve) -> Result<()> {
                 request_timeout_ms: c.request_timeout_ms,
             },
         )
-        .await?,
+        .await
+        .with_context(|| {
+            format!(
+                "failed to open export root '{}'; ensure it exists, is a directory, and is readable",
+                c.export_root.display()
+            )
+        })?,
     );
+    let endpoint = server_endpoint(c.bind, cert, key).with_context(|| {
+        format!(
+            "failed to configure TLS or bind the QUIC server to '{}'",
+            c.bind
+        )
+    })?;
     let token = Arc::new(c.token);
     let permits = Arc::new(Semaphore::new(c.max_concurrent_requests));
-    tracing::info!(address=%endpoint.local_addr()?,root=%c.export_root.display(),"server listening");
+    let local_address = endpoint
+        .local_addr()
+        .context("failed to determine the bound server address")?;
+    tracing::info!(address=%local_address,root=%c.export_root.display(),"server listening");
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
@@ -103,6 +121,25 @@ async fn serve(c: Serve) -> Result<()> {
                 break;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_configuration(c: &Serve) -> Result<()> {
+    if c.token.is_empty() {
+        bail!("development token must not be empty");
+    }
+    if c.max_read_size == 0 {
+        bail!("maximum read size must be greater than zero");
+    }
+    if c.max_open_handles == 0 {
+        bail!("maximum open handles must be greater than zero");
+    }
+    if c.request_timeout_ms == 0 {
+        bail!("request timeout must be greater than zero milliseconds");
+    }
+    if c.max_concurrent_requests == 0 {
+        bail!("maximum concurrent requests must be greater than zero");
     }
     Ok(())
 }

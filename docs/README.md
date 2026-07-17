@@ -4,6 +4,7 @@ quicKFS is currently an experimental read-only prototype. Start with the setup g
 
 - [Setup](setup.md): prerequisites, source build, certificates, and first local session.
 - [Usage and command reference](usage.md): server and client commands, environment variables, and operational behavior.
+- [Authentication and server trust](authentication.md): TLS certificates, private keys, development tokens, and connection authentication.
 - [Development](development.md): repository workflow, quality checks, and common development tasks.
 - [Troubleshooting](troubleshooting.md): TLS, connectivity, authentication, and filesystem errors.
 - [Protocol](protocol.md): version 1 wire format and request model.
@@ -14,4 +15,3 @@ quicKFS is currently an experimental read-only prototype. Start with the setup g
 - [Roadmap](roadmap.md): planned milestones.
 
 Native macFUSE mounting, write support, persistent caching, and production authentication are not yet implemented.
-

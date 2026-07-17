@@ -50,6 +50,8 @@ RUST_LOG=quickfs_server_daemon=debug quickfs-server-daemon serve
 
 Avoid putting real credentials in shell history. The token mechanism is only a development placeholder. Optional TOML configuration is planned but not currently implemented.
 
+The certificate and token are not interchangeable: certificate verification authenticates the server, while the token authenticates the client. See [Authentication and server trust](authentication.md).
+
 ## Client global options
 
 ```text
@@ -167,4 +169,3 @@ Logs should not contain tokens or file contents. Remove sensitive addresses and 
 - Server reads are bounded but currently buffered before being sent.
 - The development token is not production authentication.
 - Do not expose the prototype directly to the public Internet.
-

@@ -7,10 +7,25 @@ This guide creates a local Linux or macOS development session. The server is int
 Install:
 
 - Git;
-- the current stable Rust toolchain, including Cargo, rustfmt, and Clippy;
+- Rust 1.85 or newer, including Cargo, rustfmt, and Clippy;
 - OpenSSL, used by the development certificate script.
 
-The repository's `rust-toolchain.toml` selects stable Rust and installs rustfmt and Clippy automatically through rustup.
+Rust 1.85 is the minimum because it is the first stable release supporting the Rust 2024 edition. The repository's `rust-toolchain.toml` selects current stable Rust and installs rustfmt and Clippy automatically through rustup.
+
+On Linux, distribution packages can provide an older compiler even on a current operating system. The recommended installation is rustup:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup toolchain install stable --component rustfmt --component clippy
+```
+
+If rustup is already installed, update stable and let the repository override select it:
+
+```sh
+rustup update stable
+rustup show active-toolchain
+```
 
 Verify the tools:
 
@@ -19,6 +34,14 @@ rustc --version
 cargo --version
 openssl version
 ```
+
+Both `rustc` and `cargo` must report version 1.85 or newer. If Cargo still reports an older distribution version, verify which executable the shell finds:
+
+```sh
+command -v cargo
+```
+
+With rustup installed and its environment loaded, this normally reports `$HOME/.cargo/bin/cargo`.
 
 macFUSE is not needed for the CLI workflow. Native mounting is not implemented yet, so installing macFUSE does not enable a mount command in the current version.
 
@@ -71,6 +94,8 @@ certs/server.key
 ```
 
 The certificate is valid for `localhost` and `127.0.0.1` for 30 days. It is for local development only. The private key is ignored by Git and should not be shared.
+
+The client needs a copy of `server.crt`, which is public, but must never receive `server.key`, which is secret. The certificate authenticates the server to the client; the development token separately authenticates the client to the server. See [Authentication and server trust](authentication.md) for the complete flow.
 
 If the certificate expires or the hostname changes, regenerate it. The current script always creates a localhost certificate; certificates for remote hosts must contain the actual DNS name or IP address in their subject alternative names.
 
@@ -135,4 +160,3 @@ Run all local quality checks:
 This checks formatting, runs strict Clippy, executes workspace tests, and builds the Rust documentation.
 
 Continue with the [usage and command reference](usage.md) for remote-server examples and every supported option.
-
