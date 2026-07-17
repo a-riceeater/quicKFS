@@ -8,8 +8,10 @@ publish.workspace=true
 async-trait.workspace=true
 thiserror.workspace=true
 tokio.workspace=true
+getrandom = "0.4"
+uuid.workspace=true
+quickfs-auth={path="../auth"}
 quickfs-protocol={path="../protocol"}
 quickfs-transport-quic={path="../transport-quic"}
 [lints]
 workspace=true
-

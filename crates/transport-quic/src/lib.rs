@@ -3,8 +3,9 @@
 use quickfs_protocol::{CodecError, MAX_FRAME_SIZE, decode, encode};
 use quinn::{Connection, Endpoint};
 pub use quinn::{RecvStream, SendStream};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use serde::{Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::BufReader,
@@ -13,6 +14,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zeroize::Zeroize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -73,6 +75,71 @@ impl QuicClient {
             timeout,
         })
     }
+
+    pub async fn connect_pinned(
+        server: SocketAddr,
+        server_name: &str,
+        fingerprint: [u8; 32],
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        Self::connect_with_verifier(server, server_name, Some(fingerprint), timeout).await
+    }
+
+    /// Opens a connection that accepts the presented certificate only so an
+    /// authenticated pairing proof can bind it to an out-of-band secret.
+    /// Callers must not send credentials or filesystem requests on this mode.
+    pub async fn connect_for_pairing(
+        server: SocketAddr,
+        server_name: &str,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        Self::connect_with_verifier(server, server_name, None, timeout).await
+    }
+
+    async fn connect_with_verifier(
+        server: SocketAddr,
+        server_name: &str,
+        fingerprint: Option<[u8; 32]>,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        install_crypto_provider();
+        let verifier = FingerprintVerifier::new(fingerprint);
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        let config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+                .map_err(|error| TransportError::Tls(error.to_string()))?,
+        ));
+        let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))?;
+        endpoint.set_default_client_config(config);
+        let connecting = endpoint
+            .connect(server, server_name)
+            .map_err(|error| TransportError::Tls(error.to_string()))?;
+        let connection = tokio::time::timeout(timeout, connecting)
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+        Ok(Self {
+            endpoint,
+            connection,
+            timeout,
+        })
+    }
+
+    pub fn peer_certificate_fingerprint(&self) -> Result<[u8; 32], TransportError> {
+        let identity = self
+            .connection
+            .peer_identity()
+            .ok_or_else(|| TransportError::Tls("server did not present a certificate".into()))?;
+        let certificates = identity
+            .downcast::<Vec<CertificateDer<'static>>>()
+            .map_err(|_| TransportError::Tls("unexpected server identity type".into()))?;
+        let certificate = certificates
+            .first()
+            .ok_or_else(|| TransportError::Tls("server certificate chain is empty".into()))?;
+        Ok(Sha256::digest(certificate.as_ref()).into())
+    }
     pub async fn stream(&self) -> Result<(SendStream, RecvStream), TransportError> {
         Ok(
             tokio::time::timeout(self.timeout, self.connection.open_bi())
@@ -86,6 +153,76 @@ impl QuicClient {
     pub fn close(&self) {
         self.connection.close(0u32.into(), b"client shutdown");
         let _ = &self.endpoint;
+    }
+}
+
+#[derive(Debug)]
+struct FingerprintVerifier {
+    expected: Option<[u8; 32]>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl FingerprintVerifier {
+    fn new(expected: Option<[u8; 32]>) -> Arc<Self> {
+        Arc::new(Self {
+            expected,
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        })
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(expected) = self.expected {
+            let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+            if actual != expected {
+                return Err(rustls::Error::General(
+                    "server certificate does not match the pinned identity".into(),
+                ));
+            }
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 pub fn server_endpoint(
@@ -118,9 +255,10 @@ pub async fn write_frame<T: Serialize>(
     send: &mut SendStream,
     value: &T,
 ) -> Result<(), TransportError> {
-    let data = encode(value)?;
+    let mut data = encode(value)?;
     send.write_all(&(data.len() as u32).to_be_bytes()).await?;
     send.write_all(&data).await?;
+    data.zeroize();
     Ok(())
 }
 pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, TransportError> {

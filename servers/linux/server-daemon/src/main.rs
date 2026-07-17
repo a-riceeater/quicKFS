@@ -2,6 +2,10 @@
 #![forbid(unsafe_code)]
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use quickfs_auth::{
+    StatePaths, add_user, certificate_fingerprint, change_password, consume_pairing,
+    create_pairing, initialize, load_pairing, remove_user, set_user_enabled, verify_user,
+};
 use quickfs_common::{DEFAULT_MAX_READ_SIZE, Limits, init_logging};
 use quickfs_protocol::*;
 use quickfs_server_core::Export;
@@ -9,8 +13,9 @@ use quickfs_transport_quic::{
     RecvStream, SendStream, load_certificate, load_private_key, read_frame, server_endpoint,
     write_frame,
 };
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
+use zeroize::Zeroize;
 
 #[derive(Parser)]
 #[command(name = "server-daemon")]
@@ -21,6 +26,71 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve(Serve),
+    /// Create persistent server identity and authentication state.
+    Init(Init),
+    /// Manage user accounts.
+    User(UserCommand),
+    /// Manage one-time client pairing sessions.
+    Pair(PairCommand),
+}
+
+#[derive(clap::Args)]
+struct Init {
+    #[arg(long, default_value = ".quickfs")]
+    state_dir: PathBuf,
+    #[arg(long = "server-name", required = true)]
+    server_names: Vec<String>,
+}
+
+#[derive(clap::Args)]
+struct UserCommand {
+    #[command(subcommand)]
+    command: UserSubcommand,
+}
+
+#[derive(Subcommand)]
+enum UserSubcommand {
+    Add {
+        #[arg(long, default_value = ".quickfs")]
+        state_dir: PathBuf,
+        username: String,
+    },
+    Password {
+        #[arg(long, default_value = ".quickfs")]
+        state_dir: PathBuf,
+        username: String,
+    },
+    Enable {
+        #[arg(long, default_value = ".quickfs")]
+        state_dir: PathBuf,
+        username: String,
+    },
+    Disable {
+        #[arg(long, default_value = ".quickfs")]
+        state_dir: PathBuf,
+        username: String,
+    },
+    Delete {
+        #[arg(long, default_value = ".quickfs")]
+        state_dir: PathBuf,
+        username: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct PairCommand {
+    #[command(subcommand)]
+    command: PairSubcommand,
+}
+
+#[derive(Subcommand)]
+enum PairSubcommand {
+    Create {
+        #[arg(long, default_value = ".quickfs")]
+        state_dir: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        expires_seconds: u64,
+    },
 }
 #[derive(clap::Args, Clone)]
 struct Serve {
@@ -28,12 +98,8 @@ struct Serve {
     bind: SocketAddr,
     #[arg(long, env = "QUICKFS_EXPORT_ROOT")]
     export_root: PathBuf,
-    #[arg(long, env = "QUICKFS_CERT")]
-    cert: PathBuf,
-    #[arg(long, env = "QUICKFS_KEY")]
-    key: PathBuf,
-    #[arg(long, env = "QUICKFS_TOKEN")]
-    token: String,
+    #[arg(long, env = "QUICKFS_STATE_DIR", default_value = ".quickfs")]
+    state_dir: PathBuf,
     #[arg(long,default_value_t=DEFAULT_MAX_READ_SIZE)]
     max_read_size: u64,
     #[arg(long, default_value_t = 1024)]
@@ -49,15 +115,124 @@ async fn main() -> Result<()> {
     let Cli { command } = Cli::parse();
     match command {
         Command::Serve(c) => serve(c).await,
+        Command::Init(c) => init(c),
+        Command::User(c) => manage_user(c),
+        Command::Pair(c) => manage_pairing(c),
     }
 }
+
+fn init(command: Init) -> Result<()> {
+    let paths = initialize(&command.state_dir, command.server_names)
+        .with_context(|| format!("failed to initialize '{}'", command.state_dir.display()))?;
+    println!("Initialized quicKFS server state:");
+    println!("  certificate: {}", paths.certificate.display());
+    println!("  private key: {}", paths.private_key.display());
+    println!("Next, add a user with `server-daemon user add <USERNAME>`.");
+    Ok(())
+}
+
+fn manage_user(command: UserCommand) -> Result<()> {
+    match command.command {
+        UserSubcommand::Add {
+            state_dir,
+            username,
+        } => {
+            let mut password = prompt_new_password()?;
+            add_user(&state_dir, &username, password.as_bytes())
+                .with_context(|| format!("failed to add user '{username}'"))?;
+            password.zeroize();
+            println!("Added user '{username}'.");
+            Ok(())
+        }
+        UserSubcommand::Password {
+            state_dir,
+            username,
+        } => {
+            let mut password = prompt_new_password()?;
+            change_password(&state_dir, &username, password.as_bytes())
+                .with_context(|| format!("failed to change password for '{username}'"))?;
+            password.zeroize();
+            println!("Changed password for '{username}'.");
+            Ok(())
+        }
+        UserSubcommand::Enable {
+            state_dir,
+            username,
+        } => {
+            set_user_enabled(&state_dir, &username, true)?;
+            println!("Enabled user '{username}'.");
+            Ok(())
+        }
+        UserSubcommand::Disable {
+            state_dir,
+            username,
+        } => {
+            set_user_enabled(&state_dir, &username, false)?;
+            println!(
+                "Disabled user '{username}'. Existing authenticated connections are not revoked."
+            );
+            Ok(())
+        }
+        UserSubcommand::Delete {
+            state_dir,
+            username,
+        } => {
+            remove_user(&state_dir, &username)?;
+            println!(
+                "Deleted user '{username}'. Existing authenticated connections are not revoked."
+            );
+            Ok(())
+        }
+    }
+}
+
+fn prompt_new_password() -> Result<String> {
+    let mut password = rpassword::prompt_password("Password: ")?;
+    let mut confirmation = rpassword::prompt_password("Confirm password: ")?;
+    if password != confirmation {
+        password.zeroize();
+        confirmation.zeroize();
+        bail!("passwords do not match");
+    }
+    confirmation.zeroize();
+    Ok(password)
+}
+
+fn manage_pairing(command: PairCommand) -> Result<()> {
+    match command.command {
+        PairSubcommand::Create {
+            state_dir,
+            expires_seconds,
+        } => {
+            let pairing = create_pairing(&state_dir, Duration::from_secs(expires_seconds))?;
+            println!("Pairing ID: {}", pairing.id);
+            println!("Pairing code: {}", pairing.code);
+            println!("Expires at Unix time: {}", pairing.expires_unix_seconds);
+            println!(
+                "The code is single-use. Transfer it to the client through a trusted channel."
+            );
+            Ok(())
+        }
+    }
+}
+
 async fn serve(c: Serve) -> Result<()> {
     validate_configuration(&c)?;
 
-    let cert = load_certificate(&c.cert)
-        .with_context(|| format!("failed to load certificate '{}'", c.cert.display()))?;
-    let key = load_private_key(&c.key)
-        .with_context(|| format!("failed to load private key '{}'", c.key.display()))?;
+    let state_paths = StatePaths::new(&c.state_dir);
+    let cert = load_certificate(&state_paths.certificate).with_context(|| {
+        format!(
+            "failed to load server identity '{}'; run `server-daemon init` first",
+            state_paths.certificate.display()
+        )
+    })?;
+    let fingerprint = certificate_fingerprint(cert.as_ref());
+    let key = load_private_key(&state_paths.private_key).with_context(|| {
+        format!(
+            "failed to load private key '{}'",
+            state_paths.private_key.display()
+        )
+    })?;
     let export = Arc::new(
         Export::new(
             &c.export_root,
@@ -81,7 +256,7 @@ async fn serve(c: Serve) -> Result<()> {
             c.bind
         )
     })?;
-    let token = Arc::new(c.token);
+    let auth_root = Arc::new(c.state_dir.clone());
     let permits = Arc::new(Semaphore::new(c.max_concurrent_requests));
     let local_address = endpoint
         .local_addr()
@@ -92,20 +267,20 @@ async fn serve(c: Serve) -> Result<()> {
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
                 let export = export.clone();
-                let token = token.clone();
+                let auth_root = auth_root.clone();
                 let permits = permits.clone();
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
-                            let authenticated = Arc::new(tokio::sync::RwLock::new(false));
+                            let auth_state = Arc::new(tokio::sync::RwLock::new(ConnectionAuth::default()));
                             while let Ok((send, recv)) = connection.accept_bi().await {
                                 let Ok(permit) = permits.clone().acquire_owned().await else { break };
                                 let export = export.clone();
-                                let token = token.clone();
-                                let authenticated = authenticated.clone();
+                                let auth_root = auth_root.clone();
+                                let auth_state = auth_state.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    if let Err(error) = handle(send, recv, export, &token, authenticated).await {
+                                    if let Err(error) = handle(send, recv, export, auth_root, fingerprint, auth_state).await {
                                         tracing::warn!(%error, "request failed");
                                     }
                                 });
@@ -126,9 +301,6 @@ async fn serve(c: Serve) -> Result<()> {
 }
 
 fn validate_configuration(c: &Serve) -> Result<()> {
-    if c.token.is_empty() {
-        bail!("development token must not be empty");
-    }
     if c.max_read_size == 0 {
         bail!("maximum read size must be greater than zero");
     }
@@ -143,12 +315,19 @@ fn validate_configuration(c: &Serve) -> Result<()> {
     }
     Ok(())
 }
+
+#[derive(Default)]
+struct ConnectionAuth {
+    authenticated: bool,
+    failed_attempts: u8,
+}
 async fn handle(
     mut send: SendStream,
     mut recv: RecvStream,
     export: Arc<Export>,
-    token: &str,
-    authenticated: Arc<tokio::sync::RwLock<bool>>,
+    auth_root: Arc<PathBuf>,
+    fingerprint: [u8; 32],
+    auth_state: Arc<tokio::sync::RwLock<ConnectionAuth>>,
 ) -> Result<()> {
     let request: Envelope<Request> = read_frame(&mut recv).await?;
     let id = request.request_id;
@@ -169,8 +348,11 @@ async fn handle(
     }
     let allowed = matches!(
         request.message,
-        Request::Hello { .. } | Request::Authenticate { .. } | Request::Ping { .. }
-    ) || *authenticated.read().await;
+        Request::Hello { .. }
+            | Request::Pair { .. }
+            | Request::Authenticate { .. }
+            | Request::Ping { .. }
+    ) || auth_state.read().await.authenticated;
     if !allowed {
         write_response(
             &mut send,
@@ -188,15 +370,77 @@ async fn handle(
         Request::Hello { .. } => Response::HelloAck {
             version: PROTOCOL_VERSION,
         },
-        Request::Authenticate { token: provided } => {
-            if provided == token {
-                *authenticated.write().await = true;
-                Response::AuthenticateAck
-            } else {
+        Request::Pair {
+            pairing_id,
+            client_nonce,
+        } => match load_pairing(&auth_root, pairing_id) {
+            Ok(secret) => match secret.proof(&fingerprint, &client_nonce) {
+                Ok(proof) => match consume_pairing(&auth_root, pairing_id) {
+                    Ok(()) => Response::PairingProof {
+                        certificate_fingerprint: fingerprint,
+                        proof,
+                    },
+                    Err(error) => Response::Error(ProtocolError {
+                        code: ErrorCode::Unauthenticated,
+                        message: error.to_string(),
+                    }),
+                },
+                Err(error) => Response::Error(ProtocolError {
+                    code: ErrorCode::Internal,
+                    message: error.to_string(),
+                }),
+            },
+            Err(error) => Response::Error(ProtocolError {
+                code: ErrorCode::Unauthenticated,
+                message: error.to_string(),
+            }),
+        },
+        Request::Authenticate {
+            username,
+            mut password,
+        } => {
+            let locked = auth_state.read().await.failed_attempts >= 5;
+            if locked {
+                password.zeroize();
                 Response::Error(ProtocolError {
                     code: ErrorCode::Unauthenticated,
-                    message: "invalid token".into(),
+                    message: "too many failed authentication attempts; reconnect to try again"
+                        .into(),
                 })
+            } else {
+                let root = auth_root.as_ref().clone();
+                let log_username = username.clone();
+                let mut password_bytes = password.as_bytes().to_vec();
+                password.zeroize();
+                let verified = tokio::task::spawn_blocking(move || {
+                    let result = verify_user(&root, &username, &password_bytes);
+                    password_bytes.zeroize();
+                    result
+                })
+                .await;
+                match verified {
+                    Ok(Ok(true)) => {
+                        auth_state.write().await.authenticated = true;
+                        tracing::info!(username = %log_username, "user authenticated");
+                        Response::AuthenticateAck
+                    }
+                    Ok(Ok(false)) => {
+                        auth_state.write().await.failed_attempts += 1;
+                        tracing::warn!(username = %log_username, "authentication failed");
+                        Response::Error(ProtocolError {
+                            code: ErrorCode::Unauthenticated,
+                            message: "invalid username or password".into(),
+                        })
+                    }
+                    Ok(Err(error)) => Response::Error(ProtocolError {
+                        code: ErrorCode::Internal,
+                        message: error.to_string(),
+                    }),
+                    Err(error) => Response::Error(ProtocolError {
+                        code: ErrorCode::Internal,
+                        message: format!("authentication task failed: {error}"),
+                    }),
+                }
             }
         }
         Request::Ping { nonce } => Response::Pong { nonce },

@@ -3,8 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const ROOT_NODE: NodeId = NodeId(Uuid::from_u128(0));
 
@@ -49,8 +50,13 @@ pub enum Request {
     Hello {
         client_name: String,
     },
+    Pair {
+        pairing_id: Uuid,
+        client_nonce: [u8; 32],
+    },
     Authenticate {
-        token: String,
+        username: String,
+        password: String,
     },
     GetMetadata {
         node: NodeId,
@@ -74,12 +80,24 @@ pub enum Request {
     },
 }
 
+impl Request {
+    pub fn clear_secrets(&mut self) {
+        if let Self::Authenticate { password, .. } = self {
+            password.zeroize();
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     HelloAck {
         version: u16,
     },
     AuthenticateAck,
+    PairingProof {
+        certificate_fingerprint: [u8; 32],
+        proof: [u8; 32],
+    },
     Metadata(Metadata),
     DirectoryListing {
         revision: DirectoryRevision,

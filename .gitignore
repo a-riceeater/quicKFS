@@ -1,5 +1,7 @@
 /target/
 /certs/
+/.quickfs/
+/.quickfs-client/
 .DS_Store
 *.log
 /a.md

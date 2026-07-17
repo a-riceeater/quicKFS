@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
 use async_trait::async_trait;
+use quickfs_auth::parse_pairing_code;
 use quickfs_protocol::*;
 use quickfs_transport_quic::{QuicClient, TransportError, read_frame, write_frame};
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -28,11 +30,19 @@ pub struct NetworkFilesystem {
     transport: Arc<QuicClient>,
 }
 impl NetworkFilesystem {
-    pub async fn authenticate(transport: QuicClient, token: String) -> Result<Self> {
+    pub async fn authenticate(
+        transport: QuicClient,
+        username: String,
+        password: String,
+    ) -> Result<Self> {
         let this = Self {
             transport: Arc::new(transport),
         };
-        match this.request(Request::Authenticate { token }).await?.0 {
+        match this
+            .request(Request::Authenticate { username, password })
+            .await?
+            .0
+        {
             Response::AuthenticateAck => Ok(this),
             r => Err(response_error(r)),
         }
@@ -41,15 +51,58 @@ impl NetworkFilesystem {
         &self,
         message: Request,
     ) -> Result<(Response, Option<quickfs_transport_quic::RecvStream>)> {
-        let request = Envelope::new(message);
+        let mut request = Envelope::new(message);
         let (mut send, mut recv) = self.transport.stream().await?;
         write_frame(&mut send, &request).await?;
+        request.message.clear_secrets();
         send.finish().map_err(TransportError::Closed)?;
         let response: Envelope<Response> = read_frame(&mut recv).await?;
         if response.request_id != request.request_id {
             return Err(ClientError::UnexpectedResponse);
         };
         Ok((response.message, Some(recv)))
+    }
+}
+
+pub async fn verify_pairing(
+    transport: &QuicClient,
+    pairing_id: Uuid,
+    pairing_code: &str,
+) -> Result<[u8; 32]> {
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| ClientError::UnexpectedResponse)?;
+    let request = Envelope::new(Request::Pair {
+        pairing_id,
+        client_nonce: nonce,
+    });
+    let (mut send, mut recv) = transport.stream().await?;
+    write_frame(&mut send, &request).await?;
+    send.finish().map_err(TransportError::Closed)?;
+    let response: Envelope<Response> = read_frame(&mut recv).await?;
+    if response.request_id != request.request_id {
+        return Err(ClientError::UnexpectedResponse);
+    }
+    match response.message {
+        Response::PairingProof {
+            certificate_fingerprint,
+            proof,
+        } => {
+            let presented = transport.peer_certificate_fingerprint()?;
+            if presented != certificate_fingerprint {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let secret = parse_pairing_code(pairing_code).map_err(|error| {
+                ClientError::Server(ErrorCode::Unauthenticated, error.to_string())
+            })?;
+            if !secret.verify_proof(&certificate_fingerprint, &nonce, &proof) {
+                return Err(ClientError::Server(
+                    ErrorCode::Unauthenticated,
+                    "pairing code did not authenticate this server".into(),
+                ));
+            }
+            Ok(certificate_fingerprint)
+        }
+        other => Err(response_error(other)),
     }
 }
 fn response_error(r: Response) -> ClientError {

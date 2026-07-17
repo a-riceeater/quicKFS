@@ -6,7 +6,7 @@ quicKFS is an experimental read-only network filesystem foundation for high-late
 macFUSE adapter (planned) → client core → QUIC/TLS → Linux daemon → export directory
 ```
 
-Implemented: authenticated sessions with a development token, metadata, directory listings, file open/close, arbitrary bounded ranged reads, opaque node IDs, and an in-memory cache interface. Planned: native macFUSE callbacks, reconnect/retry policy, persistent caching, writes, and Windows/WinFsp support.
+Implemented: pairing-assisted certificate pinning, Argon2id-backed user accounts, authenticated sessions, metadata, directory listings, file open/close, arbitrary bounded ranged reads, opaque node IDs, and an in-memory cache interface. Planned: per-user export authorization, native macFUSE callbacks, reconnect/retry policy, persistent caching, writes, and Windows/WinFsp support.
 
 ## Build and run
 
@@ -14,13 +14,13 @@ Requires Rust 1.85 or newer (Rust 2024 edition). The repository's rustup toolcha
 
 ```sh
 cargo build --workspace
-./scripts/dev-cert.sh
-cargo run -p quickfs-server-daemon -- serve --bind 127.0.0.1:4433 --export-root ./shared --cert ./certs/server.crt --key ./certs/server.key --token development-token
-cargo run -p quickfs-client-cli -- --server 127.0.0.1:4433 --cert ./certs/server.crt --token development-token list /
+cargo run -p quickfs-server-daemon -- init --state-dir .quickfs --server-name localhost
+cargo run -p quickfs-server-daemon -- user add --state-dir .quickfs alice
+cargo run -p quickfs-server-daemon -- serve --bind 127.0.0.1:4433 --export-root ./shared --state-dir .quickfs
 ```
 
 Start with the [setup guide](docs/setup.md), [command reference](docs/usage.md), and [authentication explanation](docs/authentication.md). The [documentation index](docs/README.md) links architecture, development, protocol, troubleshooting, security, and roadmap material. Contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
 
-> **Security warning:** this is an experimental prototype. The development token scheme is not production authentication. Do not expose it to the public Internet.
+> **Security warning:** authentication remains experimental and authorization is not yet per-user. Do not expose the prototype to the public Internet.
 
 Licensed under Apache-2.0.

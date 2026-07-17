@@ -11,39 +11,54 @@ cargo run -p quickfs-client-cli -- --server 127.0.0.1:4433 ... ping
 
 QUIC uses UDP. Ensure UDP port 4433 is allowed by host and network firewalls. A successful TCP connection test does not verify QUIC reachability.
 
-## TLS handshake or certificate error
+## The server identity is missing
 
-For local development, regenerate the certificate and restart the server:
-
-```sh
-./scripts/dev-cert.sh
-```
-
-Both server and client must use the newly generated `certs/server.crt`; the server must use its matching `certs/server.key`.
-
-The client `--server-name` must appear in the certificate's subject alternative names. The development script creates identities for `localhost` and `127.0.0.1`, while the CLI defaults to `localhost`.
-
-Inspect a certificate:
+Initialize the state directory once, then use the same directory when serving:
 
 ```sh
-openssl x509 -in certs/server.crt -noout -subject -dates -ext subjectAltName
+quickfs-server-daemon init --state-dir .quickfs --server-name localhost
+quickfs-server-daemon serve --state-dir .quickfs ...
 ```
 
-Normal code does not provide an insecure certificate-verification bypass.
+Do not repeatedly initialize or delete this directory. Doing so changes server identity and invalidates every client pin.
 
-## Authentication fails
+## The client says the server is not paired
 
-The values passed to the server and client must match exactly:
+Create a fresh pairing on the server:
 
 ```sh
-# Server
---token development-token
-
-# Client
---token development-token
+quickfs-server-daemon pair create --state-dir .quickfs
 ```
 
-Check whether `QUICKFS_TOKEN` overrides or supplies a value in either terminal. Do not print or paste real credentials into issue reports.
+Then pair from the client with the printed ID and enter the code at the prompt. Confirm that `--server` and `--server-name` are identical during pairing and later use because the trust record is keyed by both.
+
+## Pairing fails
+
+Pairing codes expire after five minutes by default and are single-use. Create a new pairing rather than reusing an old record. Check that the client received the full grouped code through a trusted channel and that both machines have reasonable clocks.
+
+Do not send a username or password until pairing succeeds. The temporary certificate-accepting mode is used internally only by the `pair` command.
+
+## Pinned server identity changed
+
+An unexpected identity can indicate a man-in-the-middle attack, the wrong address, lost server state, or deliberate key replacement. Investigate before proceeding. If the administrator deliberately replaced the identity, explicitly remove the old pin and pair again:
+
+```sh
+quickfs-client-cli --server <ADDRESS> --server-name <NAME> forget
+quickfs-client-cli --server <ADDRESS> --server-name <NAME> pair --pairing-id <NEW_ID>
+```
+
+There is no automatic insecure override.
+
+## Username/password authentication fails
+
+Verify the username and add it if necessary:
+
+```sh
+quickfs-server-daemon user add --state-dir .quickfs alice
+quickfs-client-cli --username alice ping
+```
+
+After five failed attempts on one connection, that connection rejects further attempts. The CLI creates a new connection per invocation. Passwords are case-sensitive and are never intentionally logged. Do not include passwords, pairing codes, private state, or trust databases in issue reports.
 
 ## A path is not found
 

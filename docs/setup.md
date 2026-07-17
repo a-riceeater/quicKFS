@@ -1,51 +1,24 @@
 # Setup guide
 
-This guide creates a local Linux or macOS development session. The server is intended for Linux deployment, but the Rust daemon can also be used on macOS for development.
+This guide creates a local server, user account, paired client, and read-only session. Linux is the initial server target; the daemon also runs on macOS for development.
 
 ## Prerequisites
 
-Install:
+Install Git and Rust/Cargo 1.85 or newer. Rust 1.85 is the first stable release supporting Rust 2024. The repository's `rust-toolchain.toml` selects current stable through rustup.
 
-- Git;
-- Rust 1.85 or newer, including Cargo, rustfmt, and Clippy;
-- OpenSSL, used by the development certificate script.
-
-Rust 1.85 is the minimum because it is the first stable release supporting the Rust 2024 edition. The repository's `rust-toolchain.toml` selects current stable Rust and installs rustfmt and Clippy automatically through rustup.
-
-On Linux, distribution packages can provide an older compiler even on a current operating system. The recommended installation is rustup:
+On Linux, distribution Cargo packages may be too old:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
-rustup toolchain install stable --component rustfmt --component clippy
-```
-
-If rustup is already installed, update stable and let the repository override select it:
-
-```sh
 rustup update stable
-rustup show active-toolchain
-```
-
-Verify the tools:
-
-```sh
 rustc --version
 cargo --version
-openssl version
 ```
 
-Both `rustc` and `cargo` must report version 1.85 or newer. If Cargo still reports an older distribution version, verify which executable the shell finds:
+Both versions must be at least 1.85. `command -v cargo` should normally report `$HOME/.cargo/bin/cargo`. macFUSE is not required; native mounting is not implemented yet.
 
-```sh
-command -v cargo
-```
-
-With rustup installed and its environment loaded, this normally reports `$HOME/.cargo/bin/cargo`.
-
-macFUSE is not needed for the CLI workflow. Native mounting is not implemented yet, so installing macFUSE does not enable a mount command in the current version.
-
-## Clone and build
+## Build
 
 ```sh
 git clone https://github.com/quickfs/quickfs.git
@@ -53,22 +26,9 @@ cd quickfs
 cargo build --workspace
 ```
 
-To build optimized binaries:
+The debug binaries are `target/debug/quickfs-server-daemon` and `target/debug/quickfs-client-cli`.
 
-```sh
-cargo build --release -p quickfs-server-daemon -p quickfs-client-cli
-```
-
-The resulting programs are:
-
-```text
-target/release/quickfs-server-daemon
-target/release/quickfs-client-cli
-```
-
-## Create a local export
-
-The server exposes one directory as its root. Create a development fixture:
+## Create an export
 
 ```sh
 mkdir -p shared/examples
@@ -76,87 +36,95 @@ printf 'Hello from quicKFS\n' > shared/hello.txt
 printf 'Nested file\n' > shared/examples/nested.txt
 ```
 
-Only files beneath this directory are available. The wire protocol does not expose the server's absolute paths.
+The server exposes this directory as remote `/`. It does not create a missing export automatically.
 
-## Generate a development certificate
-
-From the repository root:
+## Initialize persistent server identity
 
 ```sh
-./scripts/dev-cert.sh
+cargo run -p quickfs-server-daemon -- init \
+  --state-dir .quickfs \
+  --server-name localhost
 ```
 
-This creates:
+This creates a self-signed TLS identity, an empty user database, and pairing storage. It replaces the old manual `dev-cert.sh` workflow for normal use. Do not copy the private server state to clients.
 
-```text
-certs/server.crt
-certs/server.key
+For a remote server, choose its stable DNS name or IP address during initialization:
+
+```sh
+quickfs-server-daemon init \
+  --state-dir /var/lib/quickfs \
+  --server-name files.example.net
 ```
 
-The certificate is valid for `localhost` and `127.0.0.1` for 30 days. It is for local development only. The private key is ignored by Git and should not be shared.
+## Add a user
 
-The client needs a copy of `server.crt`, which is public, but must never receive `server.key`, which is secret. The certificate authenticates the server to the client; the development token separately authenticates the client to the server. See [Authentication and server trust](authentication.md) for the complete flow.
+```sh
+cargo run -p quickfs-server-daemon -- user add \
+  --state-dir .quickfs \
+  alice
+```
 
-If the certificate expires or the hostname changes, regenerate it. The current script always creates a localhost certificate; certificates for remote hosts must contain the actual DNS name or IP address in their subject alternative names.
+Enter and confirm a password of at least 12 bytes at the hidden prompts. The server stores a salted Argon2id hash.
 
 ## Start the server
-
-Run this in the first terminal:
 
 ```sh
 RUST_LOG=info cargo run -p quickfs-server-daemon -- serve \
   --bind 127.0.0.1:4433 \
   --export-root ./shared \
-  --cert ./certs/server.crt \
-  --key ./certs/server.key \
-  --token development-token
+  --state-dir .quickfs
 ```
 
-Keep this terminal open. Stop the server with Ctrl+C. On Unix, SIGTERM also initiates graceful shutdown.
+Use `--bind 0.0.0.0:4433` to accept remote connections, and allow UDP port 4433 through the relevant firewall. Keep the server running. Ctrl+C and SIGTERM initiate graceful shutdown.
 
-## Connect with the client
+## Create a one-time pairing
 
-In a second terminal, verify the session:
+In another server terminal:
+
+```sh
+cargo run -p quickfs-server-daemon -- pair create \
+  --state-dir .quickfs \
+  --expires-seconds 300
+```
+
+The command prints a pairing ID and grouped high-entropy code. Transfer them to the client through a trusted channel. The code expires and is deleted after use.
+
+## Pair the client
 
 ```sh
 cargo run -p quickfs-client-cli -- \
   --server 127.0.0.1:4433 \
   --server-name localhost \
-  --cert ./certs/server.crt \
-  --token development-token \
-  ping
+  pair --pairing-id <PAIRING_ID>
 ```
 
-Expected output:
+Enter the pairing code at the hidden prompt. Successful pairing stores the server certificate fingerprint in `.quickfs-client/trusted-servers.json`; no certificate file is copied.
 
-```text
-pong 42
-```
-
-Browse and read the fixture:
+## Log in and use the client
 
 ```sh
 cargo run -p quickfs-client-cli -- \
-  --cert ./certs/server.crt --token development-token list /
+  --server 127.0.0.1:4433 \
+  --server-name localhost \
+  --username alice \
+  ping
+```
 
-cargo run -p quickfs-client-cli -- \
-  --cert ./certs/server.crt --token development-token stat /hello.txt
+Enter the account password when prompted. Then browse and read:
 
-cargo run -p quickfs-client-cli -- \
-  --cert ./certs/server.crt --token development-token \
+```sh
+cargo run -p quickfs-client-cli -- --username alice list /
+cargo run -p quickfs-client-cli -- --username alice stat /hello.txt
+cargo run -p quickfs-client-cli -- --username alice \
   read /hello.txt --offset 0 --length 4096
 ```
 
-The client defaults to `127.0.0.1:4433` and TLS server name `localhost`, so those options can be omitted for local use.
+The address and server name default to local development values. The client refuses an unexpected server certificate before prompting for a password.
 
-## Verify the development environment
-
-Run all local quality checks:
+## Run development checks
 
 ```sh
 ./scripts/check.sh
 ```
 
-This checks formatting, runs strict Clippy, executes workspace tests, and builds the Rust documentation.
-
-Continue with the [usage and command reference](usage.md) for remote-server examples and every supported option.
+See [usage](usage.md), [authentication](authentication.md), and [troubleshooting](troubleshooting.md) for more detail.

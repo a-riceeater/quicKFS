@@ -1,171 +1,152 @@
 # Usage and command reference
 
-The current user-facing tools are the Linux server daemon and a platform-independent diagnostic client. The client can browse and read the export without macFUSE.
+The current tools are a server daemon and diagnostic read-only client. Run each command with `--help` for generated help.
 
-## Server command
+## Server administration
 
-```text
-quickfs-server-daemon serve [OPTIONS] \
-  --export-root <PATH> --cert <PATH> --key <PATH> --token <TOKEN>
+### `init`
+
+Creates a persistent self-signed server identity, empty user database, and pairing directory:
+
+```sh
+quickfs-server-daemon init \
+  --state-dir /var/lib/quickfs \
+  --server-name files.example.net
 ```
 
-Options:
+`--state-dir` defaults to `.quickfs`. Supply `--server-name` more than once when the identity needs multiple names. Initialization refuses to overwrite existing identity files.
+
+### `user add`
+
+```sh
+quickfs-server-daemon user add --state-dir /var/lib/quickfs alice
+```
+
+Prompts twice for a password of at least 12 bytes and stores only a salted Argon2id hash. Usernames are 1–64 ASCII letters, digits, `.`, `_`, or `-`. Duplicate users are rejected.
+
+Other lifecycle commands are:
+
+```sh
+quickfs-server-daemon user password --state-dir /var/lib/quickfs alice
+quickfs-server-daemon user disable --state-dir /var/lib/quickfs alice
+quickfs-server-daemon user enable --state-dir /var/lib/quickfs alice
+quickfs-server-daemon user delete --state-dir /var/lib/quickfs alice
+```
+
+Password changes prompt twice. Disable and delete prevent new logins but do not terminate connections that are already authenticated.
+
+### `pair create`
+
+```sh
+quickfs-server-daemon pair create \
+  --state-dir /var/lib/quickfs \
+  --expires-seconds 300
+```
+
+Creates a single-use pairing ID and 160-bit secret. The default lifetime is five minutes. The running server reads pairing records from the state directory, so it does not need a restart.
+
+## Server `serve`
+
+```sh
+quickfs-server-daemon serve [OPTIONS] --export-root <PATH>
+```
 
 | Option | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
 | `--bind <ADDRESS>` | `QUICKFS_BIND` | `0.0.0.0:4433` | UDP address on which QUIC listens. |
-| `--export-root <PATH>` | `QUICKFS_EXPORT_ROOT` | Required | Directory exposed as the remote root. |
-| `--cert <PATH>` | `QUICKFS_CERT` | Required | PEM server certificate. |
-| `--key <PATH>` | `QUICKFS_KEY` | Required | PEM private key. |
-| `--token <TOKEN>` | `QUICKFS_TOKEN` | Required | Experimental shared development token. |
-| `--max-read-size <BYTES>` | — | `8388608` | Largest permitted ranged read (8 MiB). |
+| `--export-root <PATH>` | `QUICKFS_EXPORT_ROOT` | Required | Directory exposed as remote `/`. |
+| `--state-dir <PATH>` | `QUICKFS_STATE_DIR` | `.quickfs` | Identity, accounts, and pairing state. |
+| `--max-read-size <BYTES>` | — | `8388608` | Largest permitted ranged read. |
 | `--max-open-handles <COUNT>` | — | `1024` | Maximum tracked open files. |
-| `--request-timeout-ms <MS>` | — | `30000` | Configured request timeout value; enforcement is not complete. |
+| `--request-timeout-ms <MS>` | — | `30000` | Configured timeout; full enforcement remains incomplete. |
 | `--max-concurrent-requests <COUNT>` | — | `128` | Global request concurrency bound. |
 
-Example using flags:
+Example:
 
 ```sh
 RUST_LOG=info quickfs-server-daemon serve \
   --bind 0.0.0.0:4433 \
   --export-root /srv/project-share \
-  --cert /etc/quickfs/server.crt \
-  --key /etc/quickfs/server.key \
-  --token development-token \
-  --max-read-size 8388608 \
-  --max-open-handles 1024 \
-  --max-concurrent-requests 128
+  --state-dir /var/lib/quickfs
 ```
 
-Example using environment variables:
-
-```sh
-export QUICKFS_BIND=0.0.0.0:4433
-export QUICKFS_EXPORT_ROOT=/srv/project-share
-export QUICKFS_CERT=/etc/quickfs/server.crt
-export QUICKFS_KEY=/etc/quickfs/server.key
-export QUICKFS_TOKEN=development-token
-RUST_LOG=quickfs_server_daemon=debug quickfs-server-daemon serve
-```
-
-Avoid putting real credentials in shell history. The token mechanism is only a development placeholder. Optional TOML configuration is planned but not currently implemented.
-
-The certificate and token are not interchangeable: certificate verification authenticates the server, while the token authenticates the client. See [Authentication and server trust](authentication.md).
-
-## Client global options
+## Client options
 
 ```text
-quickfs-client-cli [OPTIONS] --cert <PATH> --token <TOKEN> <COMMAND>
+quickfs-client-cli [OPTIONS] <COMMAND>
 ```
 
 | Option | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
-| `--server <ADDRESS>` | `QUICKFS_SERVER` | `127.0.0.1:4433` | Server socket address. |
-| `--server-name <NAME>` | — | `localhost` | DNS identity validated against the TLS certificate. |
-| `--cert <PATH>` | `QUICKFS_CERT` | Required | Explicitly trusted server certificate. |
-| `--token <TOKEN>` | `QUICKFS_TOKEN` | Required | Token sent in the authentication request. |
+| `--server <ADDRESS>` | `QUICKFS_SERVER` | `127.0.0.1:4433` | Server UDP address. |
+| `--server-name <NAME>` | — | `localhost` | Logical identity associated with the pin. |
+| `--state-dir <PATH>` | `QUICKFS_CLIENT_STATE_DIR` | `.quickfs-client` | Client trust database directory. |
+| `--username <NAME>` | `QUICKFS_USERNAME` | — | Account for authenticated commands. |
 | `--timeout-ms <MS>` | — | `30000` | Connection and stream-open timeout. |
 
-The server name is a certificate identity, not necessarily the address used to reach the server. For example, a client can connect to `192.0.2.10:4433` while validating a certificate issued for `files.example.net`:
+The client no longer accepts `--cert` or the shared `--token`. Pairing establishes trust, and passwords are entered through a hidden prompt.
+
+### `pair`
 
 ```sh
 quickfs-client-cli \
   --server 192.0.2.10:4433 \
   --server-name files.example.net \
-  --cert ./files.example.net.crt \
-  --token development-token \
-  ping
+  pair --pairing-id <PAIRING_ID>
 ```
 
-## `ping`
+The command prompts for the code and pins the authenticated certificate fingerprint. `--code` or `QUICKFS_PAIRING_CODE` exists for automation but can expose the secret through process configuration; interactive entry is preferred.
 
-Checks QUIC, TLS, protocol framing, and basic request/response handling:
+### `forget`
 
 ```sh
-quickfs-client-cli --cert ./certs/server.crt --token development-token ping
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  forget
 ```
 
-Expected output:
+Removes exactly that address/name pin. Use it only for a deliberate server reset or identity rotation, then pair again. The client never replaces a changed identity silently.
 
-```text
-pong 42
-```
-
-Ping is currently allowed before server-side filesystem authentication checks, although the CLI establishes an authenticated client first.
-
-## `list`
-
-Lists one remote directory:
+### `ping`
 
 ```sh
-quickfs-client-cli --cert ./certs/server.crt --token development-token list /
-quickfs-client-cli --cert ./certs/server.crt --token development-token list /examples
+quickfs-client-cli --username alice ping
 ```
 
-Example output:
+Authenticates and prints `pong 42` on success.
 
-```text
-Directory	examples
-File	hello.txt
-```
-
-Paths are resolved client-side by walking directory entries. Only opaque node IDs travel over the network.
-
-## `stat`
-
-Prints metadata for a file or directory:
+### `list`
 
 ```sh
-quickfs-client-cli --cert ./certs/server.crt --token development-token stat /
-quickfs-client-cli --cert ./certs/server.crt --token development-token stat /hello.txt
+quickfs-client-cli --username alice list /
+quickfs-client-cli --username alice list /examples
 ```
 
-The debug-style output includes node ID, kind, size, revision, and modification time in Unix milliseconds. Revisions are change indicators, not globally ordered version numbers.
+Paths are resolved client-side by walking opaque node IDs from directory listings.
 
-## `read`
-
-Opens a file, reads a byte range, writes the raw data to stdout, and closes the handle:
+### `stat`
 
 ```sh
-quickfs-client-cli --cert ./certs/server.crt --token development-token \
+quickfs-client-cli --username alice stat /hello.txt
+```
+
+Prints node ID, kind, size, revision, and modification time. Revisions are change indicators, not globally ordered versions.
+
+### `read`
+
+```sh
+quickfs-client-cli --username alice \
   read /hello.txt --offset 0 --length 4096
-```
 
-Read a middle range:
-
-```sh
-quickfs-client-cli --cert ./certs/server.crt --token development-token \
+quickfs-client-cli --username alice \
   read /archive.bin --offset 1048576 --length 65536 > block.bin
 ```
 
-Important behavior:
+`--length` is required. Offset defaults to zero. Reads beyond EOF return available bytes, zero-length reads succeed, and output is raw file content.
 
-- `--length` is required and expressed in bytes.
-- `--offset` defaults to zero.
-- A read extending beyond EOF returns only the available bytes.
-- A zero-length read succeeds with no output.
-- The server rejects reads over its configured maximum.
-- Output is raw file content; redirect it when reading binary data.
+## Logging and limitations
 
-## Logging
+Use `RUST_LOG=info` or `RUST_LOG=quickfs_server_daemon=debug`. Logs must not contain passwords, pairing codes, or file contents.
 
-Set `RUST_LOG` when running the server:
-
-```sh
-RUST_LOG=info quickfs-server-daemon serve ...
-RUST_LOG=quickfs_server_daemon=debug quickfs-server-daemon serve ...
-RUST_LOG=warn quickfs-server-daemon serve ...
-```
-
-Logs should not contain tokens or file contents. Remove sensitive addresses and paths before sharing diagnostic output.
-
-## Current operational limits
-
-- One long-lived QUIC connection is used per CLI invocation; the CLI exits after one command.
-- Each filesystem request uses an independent bidirectional QUIC stream.
-- The implementation is read-only.
-- Native macOS mounting is not implemented, so there is no supported `mount` command.
-- Reconnect and automatic retry behavior are incomplete.
-- Server reads are bounded but currently buffered before being sent.
-- The development token is not production authentication.
-- Do not expose the prototype directly to the public Internet.
+The implementation remains experimental and read-only. Per-user export permissions, recovery and live-session revocation, server-wide login throttling, native mounting, reconnect/retry, and production deployment hardening are incomplete. Do not expose it directly to the public Internet.

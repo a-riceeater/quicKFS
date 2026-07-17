@@ -1,8 +1,8 @@
 # Roadmap
 
-1. Complete native read-only macFUSE callbacks and end-to-end CI tests.
-2. Add reconnect, idempotent retry, bounded read streaming, and fault injection.
-3. Add persistent metadata and disk-backed range caching.
-4. Harden identity, authorization, observability, fuzzing, and deployment (including systemd).
-5. Design writes and WinFsp support; neither is currently implemented.
-
+1. Add automated pairing/login/QUIC integration tests, server-wide rate limits, recovery/live-session revocation, per-user authorization, and formal authentication review.
+2. Complete native read-only macFUSE callbacks and fault-injection CI tests.
+3. Add reconnect, idempotent retry, and bounded read streaming.
+4. Add persistent metadata and disk-backed range caching.
+5. Harden observability, fuzzing, recovery, signed identity rotation, QR pairing, and deployment (including systemd).
+6. Design writes and WinFsp support; neither is currently implemented.
