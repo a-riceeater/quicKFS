@@ -150,6 +150,8 @@ quickfs-server-daemon user password --state-dir .quickfs alice
 quickfs-server-daemon user disable --state-dir .quickfs alice
 quickfs-server-daemon user enable --state-dir .quickfs alice
 quickfs-server-daemon user delete --state-dir .quickfs alice
+quickfs-server-daemon user grant-write --state-dir .quickfs alice
+quickfs-server-daemon user revoke-write --state-dir .quickfs alice
 ```
 
 Create pairing material while the server is running or stopped:
@@ -199,7 +201,7 @@ There is no automatic certificate replacement. This prevents an unexpected key c
 
 ## Current limitations
 
-- All authenticated users currently receive the same export access; per-user authorization is not implemented.
+- All users currently share one export root, but each account has an independent fail-closed write grant. Immediate revocation of an already authenticated session is not implemented.
 - Account recovery and immediate revocation of existing sessions are not implemented.
 - Pairing codes are high-entropy text rather than short numeric codes; this avoids offline guessing weaknesses without introducing an unaudited PAKE implementation.
 - QR pairing is not implemented.

@@ -4,9 +4,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use quickfs_client_core::{
-    NetworkFilesystem, RemoteFilesystem, ServerTrust, load_trusted_server_pin, resolve_path,
-    verify_pairing,
+    MAX_CLIENT_WRITE_SIZE, NetworkFilesystem, RemoteFilesystem, ServerTrust,
+    load_trusted_server_pin, resolve_path, verify_pairing,
 };
+use quickfs_protocol::{AttributeChanges, FileAccess, FileOpenOptions, RenameMode};
 use quickfs_transport_quic::{PairingClient, certificate_sha256, load_certificates};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -73,6 +74,8 @@ enum Command {
         command: TrustSubcommand,
     },
     Ping,
+    Capabilities,
+    FilesystemStats,
     List {
         path: String,
     },
@@ -85,6 +88,41 @@ enum Command {
         offset: u64,
         #[arg(long)]
         length: u64,
+    },
+    /// Write a local file into an existing remote file at an arbitrary byte offset.
+    Write {
+        path: String,
+        input: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = false)]
+        sync: bool,
+    },
+    /// Atomically create a new empty remote file.
+    Create {
+        path: String,
+        #[arg(long, default_value_t = 0o644)]
+        mode: u32,
+    },
+    Truncate {
+        path: String,
+        size: u64,
+    },
+    Mkdir {
+        path: String,
+        #[arg(long, default_value_t = 0o755)]
+        mode: u32,
+    },
+    Remove {
+        path: String,
+        #[arg(long, default_value_t = false)]
+        directory: bool,
+    },
+    Rename {
+        source: String,
+        destination: String,
+        #[arg(long, default_value_t = false)]
+        no_replace: bool,
     },
 }
 
@@ -218,6 +256,8 @@ async fn run_authenticated(cli: &Cli, timeout: Duration) -> Result<()> {
         Command::Forget => bail!("forget command reached authenticated dispatch"),
         Command::Trust { .. } => bail!("trust command reached authenticated dispatch"),
         Command::Ping => println!("pong {}", filesystem.ping(42).await?),
+        Command::Capabilities => println!("{:#?}", filesystem.capabilities().await?),
+        Command::FilesystemStats => println!("{:#?}", filesystem.stat_filesystem().await?),
         Command::List { path } => {
             let node = resolve_path(&filesystem, path).await?;
             for entry in filesystem.list_directory(node).await? {
@@ -244,8 +284,165 @@ async fn run_authenticated(cli: &Cli, timeout: Duration) -> Result<()> {
             use std::io::Write;
             std::io::stdout().write_all(&bytes)?;
         }
+        Command::Write {
+            path,
+            input,
+            offset,
+            sync,
+        } => {
+            let node = resolve_path(&filesystem, path).await?;
+            let opened = filesystem
+                .open_file_with_options(
+                    node,
+                    FileOpenOptions {
+                        access: FileAccess::ReadWrite,
+                        truncate: false,
+                        append: false,
+                    },
+                )
+                .await?;
+            let result = write_input(&filesystem, opened.handle, input, *offset, *sync).await;
+            let close_result = filesystem.close_file(opened.handle).await;
+            let written = result?;
+            close_result.context("closing file after write")?;
+            println!("wrote {written} bytes at offset {offset}");
+        }
+        Command::Create { path, mode } => {
+            let (parent, name) = resolve_parent(&filesystem, path).await?;
+            let created = filesystem
+                .create_file(
+                    parent,
+                    name.into(),
+                    *mode,
+                    FileOpenOptions {
+                        access: FileAccess::ReadWrite,
+                        truncate: false,
+                        append: false,
+                    },
+                )
+                .await?;
+            filesystem.sync_file(created.opened.handle, false).await?;
+            filesystem.close_file(created.opened.handle).await?;
+            filesystem.sync_directory(parent).await?;
+            println!("created file {:?}", created.metadata.node);
+        }
+        Command::Truncate { path, size } => {
+            let node = resolve_path(&filesystem, path).await?;
+            let metadata = filesystem
+                .set_attributes(
+                    node,
+                    None,
+                    AttributeChanges {
+                        size: Some(*size),
+                        mode: None,
+                        accessed_unix_ms: None,
+                        modified_unix_ms: None,
+                        backup_unix_ms: None,
+                    },
+                )
+                .await?;
+            println!(
+                "truncated to {} bytes (revision {})",
+                metadata.size, metadata.revision
+            );
+        }
+        Command::Mkdir { path, mode } => {
+            let (parent, name) = resolve_parent(&filesystem, path).await?;
+            let metadata = filesystem
+                .create_directory(parent, name.into(), *mode)
+                .await?;
+            println!("created directory {:?}", metadata.node);
+        }
+        Command::Remove { path, directory } => {
+            let (parent, name) = resolve_parent(&filesystem, path).await?;
+            filesystem
+                .remove_node(parent, name.into(), *directory)
+                .await?;
+        }
+        Command::Rename {
+            source,
+            destination,
+            no_replace,
+        } => {
+            let (parent, name) = resolve_parent(&filesystem, source).await?;
+            let (new_parent, new_name) = resolve_parent(&filesystem, destination).await?;
+            filesystem
+                .rename_node(
+                    parent,
+                    name.into(),
+                    new_parent,
+                    new_name.into(),
+                    if *no_replace {
+                        RenameMode::NoReplace
+                    } else {
+                        RenameMode::Replace
+                    },
+                )
+                .await?;
+            filesystem.sync_directory(parent).await?;
+            if new_parent != parent {
+                filesystem.sync_directory(new_parent).await?;
+            }
+        }
     }
     Ok(())
+}
+
+async fn write_input(
+    filesystem: &dyn RemoteFilesystem,
+    handle: quickfs_protocol::FileHandle,
+    input: &Path,
+    offset: u64,
+    sync: bool,
+) -> Result<u64> {
+    let capacity = usize::try_from(MAX_CLIENT_WRITE_SIZE)
+        .context("client write limit does not fit this platform")?;
+    let mut file = fs::File::open(input)
+        .with_context(|| format!("failed to open input '{}'", input.display()))?;
+    let mut buffer = vec![0; capacity];
+    let mut written = 0_u64;
+    loop {
+        let amount = file.read(&mut buffer)?;
+        if amount == 0 {
+            break;
+        }
+        let position = offset
+            .checked_add(written)
+            .context("write offset overflows")?;
+        let result = filesystem
+            .write_range(handle, position, &buffer[..amount])
+            .await?;
+        if result.written != amount as u64 {
+            bail!("server reported a partial write");
+        }
+        written = written
+            .checked_add(result.written)
+            .context("written byte count overflows")?;
+    }
+    filesystem.flush_file(handle, None).await?;
+    if sync {
+        filesystem.sync_file(handle, false).await?;
+    }
+    Ok(written)
+}
+
+async fn resolve_parent(
+    filesystem: &dyn RemoteFilesystem,
+    path: &str,
+) -> Result<(quickfs_protocol::NodeId, String)> {
+    let trimmed = path.trim_end_matches('/');
+    let (parent_path, name) = match trimmed.rsplit_once('/') {
+        Some(("", name)) => ("/", name),
+        Some((parent, name)) => (parent, name),
+        None => ("/", trimmed),
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("path must end in a normal entry name");
+    }
+    Ok((
+        resolve_path(filesystem, parent_path).await?,
+        name.to_owned(),
+    ))
 }
 
 fn server_trust_from_cli(cli: &Cli) -> Result<ServerTrust> {

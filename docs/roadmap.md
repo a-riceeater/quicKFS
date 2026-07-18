@@ -1,8 +1,13 @@
 # Roadmap
 
-1. Add recovery/live-session revocation, per-user authorization, distributed-login defenses, and an independent formal authentication review. Automated loopback pairing/login/QUIC tests, per-source throttling, and global authentication-work limits are implemented.
-2. Harden the implemented read-only macFUSE mount with installed-extension integration and fault-injection CI tests.
-3. Add reconnect, idempotent retry, and bounded read streaming.
-4. Add persistent metadata and disk-backed range caching.
-5. Harden observability, fuzzing, recovery, old-identity-signed rotation for exact-pin deployments, QR pairing, and deployment (including systemd). Atomic CA-backed identity rotation is implemented.
-6. Design writes and WinFsp support; neither is currently implemented.
+Implemented foundations include authenticated protocol-v5 reads/writes, per-account write grants, persistent node identity, reconnect/lock replay, disk-backed offline reads, broad macFUSE callbacks, xattrs/resource forks, hardlinks/special nodes, server-side copies, data/hole seek, and mounted-volume integration tests.
+
+Remaining priorities:
+
+1. Recovery, immediate live-session revocation, per-user export roots, stronger distributed-login defense, audit logging, and an independent protocol/security review.
+2. Fault-injection and Linux/macOS CI for daemon restart, macFUSE 4/5 backends, backing-filesystem variants, special nodes, and large resource forks.
+3. Notification-driven cache invalidation and better observability/profiling for multi-client media workloads.
+4. Signed/overlapping exact-pin rotation, platform keychain integration, deployment packaging/systemd, and administrator recovery tooling.
+5. WinFsp support.
+
+Cold-start offline mounting and offline writes are intentionally deferred unless a future design includes authenticated durable journals, version preconditions, lock/permission revalidation, explicit conflict policy, and user-visible reconciliation.

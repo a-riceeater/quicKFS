@@ -1,6 +1,6 @@
 # Usage and command reference
 
-The current tools are a server daemon and diagnostic read-only client. Run each command with `--help` for generated help.
+The current tools are a server daemon, diagnostic client, and native macFUSE mount. Run each command with `--help` for generated help.
 
 ## Server administration
 
@@ -42,6 +42,8 @@ quickfs-server-daemon user password --state-dir /var/lib/quickfs alice
 quickfs-server-daemon user disable --state-dir /var/lib/quickfs alice
 quickfs-server-daemon user enable --state-dir /var/lib/quickfs alice
 quickfs-server-daemon user delete --state-dir /var/lib/quickfs alice
+quickfs-server-daemon user grant-write --state-dir /var/lib/quickfs alice
+quickfs-server-daemon user revoke-write --state-dir /var/lib/quickfs alice
 ```
 
 Password changes prompt twice. Disable and delete prevent new logins but do not terminate connections that are already authenticated.
@@ -79,12 +81,16 @@ quickfs-server-daemon serve [OPTIONS] --export-root <PATH>
 | `--export-root <PATH>` | `QUICKFS_EXPORT_ROOT` | Required | Directory exposed as remote `/`. |
 | `--state-dir <PATH>` | `QUICKFS_STATE_DIR` | `.quickfs` | Identity, accounts, and pairing state. |
 | `--max-read-size <BYTES>` | — | `8388608` | Largest permitted ranged read. |
+| `--allow-writes` | `QUICKFS_ALLOW_WRITES` | Off | Enable the export-wide write gate; an account write grant is also required. |
+| `--max-write-size <BYTES>` | — | `8388608` | Largest raw write/xattr payload. |
 | `--max-open-handles <COUNT>` | — | `1024` | Maximum tracked open files. |
 | `--max-known-nodes-per-connection <COUNT>` | — | `8192` | Maximum node IDs retained by one connection, including the root. |
 | `--max-total-known-nodes <COUNT>` | — | `65536` | Global budget for retained non-root node IDs across connections. |
 | `--request-timeout-ms <MS>` | — | `30000` | Full request timeout, including frame I/O and filesystem work. |
 | `--max-concurrent-requests <COUNT>` | — | `128` | Global request concurrency bound. |
 | `--max-in-flight-read-bytes <BYTES>` | — | `67108864` | Global memory budget reserved by concurrent raw reads. |
+| `--max-in-flight-write-bytes <BYTES>` | — | `67108864` | Global raw-write memory budget. |
+| `--max-in-flight-write-bytes-per-connection <BYTES>` | — | `16777216` | Per-connection raw-write memory budget. |
 | `--max-concurrent-connections <COUNT>` | — | `256` | Global accepted-connection bound. |
 | `--max-concurrent-auth <COUNT>` | — | `4` | Global Argon2 worker bound. |
 | `--auth-attempts-per-minute <COUNT>` | — | `30` | Rolling login-attempt limit per source IP (maximum `1000`). |
@@ -95,7 +101,8 @@ Example:
 RUST_LOG=info quickfs-server-daemon serve \
   --bind 0.0.0.0:4433 \
   --export-root /srv/project-share \
-  --state-dir /var/lib/quickfs
+  --state-dir /var/lib/quickfs \
+  --allow-writes
 ```
 
 ## Client options
@@ -209,7 +216,7 @@ target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
   --username alice
 ```
 
-The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, authenticates once, and keeps one `RemoteFilesystem` connection and one Tokio runtime for the mount lifetime. Leave it running while the volume is in use; Finder can browse directories and open/read files. Unmount from another terminal:
+The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, and keeps one shared Tokio runtime around an authenticated reconnecting `RemoteFilesystem`. Finder and media applications can use ordinary read/write namespace operations, xattrs/resource forks, hardlinks, locks, random byte ranges, sparse seek, volume rename, and backup time. Server-side copy, `readdirplus`, and `exchangedata` callbacks are capability-gated because current macFUSE/macOS combinations do not necessarily expose those optional messages; see [filesystem semantics](filesystem-semantics.md). Unmount from another terminal:
 
 ```sh
 diskutil unmount "$HOME/Volumes/quickfs"
@@ -221,16 +228,20 @@ diskutil unmount "$HOME/Volumes/quickfs"
 | `--server-name <NAME>` | — | `localhost` | Logical TLS identity and exact-pin key. |
 | `--state-dir <PATH>` | `QUICKFS_CLIENT_STATE_DIR` | `.quickfs-client` | Existing exact-pin trust database. |
 | `--username <NAME>` | `QUICKFS_USERNAME` | Required | Account used to authenticate the retained session. |
-| `--timeout-ms <MS>` | — | `30000` | Connection and transport-operation timeout. |
-| `--callback-timeout-ms <MS>` | — | `30000` | Maximum time a macFUSE callback waits for its remote operation. |
+| `--cache-dir <PATH>` | `QUICKFS_CACHE_DIR` | Client state directory | Private persistent offline-read cache. |
+| `--cache-max-bytes <BYTES>` | `QUICKFS_CACHE_MAX_BYTES` | `21474836480` | Hard payload budget for the persistent cache. |
+| `--cache-block-kib <KiB>` | — | `1024` | Read-through block size. |
+| `--timeout-ms <MS>` | — | `10000` | Connection and transport-operation timeout. |
+| `--callback-timeout-ms <MS>` | — | `45000` | Maximum time a macFUSE callback waits for its remote operation. |
+| `--reconnect-attempts <COUNT>` | — | `3` | Bounded authenticated reconnect attempts. |
 | `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Use the operating-system public/managed roots. |
 | `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Use an explicit enterprise-CA bundle. |
 | `--volume-name <NAME>` | — | `quicKFS` | Volume label shown by macOS. |
 
-Without a CA option, the mount reads the same private exact-pin database created by `quickfs-client-cli pair` or `trust import`. `--trust-system-roots` and `--ca-cert` are mutually exclusive. The mount is intentionally read-only: directories are `0555`, files are `0444`, and macOS write/xattr sidecars are disabled.
+Without a CA option, the mount reads the same private exact-pin database created by `quickfs-client-cli pair` or `trust import`. `--trust-system-roots` and `--ca-cert` are mutually exclusive. The mount reports read/write only when both server and account gates allow it. Cached data remains readable after a disconnect, but write opens/mutations fail closed and the server must be online to start a mount.
 
 ## Logging and limitations
 
 Use `RUST_LOG=info` or `RUST_LOG=quickfs_server_daemon=debug`. Logs must not contain passwords, pairing codes, or file contents.
 
-The implementation remains experimental and read-only. Per-user export permissions, recovery and live-session revocation, distributed-login defense, reconnect/retry, installed-macFUSE integration testing, and production deployment hardening are incomplete. A lost QUIC session currently requires unmounting and starting `quickfs-mount` again. Do not expose it directly to the public Internet.
+The implementation remains experimental. Per-user export roots, recovery and live-session revocation, distributed-login defense, cold-start offline mounting, offline mutation/conflict reconciliation, and production hardening remain incomplete. Do not expose it directly to the public Internet without an independent security and operational review.

@@ -109,6 +109,13 @@ struct UserRecord {
     username: String,
     password_hash: String,
     enabled: bool,
+    #[serde(default)]
+    writable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserAuthorization {
+    pub writable: bool,
 }
 
 #[derive(Default, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
@@ -384,6 +391,7 @@ pub fn add_user(root: &Path, username: &str, password: &[u8]) -> Result<(), Auth
         username: username.into(),
         password_hash: hash_password(password)?,
         enabled: true,
+        writable: false,
     });
     write_json(&path, &database)
 }
@@ -419,6 +427,21 @@ pub fn set_user_enabled(root: &Path, username: &str, enabled: bool) -> Result<()
     write_json(&path, &database)
 }
 
+pub fn set_user_writable(root: &Path, username: &str, writable: bool) -> Result<(), AuthError> {
+    validate_server_state(root)?;
+    validate_username(username)?;
+    let _lock = lock_user_database(root)?;
+    let path = root.join(USERS_FILE);
+    let mut database = read_user_database(&path)?;
+    let user = database
+        .users
+        .iter_mut()
+        .find(|user| user.username == username)
+        .ok_or_else(|| AuthError::UserNotFound(username.into()))?;
+    user.writable = writable;
+    write_json(&path, &database)
+}
+
 pub fn remove_user(root: &Path, username: &str) -> Result<(), AuthError> {
     validate_server_state(root)?;
     validate_username(username)?;
@@ -434,8 +457,16 @@ pub fn remove_user(root: &Path, username: &str) -> Result<(), AuthError> {
 }
 
 pub fn verify_user(root: &Path, username: &str, password: &[u8]) -> Result<bool, AuthError> {
+    Ok(verify_user_authorization(root, username, password)?.is_some())
+}
+
+pub fn verify_user_authorization(
+    root: &Path,
+    username: &str,
+    password: &[u8],
+) -> Result<Option<UserAuthorization>, AuthError> {
     if validate_username(username).is_err() || password.len() > MAX_PASSWORD_LENGTH {
-        return Ok(false);
+        return Ok(None);
     }
     let users_path = root.join(USERS_FILE);
     validate_private_file(&users_path)?;
@@ -449,12 +480,18 @@ pub fn verify_user(root: &Path, username: &str, password: &[u8]) -> Result<bool,
         let salt =
             SaltString::encode_b64(b"quickfs-unknown-user-salt").map_err(|_| AuthError::Crypto)?;
         let _ = Argon2::default().hash_password(password, &salt);
-        return Ok(false);
+        return Ok(None);
     };
     let parsed = parse_password_hash(&user.password_hash).map_err(|_| {
         AuthError::InvalidData(format!("invalid password hash for user '{username}'"))
     })?;
-    Ok(Argon2::default().verify_password(password, &parsed).is_ok())
+    if Argon2::default().verify_password(password, &parsed).is_ok() {
+        Ok(Some(UserAuthorization {
+            writable: user.writable,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn create_pairing(root: &Path, lifetime: Duration) -> Result<NewPairing, AuthError> {
@@ -957,6 +994,18 @@ mod tests {
         initialize(directory.path(), vec!["localhost".into()]).unwrap();
         add_user(directory.path(), "alice", b"correct horse battery staple").unwrap();
         assert!(verify_user(directory.path(), "alice", b"correct horse battery staple").unwrap());
+        assert_eq!(
+            verify_user_authorization(directory.path(), "alice", b"correct horse battery staple")
+                .unwrap(),
+            Some(UserAuthorization { writable: false })
+        );
+        set_user_writable(directory.path(), "alice", true).unwrap();
+        assert_eq!(
+            verify_user_authorization(directory.path(), "alice", b"correct horse battery staple")
+                .unwrap(),
+            Some(UserAuthorization { writable: true })
+        );
+        set_user_writable(directory.path(), "alice", false).unwrap();
         assert!(!verify_user(directory.path(), "alice", b"incorrect password").unwrap());
         change_password(directory.path(), "alice", b"a different secure password").unwrap();
         assert!(verify_user(directory.path(), "alice", b"a different secure password").unwrap());

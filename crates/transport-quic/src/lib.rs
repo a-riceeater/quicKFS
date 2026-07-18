@@ -187,6 +187,12 @@ impl QuicClient {
             .await
             .map_err(|_| TransportError::Timeout)?
     }
+    pub async fn send_all(&self, send: &mut SendStream, data: &[u8]) -> Result<(), TransportError> {
+        tokio::time::timeout(self.timeout, send.write_all(data))
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+        Ok(())
+    }
     pub async fn receive_frame<T: DeserializeOwned>(
         &self,
         recv: &mut RecvStream,

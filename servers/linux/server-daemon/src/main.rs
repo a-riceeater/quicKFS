@@ -5,10 +5,10 @@ use clap::{Parser, Subcommand};
 use quickfs_auth::{
     MAX_PASSWORD_LENGTH, StatePaths, add_user, certificate_fingerprint, change_password,
     consume_pairing, create_pairing, initialize, initialize_with_identity, install_identity,
-    load_pairing, remove_user, set_user_enabled, validate_server_state, validate_username,
-    verify_user,
+    load_pairing, remove_user, set_user_enabled, set_user_writable, validate_server_state,
+    validate_username, verify_user_authorization,
 };
-use quickfs_common::{DEFAULT_MAX_READ_SIZE, Limits, init_logging};
+use quickfs_common::{DEFAULT_MAX_READ_SIZE, DEFAULT_MAX_WRITE_SIZE, Limits, init_logging};
 use quickfs_protocol::*;
 use quickfs_server_core::{Export, ExportSession};
 use quickfs_transport_quic::{
@@ -107,6 +107,18 @@ enum UserSubcommand {
         state_dir: PathBuf,
         username: String,
     },
+    /// Permit this user to mutate exports started with --allow-writes.
+    GrantWrite {
+        #[arg(long, default_value = ".quickfs")]
+        state_dir: PathBuf,
+        username: String,
+    },
+    /// Return this user to read-only access.
+    RevokeWrite {
+        #[arg(long, default_value = ".quickfs")]
+        state_dir: PathBuf,
+        username: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -155,6 +167,11 @@ struct Serve {
     state_dir: PathBuf,
     #[arg(long,default_value_t=DEFAULT_MAX_READ_SIZE)]
     max_read_size: u64,
+    /// Permit mutating filesystem requests. Exports are read-only by default.
+    #[arg(long, env = "QUICKFS_ALLOW_WRITES", default_value_t = false)]
+    allow_writes: bool,
+    #[arg(long, default_value_t = DEFAULT_MAX_WRITE_SIZE)]
+    max_write_size: u64,
     #[arg(long, default_value_t = 1024)]
     max_open_handles: usize,
     #[arg(long, default_value_t = 8_192)]
@@ -167,6 +184,12 @@ struct Serve {
     max_concurrent_requests: usize,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     max_in_flight_read_bytes: usize,
+    /// Aggregate memory reserved for write request bodies across all clients.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_in_flight_write_bytes: usize,
+    /// Memory reserved for write bodies from any one client connection.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_in_flight_write_bytes_per_connection: usize,
     #[arg(long, default_value_t = 256)]
     max_concurrent_connections: usize,
     #[arg(long, default_value_t = 4)]
@@ -303,6 +326,26 @@ fn manage_user(command: UserCommand) -> Result<()> {
             );
             Ok(())
         }
+        UserSubcommand::GrantWrite {
+            state_dir,
+            username,
+        } => {
+            set_user_writable(&state_dir, &username, true)?;
+            println!(
+                "Granted write access to '{username}'. The daemon must also be started with --allow-writes."
+            );
+            Ok(())
+        }
+        UserSubcommand::RevokeWrite {
+            state_dir,
+            username,
+        } => {
+            set_user_writable(&state_dir, &username, false)?;
+            println!(
+                "Revoked write access from '{username}'. Existing authenticated connections are not revoked."
+            );
+            Ok(())
+        }
     }
 }
 
@@ -381,15 +424,18 @@ where
         )
     })?;
     let export = Arc::new(
-        Export::new(
+        Export::new_persistent_with_writes(
             &export_root,
+            state_root.join("filesystem-export.json"),
             Limits {
                 max_read_size: c.max_read_size,
+                max_write_size: c.max_write_size,
                 max_open_handles: c.max_open_handles,
                 max_known_nodes: c.max_known_nodes_per_connection,
                 max_total_known_nodes: c.max_total_known_nodes,
                 request_timeout_ms: c.request_timeout_ms,
             },
+            c.allow_writes,
         )
         .await
         .with_context(|| {
@@ -410,6 +456,7 @@ where
     let connection_permits = Arc::new(Semaphore::new(c.max_concurrent_connections));
     let auth_permits = Arc::new(Semaphore::new(c.max_concurrent_auth));
     let read_permits = Arc::new(Semaphore::new(c.max_in_flight_read_bytes));
+    let write_permits = Arc::new(Semaphore::new(c.max_in_flight_write_bytes));
     let auth_limiter = Arc::new(Mutex::new(AuthRateLimiter::new(c.auth_attempts_per_minute)));
     let request_timeout = Duration::from_millis(c.request_timeout_ms);
     let local_address = endpoint
@@ -418,7 +465,7 @@ where
     if let Some(ready) = ready {
         let _ = ready.send(local_address);
     }
-    tracing::info!(address=%local_address,root=%export_root.display(),"server listening");
+    tracing::info!(address=%local_address,root=%export_root.display(),writable=c.allow_writes,"server listening");
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -434,6 +481,8 @@ where
                 let auth_permits = auth_permits.clone();
                 let auth_limiter = auth_limiter.clone();
                 let read_permits = read_permits.clone();
+                let write_permits = write_permits.clone();
+                let connection_write_budget = c.max_in_flight_write_bytes_per_connection;
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     match incoming.await {
@@ -441,16 +490,21 @@ where
                             let peer_ip = connection.remote_address().ip();
                             let auth_state = Arc::new(Mutex::new(ConnectionAuth::default()));
                             let session = Arc::new(export.session());
+                            let connection_write_permits =
+                                Arc::new(Semaphore::new(connection_write_budget));
                             let request_context = Arc::new(RequestContext {
-                                export: session,
+                                export: session.clone(),
                                 auth_root,
                                 fingerprint,
                                 auth_state,
                                 auth_permits,
                                 auth_limiter,
                                 read_permits,
+                                write_permits,
+                                connection_write_permits,
                                 peer_ip,
                             });
+                            let mut request_tasks = tokio::task::JoinSet::new();
                             while let Ok((send, recv)) = connection.accept_bi().await {
                                 let permit = match tokio::time::timeout(
                                     request_timeout,
@@ -466,7 +520,7 @@ where
                                     }
                                 };
                                 let request_context = request_context.clone();
-                                tokio::spawn(async move {
+                                request_tasks.spawn(async move {
                                     let _permit = permit;
                                     match tokio::time::timeout(
                                         request_timeout,
@@ -479,6 +533,12 @@ where
                                         Err(_) => tracing::warn!(%peer_ip, "request timed out"),
                                     }
                                 });
+                                while request_tasks.try_join_next().is_some() {}
+                            }
+                            request_tasks.abort_all();
+                            while request_tasks.join_next().await.is_some() {}
+                            if let Err(error) = session.cleanup_locks() {
+                                tracing::warn!(%error, %peer_ip, "failed to clean up connection locks");
                             }
                         }
                         Err(error) => tracing::warn!(%error, "connection failed"),
@@ -498,6 +558,9 @@ where
 fn validate_configuration(c: &Serve) -> Result<()> {
     if c.max_read_size == 0 {
         bail!("maximum read size must be greater than zero");
+    }
+    if c.max_write_size == 0 {
+        bail!("maximum write size must be greater than zero");
     }
     if c.max_open_handles == 0 {
         bail!("maximum open handles must be greater than zero");
@@ -519,6 +582,9 @@ fn validate_configuration(c: &Serve) -> Result<()> {
     if c.max_in_flight_read_bytes == 0 {
         bail!("maximum in-flight read bytes must be greater than zero");
     }
+    if c.max_in_flight_write_bytes == 0 || c.max_in_flight_write_bytes_per_connection == 0 {
+        bail!("global and per-connection in-flight write-byte budgets must be greater than zero");
+    }
     if c.max_read_size > u32::MAX.into()
         || usize::try_from(c.max_read_size).is_err()
         || c.max_read_size as usize > c.max_in_flight_read_bytes
@@ -527,6 +593,16 @@ fn validate_configuration(c: &Serve) -> Result<()> {
             "maximum read size must fit within the configured in-flight read-byte budget and u32"
         );
     }
+    if c.max_write_size > u32::MAX.into()
+        || usize::try_from(c.max_write_size).is_err()
+        || c.max_write_size as usize > c.max_in_flight_write_bytes
+        || c.max_write_size as usize > c.max_in_flight_write_bytes_per_connection
+    {
+        bail!("maximum write size must fit within both in-flight write-byte budgets and u32");
+    }
+    if c.max_in_flight_write_bytes_per_connection > c.max_in_flight_write_bytes {
+        bail!("per-connection write-byte budget must not exceed the global write-byte budget");
+    }
     if c.max_open_handles > Semaphore::MAX_PERMITS
         || c.max_known_nodes_per_connection > Semaphore::MAX_PERMITS
         || c.max_total_known_nodes > Semaphore::MAX_PERMITS
@@ -534,6 +610,8 @@ fn validate_configuration(c: &Serve) -> Result<()> {
         || c.max_concurrent_connections > Semaphore::MAX_PERMITS
         || c.max_concurrent_auth > Semaphore::MAX_PERMITS
         || c.max_in_flight_read_bytes > Semaphore::MAX_PERMITS
+        || c.max_in_flight_write_bytes > Semaphore::MAX_PERMITS
+        || c.max_in_flight_write_bytes_per_connection > Semaphore::MAX_PERMITS
     {
         bail!("configured concurrency exceeds the runtime semaphore limit");
     }
@@ -566,6 +644,8 @@ struct RequestContext {
     auth_permits: Arc<Semaphore>,
     auth_limiter: Arc<Mutex<AuthRateLimiter>>,
     read_permits: Arc<Semaphore>,
+    write_permits: Arc<Semaphore>,
+    connection_write_permits: Arc<Semaphore>,
     peer_ip: IpAddr,
 }
 
@@ -625,6 +705,8 @@ async fn handle(
     let auth_permits = context.auth_permits.clone();
     let auth_limiter = context.auth_limiter.clone();
     let read_permits = context.read_permits.clone();
+    let write_permits = context.write_permits.clone();
+    let connection_write_permits = context.connection_write_permits.clone();
     let peer_ip = context.peer_ip;
     let request: Envelope<Request> = read_frame(&mut recv).await?;
     let id = request.request_id;
@@ -749,16 +831,21 @@ async fn handle(
                 password.zeroize();
                 let verified = tokio::task::spawn_blocking(move || {
                     let _auth_permit = auth_permit;
-                    verify_user(&root, &username, password_bytes.as_slice())
+                    verify_user_authorization(&root, &username, password_bytes.as_slice())
                 })
                 .await;
                 match verified {
-                    Ok(Ok(true)) => {
+                    Ok(Ok(Some(authorization))) => {
+                        export.set_write_authorized(authorization.writable);
                         state.authenticated = true;
-                        tracing::info!(username = %log_username, "user authenticated");
+                        tracing::info!(
+                            username = %log_username,
+                            writable = export.capabilities().writable,
+                            "user authenticated"
+                        );
                         Response::AuthenticateAck
                     }
-                    Ok(Ok(false)) => {
+                    Ok(Ok(None)) => {
                         state.failed_attempts = state.failed_attempts.saturating_add(1);
                         tracing::warn!(username = %log_username, "authentication failed");
                         authentication_error("invalid username or password")
@@ -774,58 +861,446 @@ async fn handle(
                 }
             }
         }
-        Request::Ping { nonce } => Response::Pong { nonce },
+        Request::GetCapabilities => Response::Capabilities(export.capabilities()),
+        Request::StatFilesystem => export
+            .stat_filesystem()
+            .await
+            .map(Response::FilesystemStats)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
         Request::GetMetadata { node } => export
             .metadata(node)
             .await
             .map(Response::Metadata)
-            .unwrap_or_else(|e| Response::Error(e.protocol())),
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
         Request::ListDirectory { node } => export
-            .list(node)
+            .list_with_revision(node)
             .await
-            .map(|entries| Response::DirectoryListing {
-                revision: 0,
-                entries,
-            })
-            .unwrap_or_else(|e| Response::Error(e.protocol())),
-        Request::OpenFile { node } => export
-            .open(node)
+            .map(|(revision, entries)| Response::DirectoryListing { revision, entries })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::OpenFile { node, options } => export
+            .open(node, options)
             .await
             .map(|(handle, revision, size)| Response::FileOpened {
                 handle,
                 revision,
                 size,
             })
-            .unwrap_or_else(|e| Response::Error(e.protocol())),
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::CreateFile {
+            parent,
+            name,
+            mode,
+            options,
+        } => export
+            .create_file(parent, name.as_bytes(), mode, options)
+            .await
+            .map(|(metadata, handle, revision, size)| Response::FileCreated {
+                metadata,
+                handle,
+                revision,
+                size,
+            })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::CreateDirectory { parent, name, mode } => export
+            .create_directory(parent, name.as_bytes(), mode)
+            .await
+            .map(Response::NodeCreated)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::CreateSymlink {
+            parent,
+            name,
+            target,
+        } => export
+            .create_symlink(parent, name.as_bytes(), &target)
+            .await
+            .map(Response::NodeCreated)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::RemoveNode {
+            parent,
+            name,
+            directory,
+        } => export
+            .remove_node(parent, name.as_bytes(), directory)
+            .await
+            .map(|()| Response::NodeRemoved)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::RenameNode {
+            parent,
+            name,
+            new_parent,
+            new_name,
+            mode,
+        } => export
+            .rename_node(
+                parent,
+                name.as_bytes(),
+                new_parent,
+                new_name.as_bytes(),
+                mode,
+            )
+            .await
+            .map(|()| Response::NodeRenamed)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::CreateHardLink {
+            node,
+            new_parent,
+            new_name,
+        } => export
+            .create_hard_link(node, new_parent, new_name.as_bytes())
+            .await
+            .map(Response::HardLinkCreated)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::CreateSpecialNode {
+            parent,
+            name,
+            kind,
+            mode,
+            device_major,
+            device_minor,
+        } => export
+            .create_special_node(
+                parent,
+                name.as_bytes(),
+                kind,
+                mode,
+                device_major,
+                device_minor,
+            )
+            .await
+            .map(Response::NodeCreated)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::ReadLink { node } => export
+            .read_link(node)
+            .await
+            .map(Response::LinkTarget)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::SetAttributes {
+            node,
+            handle,
+            changes,
+        } => export
+            .set_attributes(node, handle, changes)
+            .await
+            .map(Response::AttributesChanged)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
         Request::ReadRange {
             handle,
             offset,
             length,
-        } => match u32::try_from(length) {
-            Ok(permit_count) => match read_permits.clone().try_acquire_many_owned(permit_count) {
-                Ok(permit) => match export.read(handle, offset, length).await {
-                    Ok((revision, data)) => {
-                        let length = data.len() as u64;
-                        raw = Some(data);
-                        read_permit = Some(permit);
-                        Response::ReadData { revision, length }
-                    }
-                    Err(error) => Response::Error(error.protocol()),
-                },
-                Err(_) => Response::Error(ProtocolError {
+        } => {
+            if length > export.capabilities().max_read_size || offset.checked_add(length).is_none()
+            {
+                Response::Error(ProtocolError {
                     code: ErrorCode::TooLarge,
-                    message: "server read capacity is busy; retry later".into(),
-                }),
-            },
-            Err(_) => Response::Error(ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                message: "read length exceeds the supported range".into(),
-            }),
-        },
+                    message: "read range exceeds the configured limit".into(),
+                })
+            } else {
+                match u32::try_from(length) {
+                    Ok(permit_count) => {
+                        match read_permits.clone().try_acquire_many_owned(permit_count) {
+                            Ok(permit) => match export.read(handle, offset, length).await {
+                                Ok((revision, data)) => {
+                                    let length = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                                    raw = Some(data);
+                                    read_permit = Some(permit);
+                                    Response::ReadData { revision, length }
+                                }
+                                Err(error) => Response::Error(error.protocol()),
+                            },
+                            Err(_) => Response::Error(ProtocolError {
+                                code: ErrorCode::Busy,
+                                message: "server read capacity is busy; retry later".into(),
+                            }),
+                        }
+                    }
+                    Err(_) => Response::Error(ProtocolError {
+                        code: ErrorCode::TooLarge,
+                        message: "read length exceeds the supported range".into(),
+                    }),
+                }
+            }
+        }
+        Request::WriteRange {
+            handle,
+            offset,
+            length,
+        } => {
+            let capabilities = export.capabilities();
+            if !capabilities.writable {
+                Response::Error(ProtocolError {
+                    code: ErrorCode::ReadOnly,
+                    message: "the export is read-only".into(),
+                })
+            } else if length > capabilities.max_write_size || offset.checked_add(length).is_none() {
+                Response::Error(ProtocolError {
+                    code: ErrorCode::TooLarge,
+                    message: "write range exceeds the configured limit".into(),
+                })
+            } else {
+                match (u32::try_from(length), usize::try_from(length)) {
+                    (Ok(permit_count), Ok(body_length)) => {
+                        match write_permits.clone().try_acquire_many_owned(permit_count) {
+                            Ok(global_permit) => match connection_write_permits
+                                .clone()
+                                .try_acquire_many_owned(permit_count)
+                            {
+                                Ok(connection_permit) => {
+                                    let mut data = vec![0; body_length];
+                                    recv.read_exact(&mut data).await?;
+                                    let export = export.clone();
+                                    // Retain both memory reservations with the owned body if
+                                    // the request deadline expires after filesystem work starts.
+                                    match tokio::spawn(async move {
+                                        let _write_memory = (global_permit, connection_permit);
+                                        export.write_owned(handle, offset, data).await
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok((written, revision, size))) => {
+                                            Response::WriteComplete {
+                                                written,
+                                                revision,
+                                                size,
+                                            }
+                                        }
+                                        Ok(Err(error)) => Response::Error(error.protocol()),
+                                        Err(error) => {
+                                            tracing::error!(%error, "write task failed");
+                                            internal_error()
+                                        }
+                                    }
+                                }
+                                Err(_) => Response::Error(ProtocolError {
+                                    code: ErrorCode::Busy,
+                                    message: "connection write capacity is busy; retry later"
+                                        .into(),
+                                }),
+                            },
+                            Err(_) => Response::Error(ProtocolError {
+                                code: ErrorCode::Busy,
+                                message: "server write capacity is busy; retry later".into(),
+                            }),
+                        }
+                    }
+                    _ => Response::Error(ProtocolError {
+                        code: ErrorCode::TooLarge,
+                        message: "write length exceeds the supported range".into(),
+                    }),
+                }
+            }
+        }
+        Request::FlushFile { handle, lock_owner } => export
+            .flush(handle, lock_owner)
+            .await
+            .map(|()| Response::FileFlushed)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::SyncFile { handle, data_only } => export
+            .sync(handle, data_only)
+            .await
+            .map(|()| Response::FileSynced)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::SyncDirectory { node } => export
+            .sync_directory(node)
+            .await
+            .map(|()| Response::DirectorySynced)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::AllocateFile {
+            handle,
+            offset,
+            length,
+        } => export
+            .allocate(handle, offset, length)
+            .await
+            .map(|(revision, size)| Response::FileAllocated { revision, size })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::GetXattr {
+            node,
+            name,
+            offset,
+            length,
+        } => {
+            if length > export.capabilities().max_read_size || offset.checked_add(length).is_none()
+            {
+                Response::Error(ProtocolError {
+                    code: ErrorCode::TooLarge,
+                    message: "xattr read exceeds the configured limit".into(),
+                })
+            } else {
+                match u32::try_from(length) {
+                    Ok(permit_count) => {
+                        match read_permits.clone().try_acquire_many_owned(permit_count) {
+                            Ok(permit) => match export.get_xattr(node, &name, offset, length).await
+                            {
+                                Ok((total_size, data)) => {
+                                    let length = data.len() as u64;
+                                    raw = Some(data);
+                                    read_permit = Some(permit);
+                                    Response::XattrData { length, total_size }
+                                }
+                                Err(error) => Response::Error(error.protocol()),
+                            },
+                            Err(_) => Response::Error(ProtocolError {
+                                code: ErrorCode::Busy,
+                                message: "server read capacity is busy; retry later".into(),
+                            }),
+                        }
+                    }
+                    Err(_) => Response::Error(ProtocolError {
+                        code: ErrorCode::TooLarge,
+                        message: "xattr read exceeds the supported range".into(),
+                    }),
+                }
+            }
+        }
+        Request::SetXattr {
+            node,
+            name,
+            mode,
+            position,
+            length,
+        } => {
+            let capabilities = export.capabilities();
+            if !capabilities.writable {
+                Response::Error(ProtocolError {
+                    code: ErrorCode::ReadOnly,
+                    message: "the export is read-only".into(),
+                })
+            } else if length > capabilities.max_write_size {
+                Response::Error(ProtocolError {
+                    code: ErrorCode::TooLarge,
+                    message: "xattr write exceeds the configured limit".into(),
+                })
+            } else {
+                match (u32::try_from(length), usize::try_from(length)) {
+                    (Ok(permit_count), Ok(body_length)) => {
+                        match write_permits.clone().try_acquire_many_owned(permit_count) {
+                            Ok(global_permit) => match connection_write_permits
+                                .clone()
+                                .try_acquire_many_owned(permit_count)
+                            {
+                                Ok(connection_permit) => {
+                                    let mut data = vec![0; body_length];
+                                    recv.read_exact(&mut data).await?;
+                                    let export = export.clone();
+                                    match tokio::spawn(async move {
+                                        let _write_memory = (global_permit, connection_permit);
+                                        export.set_xattr(node, &name, data, mode, position).await
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(())) => Response::XattrSet,
+                                        Ok(Err(error)) => Response::Error(error.protocol()),
+                                        Err(error) => {
+                                            tracing::error!(%error, "xattr task failed");
+                                            internal_error()
+                                        }
+                                    }
+                                }
+                                Err(_) => Response::Error(ProtocolError {
+                                    code: ErrorCode::Busy,
+                                    message: "connection write capacity is busy; retry later"
+                                        .into(),
+                                }),
+                            },
+                            Err(_) => Response::Error(ProtocolError {
+                                code: ErrorCode::Busy,
+                                message: "server write capacity is busy; retry later".into(),
+                            }),
+                        }
+                    }
+                    _ => Response::Error(ProtocolError {
+                        code: ErrorCode::TooLarge,
+                        message: "xattr write exceeds the supported range".into(),
+                    }),
+                }
+            }
+        }
+        Request::ListXattrs { node } => export
+            .list_xattrs(node)
+            .await
+            .map(Response::XattrNames)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::RemoveXattr { node, name } => export
+            .remove_xattr(node, &name)
+            .await
+            .map(|()| Response::XattrRemoved)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::CopyFileRange {
+            input,
+            input_offset,
+            output,
+            output_offset,
+            length,
+        } => export
+            .copy_file_range(input, input_offset, output, output_offset, length)
+            .await
+            .map(|(copied, revision, size)| Response::RangeCopied {
+                copied,
+                revision,
+                size,
+            })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::SeekFile {
+            handle,
+            offset,
+            whence,
+        } => export
+            .seek_file(handle, offset, whence)
+            .await
+            .map(|offset| Response::FileSeeked { offset })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::SafeIoctl { handle, operation } => export
+            .safe_ioctl(handle, operation)
+            .map(|value| Response::IoctlResult { value })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::MapBlock {
+            node,
+            block_size,
+            block,
+        } => export
+            .map_block(node, block_size, block)
+            .await
+            .map(|block| Response::BlockMapped { block })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::ExchangeData {
+            parent,
+            name,
+            new_parent,
+            new_name,
+            options,
+        } => export
+            .exchange_data(
+                parent,
+                name.as_bytes(),
+                new_parent,
+                new_name.as_bytes(),
+                options,
+            )
+            .await
+            .map(|()| Response::DataExchanged)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::SetVolumeName { name } => export
+            .set_volume_name(&name)
+            .map(|()| Response::VolumeNameSet)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::ForgetNodes { nodes } => export
+            .forget_nodes(&nodes)
+            .map(|()| Response::NodesForgotten)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::GetLock { handle, lock } => export
+            .get_lock(handle, lock)
+            .map(|conflict| Response::LockStatus { conflict })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::SetLock { handle, lock, wait } => export
+            .set_lock(handle, lock, wait)
+            .await
+            .map(|()| Response::LockUpdated)
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
         Request::CloseFile { handle } => export
             .close(handle)
             .map(|()| Response::FileClosed)
-            .unwrap_or_else(|e| Response::Error(e.protocol())),
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::Ping { nonce } => Response::Pong { nonce },
     };
     write_response(&mut send, id, response).await?;
     if let Some(data) = raw {
@@ -884,7 +1359,9 @@ async fn shutdown_signal() {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use quickfs_client_core::{NetworkFilesystem, RemoteFilesystem, resolve_path, verify_pairing};
+    use quickfs_client_core::{
+        ClientError, NetworkFilesystem, RemoteFilesystem, resolve_path, verify_pairing,
+    };
     use quickfs_transport_quic::{PairingClient, QuicClient, parse_certificates_pem};
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -910,6 +1387,15 @@ mod tests {
             initialize(state.path(), vec!["localhost".into()]).unwrap();
             add_user(state.path(), "alice", b"correct horse battery staple").unwrap();
             Self::start_prepared(state, export, request_timeout_ms).await
+        }
+
+        async fn start_writable(request_timeout_ms: u64) -> Self {
+            let state = tempfile::tempdir().unwrap();
+            let export = tempfile::tempdir().unwrap();
+            initialize(state.path(), vec!["localhost".into()]).unwrap();
+            add_user(state.path(), "alice", b"correct horse battery staple").unwrap();
+            set_user_writable(state.path(), "alice", true).unwrap();
+            Self::start_prepared_with_write_setting(state, export, request_timeout_ms, true).await
         }
 
         async fn start_with_identity(
@@ -940,10 +1426,20 @@ mod tests {
         }
 
         async fn start_prepared(state: TempDir, export: TempDir, request_timeout_ms: u64) -> Self {
+            Self::start_prepared_with_write_setting(state, export, request_timeout_ms, false).await
+        }
+
+        async fn start_prepared_with_write_setting(
+            state: TempDir,
+            export: TempDir,
+            request_timeout_ms: u64,
+            allow_writes: bool,
+        ) -> Self {
             let active_identity = StatePaths::resolve(state.path().to_path_buf()).unwrap();
             let certificates = load_certificates(&active_identity.certificate).unwrap();
             let fingerprint = certificate_fingerprint(certificates[0].as_ref());
-            let config = test_configuration(state.path(), export.path(), request_timeout_ms);
+            let mut config = test_configuration(state.path(), export.path(), request_timeout_ms);
+            config.allow_writes = allow_writes;
             let (ready_tx, ready_rx) = oneshot::channel();
             let (stop_tx, stop_rx) = oneshot::channel();
             let task = tokio::spawn(serve_until(
@@ -971,6 +1467,19 @@ mod tests {
         async fn stop(self) {
             let _ = self.stop.send(());
             self.task.await.unwrap().unwrap();
+        }
+
+        async fn stop_preserving(self) -> (TempDir, TempDir) {
+            let Self {
+                _state: state,
+                _export: export,
+                stop,
+                task,
+                ..
+            } = self;
+            let _ = stop.send(());
+            task.await.unwrap().unwrap();
+            (state, export)
         }
 
         async fn pinned_client(&self) -> QuicClient {
@@ -1019,12 +1528,16 @@ mod tests {
             export_root: export_root.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
             max_read_size: DEFAULT_MAX_READ_SIZE,
+            allow_writes: false,
+            max_write_size: DEFAULT_MAX_WRITE_SIZE,
             max_open_handles: 8,
             max_known_nodes_per_connection: 128,
             max_total_known_nodes: 512,
             request_timeout_ms: timeout,
             max_concurrent_requests: 32,
             max_in_flight_read_bytes: 16 * 1024 * 1024,
+            max_in_flight_write_bytes: 16 * 1024 * 1024,
+            max_in_flight_write_bytes_per_connection: 16 * 1024 * 1024,
             max_concurrent_connections: 32,
             max_concurrent_auth: 2,
             auth_attempts_per_minute: 100,
@@ -1195,6 +1708,564 @@ mod tests {
         server.stop().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writable_v5_pipeline_supports_random_io_sync_rename_and_connection_locks() {
+        let server = TestServer::start_writable(5_000).await;
+        let first = NetworkFilesystem::authenticate(
+            server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+        let capabilities = first.capabilities().await.unwrap();
+        assert!(capabilities.writable);
+        assert!(capabilities.supports_locks);
+        assert!(capabilities.supports_atomic_rename);
+        assert_eq!(capabilities.max_write_size, DEFAULT_MAX_WRITE_SIZE);
+        assert!(first.stat_filesystem().await.unwrap().block_size > 0);
+
+        let options = FileOpenOptions {
+            access: FileAccess::ReadWrite,
+            truncate: false,
+            append: false,
+        };
+        let created = first
+            .create_file(ROOT_NODE, "clip.tmp".into(), 0o644, options)
+            .await
+            .unwrap();
+        let node = created.metadata.node;
+        let handle = created.opened.handle;
+        let initial = first.write_range(handle, 0, b"0123456789").await.unwrap();
+        assert_eq!(initial.written, 10);
+        let overwritten = first.write_range(handle, 2, b"ABCD").await.unwrap();
+        assert_eq!(overwritten.written, 4);
+        let read = first.read_range_versioned(handle, 1, 7).await.unwrap();
+        assert_eq!(read.data, b"1ABCD67");
+        assert_eq!(read.revision, overwritten.revision);
+        if capabilities.supports_preallocation {
+            assert!(first.allocate_file(handle, 0, 4_096).await.unwrap().size >= 10);
+        }
+        first.sync_file(handle, false).await.unwrap();
+
+        let first_lock = FileLock {
+            owner: 11,
+            start: 0,
+            end: 1_023,
+            kind: LockKind::Write,
+            pid: 101,
+        };
+        first.set_lock(handle, first_lock, false).await.unwrap();
+
+        let second = NetworkFilesystem::authenticate(
+            server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+        let second_handle = second
+            .open_file_with_options(node, options)
+            .await
+            .unwrap()
+            .handle;
+        let requested_by_second = FileLock {
+            owner: 22,
+            pid: 202,
+            ..first_lock
+        };
+        assert_eq!(
+            second
+                .get_lock(second_handle, requested_by_second)
+                .await
+                .unwrap(),
+            Some(first_lock)
+        );
+        assert!(matches!(
+            second
+                .set_lock(second_handle, requested_by_second, false)
+                .await,
+            Err(ClientError::Server(ErrorCode::WouldBlock, _))
+        ));
+
+        // Dropping the first QUIC connection without closing its handle must
+        // release its session-scoped locks before another client can proceed.
+        drop(first);
+        let mut acquired_after_disconnect = false;
+        for _ in 0..40 {
+            match second
+                .set_lock(second_handle, requested_by_second, false)
+                .await
+            {
+                Ok(()) => {
+                    acquired_after_disconnect = true;
+                    break;
+                }
+                Err(ClientError::Server(ErrorCode::WouldBlock, _)) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("unexpected lock recovery error: {error}"),
+            }
+        }
+        assert!(acquired_after_disconnect);
+        second
+            .set_lock(
+                second_handle,
+                FileLock {
+                    kind: LockKind::Unlock,
+                    ..requested_by_second
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        let attributes = second
+            .set_attributes(
+                node,
+                Some(second_handle),
+                AttributeChanges {
+                    size: Some(8),
+                    mode: None,
+                    accessed_unix_ms: None,
+                    modified_unix_ms: None,
+                    backup_unix_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attributes.size, 8);
+        second.sync_file(second_handle, true).await.unwrap();
+        second.close_file(second_handle).await.unwrap();
+
+        let project = second
+            .create_directory(ROOT_NODE, "project".into(), 0o755)
+            .await
+            .unwrap();
+        second
+            .rename_node(
+                ROOT_NODE,
+                "clip.tmp".into(),
+                project.node,
+                "clip.mov".into(),
+                RenameMode::NoReplace,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_path(&second, "/project/clip.mov").await.unwrap(),
+            node
+        );
+        second.sync_directory(project.node).await.unwrap();
+        let link = second
+            .create_symlink(ROOT_NODE, "clip-link".into(), b"project/clip.mov".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            second.read_link(link.node).await.unwrap(),
+            b"project/clip.mov"
+        );
+        second
+            .remove_node(ROOT_NODE, "clip-link".into(), false)
+            .await
+            .unwrap();
+        second
+            .remove_node(project.node, "clip.mov".into(), false)
+            .await
+            .unwrap();
+        second
+            .remove_node(ROOT_NODE, "project".into(), true)
+            .await
+            .unwrap();
+
+        // The export-wide flag is necessary but not sufficient: a new login
+        // after revocation must receive read-only capabilities and mutation
+        // errors even while this daemon remains writable for granted users.
+        set_user_writable(&server.state_path, "alice", false).unwrap();
+        let revoked = NetworkFilesystem::authenticate(
+            server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+        assert!(!revoked.capabilities().await.unwrap().writable);
+        assert!(matches!(
+            revoked
+                .create_directory(ROOT_NODE, "denied".into(), 0o755)
+                .await,
+            Err(ClientError::Server(ErrorCode::ReadOnly, _))
+        ));
+        drop(revoked);
+        drop(second);
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v5_extended_filesystem_operations_cross_the_authenticated_transport() {
+        let server = TestServer::start_writable(5_000).await;
+        let filesystem = NetworkFilesystem::authenticate(
+            server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+        let capabilities = filesystem.capabilities().await.unwrap();
+        assert!(capabilities.supports_xattrs);
+        assert!(capabilities.supports_hard_links);
+        assert!(capabilities.supports_copy_file_range);
+        assert!(capabilities.supports_seek_data_hole);
+        assert!(capabilities.supports_safe_ioctl);
+        assert!(capabilities.supports_poll);
+        assert!(capabilities.supports_bmap);
+        assert!(capabilities.supports_exchange_data);
+        assert!(capabilities.supports_volume_rename);
+        assert!(capabilities.supports_backup_time);
+        assert!(capabilities.supports_readdirplus);
+        assert!(capabilities.persistent_node_ids);
+        assert!(capabilities.restart_lock_replay);
+
+        let options = FileOpenOptions {
+            access: FileAccess::ReadWrite,
+            truncate: false,
+            append: false,
+        };
+        let left = filesystem
+            .create_file(ROOT_NODE, "left.mov".into(), 0o600, options)
+            .await
+            .unwrap();
+        let right = filesystem
+            .create_file(ROOT_NODE, "right.mov".into(), 0o600, options)
+            .await
+            .unwrap();
+        filesystem
+            .write_range(left.opened.handle, 0, b"abcdefgh")
+            .await
+            .unwrap();
+        filesystem
+            .write_range(right.opened.handle, 0, b"1234")
+            .await
+            .unwrap();
+
+        let tag = Name::from("com.apple.metadata:_kMDItemUserTags");
+        filesystem
+            .set_xattr(
+                left.metadata.node,
+                tag.clone(),
+                b"test-tag",
+                XattrSetMode::Create,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .get_xattr(left.metadata.node, tag.clone(), 2, 4)
+                .await
+                .unwrap()
+                .data,
+            b"st-t"
+        );
+        assert!(
+            filesystem
+                .list_xattrs(left.metadata.node)
+                .await
+                .unwrap()
+                .contains(&tag)
+        );
+
+        let resource_fork = Name::from("com.apple.ResourceFork");
+        filesystem
+            .set_xattr(
+                left.metadata.node,
+                resource_fork.clone(),
+                b"left-fork",
+                XattrSetMode::Create,
+                0,
+            )
+            .await
+            .unwrap();
+        filesystem
+            .set_xattr(
+                right.metadata.node,
+                resource_fork.clone(),
+                b"right-fork",
+                XattrSetMode::Create,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let linked = filesystem
+            .create_hard_link(left.metadata.node, ROOT_NODE, "left-alias.mov".into())
+            .await
+            .unwrap();
+        assert_eq!(linked.node, left.metadata.node);
+        assert_eq!(linked.link_count, 2);
+        let copied = filesystem
+            .copy_file_range(left.opened.handle, 2, right.opened.handle, 1, 4)
+            .await
+            .unwrap();
+        assert_eq!(copied.written, 4);
+        assert_eq!(
+            filesystem
+                .seek_file(left.opened.handle, 0, SeekWhence::Data)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            filesystem
+                .seek_file(left.opened.handle, 0, SeekWhence::Hole)
+                .await
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            filesystem
+                .safe_ioctl(left.opened.handle, SafeIoctl::BytesAvailable)
+                .await
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            filesystem
+                .map_block(left.metadata.node, 4_096, 0)
+                .await
+                .unwrap(),
+            0
+        );
+        let backup = 1_700_555_000_123;
+        assert_eq!(
+            filesystem
+                .set_attributes(
+                    left.metadata.node,
+                    Some(left.opened.handle),
+                    AttributeChanges {
+                        size: None,
+                        mode: None,
+                        accessed_unix_ms: None,
+                        modified_unix_ms: None,
+                        backup_unix_ms: Some(backup),
+                    },
+                )
+                .await
+                .unwrap()
+                .backup_unix_ms,
+            Some(backup)
+        );
+
+        filesystem
+            .exchange_data(
+                ROOT_NODE,
+                "left.mov".into(),
+                ROOT_NODE,
+                "right.mov".into(),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .read_range(left.opened.handle, 0, 16)
+                .await
+                .unwrap(),
+            b"1cdef"
+        );
+        assert_eq!(
+            filesystem
+                .read_range(right.opened.handle, 0, 16)
+                .await
+                .unwrap(),
+            b"abcdefgh"
+        );
+        assert_eq!(
+            filesystem
+                .get_xattr(left.metadata.node, resource_fork.clone(), 0, 32)
+                .await
+                .unwrap()
+                .data,
+            b"right-fork"
+        );
+        assert_eq!(
+            filesystem
+                .get_xattr(right.metadata.node, resource_fork.clone(), 0, 32)
+                .await
+                .unwrap()
+                .data,
+            b"left-fork"
+        );
+
+        filesystem
+            .set_volume_name("Network Editing".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            filesystem.capabilities().await.unwrap().volume_name,
+            "Network Editing"
+        );
+        let listing = filesystem.list_directory_snapshot(ROOT_NODE).await.unwrap();
+        assert!(
+            listing
+                .entries
+                .iter()
+                .all(|entry| entry.metadata.node == entry.node)
+        );
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if capabilities.supports_special_nodes {
+            let fifo = filesystem
+                .create_special_node(
+                    ROOT_NODE,
+                    "render.fifo".into(),
+                    SpecialNodeKind::NamedPipe,
+                    0o600,
+                    0,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(fifo.kind, NodeKind::NamedPipe);
+            filesystem
+                .remove_node(ROOT_NODE, "render.fifo".into(), false)
+                .await
+                .unwrap();
+
+            let raw = Name::new(b"clip-\xff.mov".to_vec());
+            let raw_directory = filesystem
+                .create_directory(ROOT_NODE, raw.clone(), 0o700)
+                .await
+                .unwrap();
+            assert!(
+                filesystem
+                    .list_directory(ROOT_NODE)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.name == raw)
+            );
+            filesystem.remove_node(ROOT_NODE, raw, true).await.unwrap();
+            filesystem
+                .forget_nodes(vec![fifo.node, raw_directory.node])
+                .await
+                .unwrap();
+        }
+
+        filesystem
+            .remove_xattr(left.metadata.node, tag)
+            .await
+            .unwrap();
+        filesystem.close_file(left.opened.handle).await.unwrap();
+        filesystem.close_file(right.opened.handle).await.unwrap();
+        filesystem
+            .remove_node(ROOT_NODE, "left-alias.mov".into(), false)
+            .await
+            .unwrap();
+        filesystem
+            .remove_node(ROOT_NODE, "left.mov".into(), false)
+            .await
+            .unwrap();
+        filesystem
+            .remove_node(ROOT_NODE, "right.mov".into(), false)
+            .await
+            .unwrap();
+        filesystem
+            .forget_nodes(vec![left.metadata.node, right.metadata.node])
+            .await
+            .unwrap();
+        drop(filesystem);
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn persistent_epoch_node_and_volume_state_survive_full_daemon_restart() {
+        let first_server = TestServer::start_writable(5_000).await;
+        let first = NetworkFilesystem::authenticate(
+            first_server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+        let created = first
+            .create_file(
+                ROOT_NODE,
+                "restart.mov".into(),
+                0o600,
+                FileOpenOptions {
+                    access: FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .await
+            .unwrap();
+        first
+            .write_range(created.opened.handle, 0, b"restart-safe")
+            .await
+            .unwrap();
+        first.sync_file(created.opened.handle, false).await.unwrap();
+        first.close_file(created.opened.handle).await.unwrap();
+        first
+            .set_volume_name("Persistent Media".into())
+            .await
+            .unwrap();
+        let node = created.metadata.node;
+        let epoch = first.capabilities().await.unwrap().server_epoch;
+        drop(first);
+        let (state, export) = first_server.stop_preserving().await;
+
+        let second_server =
+            TestServer::start_prepared_with_write_setting(state, export, 5_000, true).await;
+        let second = NetworkFilesystem::authenticate(
+            second_server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+        let capabilities = second.capabilities().await.unwrap();
+        assert_eq!(capabilities.server_epoch, epoch);
+        assert_eq!(capabilities.volume_name, "Persistent Media");
+        assert_eq!(second.get_metadata(node).await.unwrap().node, node);
+        assert_eq!(resolve_path(&second, "/restart.mov").await.unwrap(), node);
+        let handle = second.open_file(node).await.unwrap().0;
+        assert_eq!(
+            second.read_range(handle, 0, 32).await.unwrap(),
+            b"restart-safe"
+        );
+        second.close_file(handle).await.unwrap();
+        drop(second);
+        second_server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_only_default_advertises_and_rejects_writes() {
+        let server = TestServer::start(5_000).await;
+        let filesystem = NetworkFilesystem::authenticate(
+            server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+        assert!(!filesystem.capabilities().await.unwrap().writable);
+        let node = resolve_path(&filesystem, "/example.txt").await.unwrap();
+        let (handle, _, _) = filesystem.open_file(node).await.unwrap();
+        assert!(matches!(
+            filesystem.write_range(handle, 0, b"mutate").await,
+            Err(ClientError::Server(ErrorCode::ReadOnly, _))
+        ));
+        assert_eq!(
+            filesystem.read_range(handle, 0, 22).await.unwrap(),
+            b"authenticated contents"
+        );
+        filesystem.close_file(handle).await.unwrap();
+        drop(filesystem);
+        server.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enterprise_ca_authenticates_server_without_pairing() {
         let server_name = "files.enterprise.test";
@@ -1308,6 +2379,77 @@ mod tests {
         server.stop().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_and_incomplete_write_bodies_are_bounded_and_timed_out() {
+        let server = TestServer::start_writable(1_000).await;
+        let client = server.pinned_client().await;
+        assert!(matches!(
+            request(
+                &client,
+                Request::Authenticate {
+                    username: "alice".into(),
+                    password: "correct horse battery staple".to_string().into(),
+                },
+            )
+            .await,
+            Response::AuthenticateAck
+        ));
+        let handle = match request(
+            &client,
+            Request::CreateFile {
+                parent: ROOT_NODE,
+                name: "upload.bin".into(),
+                mode: 0o600,
+                options: FileOpenOptions {
+                    access: FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            },
+        )
+        .await
+        {
+            Response::FileCreated { handle, .. } => handle,
+            response => panic!("unexpected create response: {response:?}"),
+        };
+        assert!(matches!(
+            request(
+                &client,
+                Request::WriteRange {
+                    handle,
+                    offset: 0,
+                    length: DEFAULT_MAX_WRITE_SIZE + 1,
+                },
+            )
+            .await,
+            Response::Error(ProtocolError {
+                code: ErrorCode::TooLarge,
+                ..
+            })
+        ));
+
+        let envelope = Envelope::new(Request::WriteRange {
+            handle,
+            offset: 0,
+            length: 4,
+        });
+        let (mut send, mut recv) = client.stream().await.unwrap();
+        client.send_frame(&mut send, &envelope).await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(1_024))
+                .await
+                .is_ok()
+        );
+        drop(send);
+        assert!(matches!(
+            request(&client, Request::Ping { nonce: 19 }).await,
+            Response::Pong { nonce: 19 }
+        ));
+        client.close();
+        server.stop().await;
+    }
+
     #[tokio::test]
     async fn refuses_to_export_server_state() {
         let export = tempfile::tempdir().unwrap();
@@ -1371,6 +2513,8 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(Cli::try_parse_from(["server-daemon", "user", "grant-write", "alice"]).is_ok());
+        assert!(Cli::try_parse_from(["server-daemon", "user", "revoke-write", "alice"]).is_ok());
     }
 
     #[test]

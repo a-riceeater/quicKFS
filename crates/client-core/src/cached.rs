@@ -1,0 +1,1052 @@
+// SPDX-License-Identifier: Apache-2.0
+#![forbid(unsafe_code)]
+
+use crate::{
+    ClientError, CreatedFile, DirectorySnapshot, OpenedFile, RangeRead, RemoteFilesystem, Result,
+    WriteResult, XattrRead,
+};
+use async_trait::async_trait;
+use futures::future::join_all;
+use quickfs_cache::{
+    DirectoryCache, FilesystemStateCache, MetadataCache, RangeCache, RangeKey, RevisionKey,
+};
+use quickfs_protocol::{
+    AttributeChanges, DirectoryEntry, ErrorCode, FileAccess, FileHandle, FileLock, FileOpenOptions,
+    FilesystemCapabilities, FilesystemStats, Metadata, Name, NodeId, RenameMode, SafeIoctl,
+    SeekWhence, SpecialNodeKind, XattrSetMode,
+};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{Mutex, RwLock};
+use uuid::Uuid;
+
+pub trait FilesystemCache:
+    MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache
+{
+}
+impl<T: MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache> FilesystemCache for T {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CachePolicy {
+    /// Remote reads are aligned to blocks so nearby and overlapping random
+    /// reads can be served without another network round trip.
+    pub block_size: u64,
+}
+
+impl Default for CachePolicy {
+    fn default() -> Self {
+        Self {
+            block_size: 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedHandle {
+    node: NodeId,
+    inner: Option<FileHandle>,
+    revision: u64,
+    size: u64,
+    mutation: Arc<Mutex<()>>,
+}
+
+/// Adds a revision-keyed read-through/offline cache without weakening remote
+/// write, fsync, or lock semantics. Offline access is intentionally read-only.
+pub struct CachedFilesystem {
+    inner: Arc<dyn RemoteFilesystem>,
+    cache: Arc<dyn FilesystemCache>,
+    policy: CachePolicy,
+    handles: RwLock<HashMap<FileHandle, CachedHandle>>,
+    capabilities: RwLock<Option<FilesystemCapabilities>>,
+}
+
+impl CachedFilesystem {
+    pub fn new(
+        inner: Arc<dyn RemoteFilesystem>,
+        cache: Arc<dyn FilesystemCache>,
+        policy: CachePolicy,
+    ) -> Result<Self> {
+        if policy.block_size == 0 || policy.block_size > crate::MAX_CLIENT_READ_SIZE {
+            return Err(ClientError::Server(
+                ErrorCode::InvalidRequest,
+                "cache block size must be within the client read limit".into(),
+            ));
+        }
+        Ok(Self {
+            inner,
+            cache,
+            policy,
+            handles: RwLock::new(HashMap::new()),
+            capabilities: RwLock::new(None),
+        })
+    }
+
+    async fn cache_metadata(&self, metadata: Metadata) -> Metadata {
+        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        metadata
+    }
+
+    async fn cached_metadata(&self, node: NodeId) -> Result<Metadata> {
+        MetadataCache::get(self.cache.as_ref(), node)
+            .await
+            .ok_or(ClientError::OfflineCacheMiss)
+    }
+
+    async fn remember_handle(
+        &self,
+        node: NodeId,
+        inner: Option<FileHandle>,
+        revision: u64,
+        size: u64,
+        _options: FileOpenOptions,
+    ) -> OpenedFile {
+        let logical = FileHandle(Uuid::new_v4());
+        self.handles.write().await.insert(
+            logical,
+            CachedHandle {
+                node,
+                inner,
+                revision,
+                size,
+                mutation: Arc::new(Mutex::new(())),
+            },
+        );
+        OpenedFile {
+            handle: logical,
+            revision,
+            size,
+        }
+    }
+
+    async fn handle(&self, logical: FileHandle) -> Result<CachedHandle> {
+        self.handles
+            .read()
+            .await
+            .get(&logical)
+            .cloned()
+            .ok_or_else(|| {
+                ClientError::Server(ErrorCode::InvalidHandle, "unknown cached handle".into())
+            })
+    }
+
+    async fn invalidate_node(&self, node: NodeId) {
+        MetadataCache::invalidate(self.cache.as_ref(), node).await;
+        DirectoryCache::invalidate(self.cache.as_ref(), node).await;
+        RangeCache::invalidate(self.cache.as_ref(), node).await;
+    }
+
+    async fn offline_directory(&self, node: NodeId) -> Result<DirectorySnapshot> {
+        let metadata = self.cached_metadata(node).await?;
+        let key = RevisionKey {
+            node,
+            revision: metadata.revision,
+        };
+        DirectoryCache::get(self.cache.as_ref(), key)
+            .await
+            .map(|entries| DirectorySnapshot {
+                revision: metadata.revision,
+                entries,
+            })
+            .ok_or(ClientError::OfflineCacheMiss)
+    }
+
+    async fn cached_range(
+        &self,
+        state: &CachedHandle,
+        offset: u64,
+        length: u64,
+    ) -> Option<Vec<u8>> {
+        let available = state.size.saturating_sub(offset);
+        let length = length.min(available);
+        RangeCache::get(
+            self.cache.as_ref(),
+            RangeKey {
+                file: RevisionKey {
+                    node: state.node,
+                    revision: state.revision,
+                },
+                offset,
+                length,
+            },
+        )
+        .await
+    }
+
+    fn blocks_for(&self, state: &CachedHandle, offset: u64, length: u64) -> Result<Vec<RangeKey>> {
+        if offset.checked_add(length).is_none() {
+            return Err(ClientError::Server(
+                ErrorCode::InvalidRequest,
+                "read range overflows".into(),
+            ));
+        }
+        let available = state.size.saturating_sub(offset);
+        let requested = length.min(available);
+        if requested == 0 {
+            return Ok(Vec::new());
+        }
+        let requested_end = offset
+            .checked_add(requested)
+            .ok_or(ClientError::UnexpectedResponse)?;
+        let mut block_offset = offset / self.policy.block_size * self.policy.block_size;
+        let mut blocks = Vec::new();
+        while block_offset < requested_end {
+            let block_length = self
+                .policy
+                .block_size
+                .min(state.size.saturating_sub(block_offset));
+            blocks.push(RangeKey {
+                file: RevisionKey {
+                    node: state.node,
+                    revision: state.revision,
+                },
+                offset: block_offset,
+                length: block_length,
+            });
+            block_offset = block_offset
+                .checked_add(self.policy.block_size)
+                .ok_or(ClientError::UnexpectedResponse)?;
+        }
+        Ok(blocks)
+    }
+
+    async fn update_handle(&self, logical: FileHandle, result: WriteResult) {
+        if let Some(state) = self.handles.write().await.get_mut(&logical) {
+            state.revision = result.revision;
+            state.size = result.size;
+        }
+    }
+}
+
+fn is_offline(error: &ClientError) -> bool {
+    matches!(error, ClientError::Transport(_) | ClientError::Offline)
+}
+
+fn require_online_handle(state: &CachedHandle) -> Result<FileHandle> {
+    state.inner.ok_or(ClientError::Offline)
+}
+
+#[async_trait]
+impl RemoteFilesystem for CachedFilesystem {
+    async fn ping(&self, nonce: u64) -> Result<u64> {
+        self.inner.ping(nonce).await
+    }
+
+    async fn capabilities(&self) -> Result<FilesystemCapabilities> {
+        match self.inner.capabilities().await {
+            Ok(capabilities) => {
+                *self.capabilities.write().await = Some(capabilities.clone());
+                Ok(capabilities)
+            }
+            Err(error) if is_offline(&error) => self
+                .capabilities
+                .read()
+                .await
+                .clone()
+                .ok_or(ClientError::Offline),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn stat_filesystem(&self) -> Result<FilesystemStats> {
+        match self.inner.stat_filesystem().await {
+            Ok(statistics) => {
+                self.cache.insert_filesystem_stats(statistics).await;
+                Ok(statistics)
+            }
+            Err(error) if is_offline(&error) => self
+                .cache
+                .get_filesystem_stats()
+                .await
+                .ok_or(ClientError::OfflineCacheMiss),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn get_metadata(&self, node: NodeId) -> Result<Metadata> {
+        match self.inner.get_metadata(node).await {
+            Ok(metadata) => Ok(self.cache_metadata(metadata).await),
+            Err(error) if is_offline(&error) => self.cached_metadata(node).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_directory(&self, node: NodeId) -> Result<Vec<DirectoryEntry>> {
+        Ok(self.list_directory_snapshot(node).await?.entries)
+    }
+
+    async fn list_directory_snapshot(&self, node: NodeId) -> Result<DirectorySnapshot> {
+        match self.inner.list_directory_snapshot(node).await {
+            Ok(snapshot) => {
+                let key = RevisionKey {
+                    node,
+                    revision: snapshot.revision,
+                };
+                DirectoryCache::insert(self.cache.as_ref(), key, snapshot.entries.clone()).await;
+                if let Ok(metadata) = self.inner.get_metadata(node).await
+                    && metadata.revision == snapshot.revision
+                {
+                    MetadataCache::insert(self.cache.as_ref(), metadata).await;
+                }
+                Ok(snapshot)
+            }
+            Err(error) if is_offline(&error) => self.offline_directory(node).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn open_file(&self, node: NodeId) -> Result<(FileHandle, u64, u64)> {
+        let opened = self
+            .open_file_with_options(node, FileOpenOptions::READ_ONLY)
+            .await?;
+        Ok((opened.handle, opened.revision, opened.size))
+    }
+
+    async fn open_file_with_options(
+        &self,
+        node: NodeId,
+        options: FileOpenOptions,
+    ) -> Result<OpenedFile> {
+        match self.inner.open_file_with_options(node, options).await {
+            Ok(opened) => Ok(self
+                .remember_handle(
+                    node,
+                    Some(opened.handle),
+                    opened.revision,
+                    opened.size,
+                    options,
+                )
+                .await),
+            Err(error)
+                if is_offline(&error)
+                    && options.access == FileAccess::ReadOnly
+                    && !options.truncate
+                    && !options.append =>
+            {
+                let metadata = self.cached_metadata(node).await?;
+                Ok(self
+                    .remember_handle(node, None, metadata.revision, metadata.size, options)
+                    .await)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn create_file(
+        &self,
+        parent: NodeId,
+        name: Name,
+        mode: u32,
+        options: FileOpenOptions,
+    ) -> Result<CreatedFile> {
+        let created = self.inner.create_file(parent, name, mode, options).await?;
+        self.invalidate_node(parent).await;
+        MetadataCache::insert(self.cache.as_ref(), created.metadata.clone()).await;
+        let opened = self
+            .remember_handle(
+                created.metadata.node,
+                Some(created.opened.handle),
+                created.opened.revision,
+                created.opened.size,
+                options,
+            )
+            .await;
+        Ok(CreatedFile {
+            metadata: created.metadata,
+            opened,
+        })
+    }
+
+    async fn create_directory(&self, parent: NodeId, name: Name, mode: u32) -> Result<Metadata> {
+        let metadata = self.inner.create_directory(parent, name, mode).await?;
+        self.invalidate_node(parent).await;
+        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        Ok(metadata)
+    }
+
+    async fn create_symlink(
+        &self,
+        parent: NodeId,
+        name: Name,
+        target: Vec<u8>,
+    ) -> Result<Metadata> {
+        let cached_target = target.clone();
+        let metadata = self.inner.create_symlink(parent, name, target).await?;
+        self.invalidate_node(parent).await;
+        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        if u64::try_from(cached_target.len()).ok() == Some(metadata.size) {
+            RangeCache::insert(
+                self.cache.as_ref(),
+                RangeKey {
+                    file: RevisionKey {
+                        node: metadata.node,
+                        revision: metadata.revision,
+                    },
+                    offset: 0,
+                    length: metadata.size,
+                },
+                cached_target,
+            )
+            .await;
+        }
+        Ok(metadata)
+    }
+
+    async fn create_hard_link(
+        &self,
+        node: NodeId,
+        new_parent: NodeId,
+        new_name: Name,
+    ) -> Result<Metadata> {
+        let metadata = self
+            .inner
+            .create_hard_link(node, new_parent, new_name)
+            .await?;
+        self.invalidate_node(node).await;
+        self.invalidate_node(new_parent).await;
+        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        Ok(metadata)
+    }
+
+    async fn create_special_node(
+        &self,
+        parent: NodeId,
+        name: Name,
+        kind: SpecialNodeKind,
+        mode: u32,
+        device_major: u32,
+        device_minor: u32,
+    ) -> Result<Metadata> {
+        let metadata = self
+            .inner
+            .create_special_node(parent, name, kind, mode, device_major, device_minor)
+            .await?;
+        self.invalidate_node(parent).await;
+        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        Ok(metadata)
+    }
+
+    async fn remove_node(&self, parent: NodeId, name: Name, directory: bool) -> Result<()> {
+        let cached_child = self
+            .offline_directory(parent)
+            .await
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .entries
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .map(|entry| entry.node)
+            });
+        self.inner.remove_node(parent, name, directory).await?;
+        self.invalidate_node(parent).await;
+        if let Some(node) = cached_child {
+            self.invalidate_node(node).await;
+        }
+        Ok(())
+    }
+
+    async fn rename_node(
+        &self,
+        parent: NodeId,
+        name: Name,
+        new_parent: NodeId,
+        new_name: Name,
+        mode: RenameMode,
+    ) -> Result<()> {
+        self.inner
+            .rename_node(parent, name, new_parent, new_name, mode)
+            .await?;
+        self.invalidate_node(parent).await;
+        self.invalidate_node(new_parent).await;
+        Ok(())
+    }
+
+    async fn read_link(&self, node: NodeId) -> Result<Vec<u8>> {
+        match self.inner.read_link(node).await {
+            Ok(target) => {
+                let metadata = match self.inner.get_metadata(node).await {
+                    Ok(metadata) => self.cache_metadata(metadata).await,
+                    Err(_) => return Ok(target),
+                };
+                if u64::try_from(target.len()).ok() == Some(metadata.size) {
+                    RangeCache::insert(
+                        self.cache.as_ref(),
+                        RangeKey {
+                            file: RevisionKey {
+                                node,
+                                revision: metadata.revision,
+                            },
+                            offset: 0,
+                            length: metadata.size,
+                        },
+                        target.clone(),
+                    )
+                    .await;
+                }
+                Ok(target)
+            }
+            Err(error) if is_offline(&error) => {
+                let metadata = self.cached_metadata(node).await?;
+                RangeCache::get(
+                    self.cache.as_ref(),
+                    RangeKey {
+                        file: RevisionKey {
+                            node,
+                            revision: metadata.revision,
+                        },
+                        offset: 0,
+                        length: metadata.size,
+                    },
+                )
+                .await
+                .ok_or(ClientError::OfflineCacheMiss)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn set_attributes(
+        &self,
+        node: NodeId,
+        handle: Option<FileHandle>,
+        changes: AttributeChanges,
+    ) -> Result<Metadata> {
+        let state = match handle {
+            Some(logical) => Some(self.handle(logical).await?),
+            None => None,
+        };
+        let _mutation = match &state {
+            Some(state) => Some(state.mutation.lock().await),
+            None => None,
+        };
+        let mapped = state.as_ref().map(require_online_handle).transpose()?;
+        let metadata = self.inner.set_attributes(node, mapped, changes).await?;
+        self.invalidate_node(node).await;
+        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        if let Some(logical) = handle
+            && let Some(state) = self.handles.write().await.get_mut(&logical)
+        {
+            state.revision = metadata.revision;
+            state.size = metadata.size;
+        }
+        Ok(metadata)
+    }
+
+    async fn read_range(&self, handle: FileHandle, offset: u64, length: u64) -> Result<Vec<u8>> {
+        Ok(self
+            .read_range_versioned(handle, offset, length)
+            .await?
+            .data)
+    }
+
+    async fn read_range_versioned(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        length: u64,
+    ) -> Result<RangeRead> {
+        let state = self.handle(handle).await?;
+        if offset.checked_add(length).is_none() {
+            return Err(ClientError::Server(
+                ErrorCode::InvalidRequest,
+                "read range overflows".into(),
+            ));
+        }
+        if let Some(data) = self.cached_range(&state, offset, length).await {
+            return Ok(RangeRead {
+                revision: state.revision,
+                data,
+            });
+        }
+        let Some(inner_handle) = state.inner else {
+            return Err(ClientError::OfflineCacheMiss);
+        };
+
+        let blocks = self.blocks_for(&state, offset, length)?;
+        let mut missing = Vec::new();
+        for block in blocks {
+            if RangeCache::get(self.cache.as_ref(), block).await.is_none() {
+                missing.push(block);
+            }
+        }
+        let reads = missing.iter().map(|block| {
+            let filesystem = self.inner.clone();
+            let block = *block;
+            async move {
+                filesystem
+                    .read_range_versioned(inner_handle, block.offset, block.length)
+                    .await
+                    .map(|read| (block, read))
+            }
+        });
+        let mut offline_error = false;
+        for result in join_all(reads).await {
+            match result {
+                Ok((block, read)) if read.revision == state.revision => {
+                    let actual = u64::try_from(read.data.len())
+                        .map_err(|_| ClientError::UnexpectedResponse)?;
+                    if actual > block.length {
+                        return Err(ClientError::UnexpectedResponse);
+                    }
+                    if actual > 0 {
+                        RangeCache::insert(
+                            self.cache.as_ref(),
+                            RangeKey {
+                                length: actual,
+                                ..block
+                            },
+                            read.data,
+                        )
+                        .await;
+                    }
+                }
+                Ok(_) => return Err(ClientError::StaleRevision),
+                Err(error) if is_offline(&error) => offline_error = true,
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(data) = self.cached_range(&state, offset, length).await {
+            return Ok(RangeRead {
+                revision: state.revision,
+                data,
+            });
+        }
+        if offline_error {
+            Err(ClientError::OfflineCacheMiss)
+        } else {
+            Err(ClientError::UnexpectedResponse)
+        }
+    }
+
+    async fn write_range(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<WriteResult> {
+        let state = self.handle(handle).await?;
+        let _mutation = state.mutation.lock().await;
+        let inner_handle = require_online_handle(&state)?;
+        let result = self.inner.write_range(inner_handle, offset, data).await?;
+        self.invalidate_node(state.node).await;
+        self.update_handle(handle, result).await;
+        if result.written > 0 {
+            let written =
+                usize::try_from(result.written).map_err(|_| ClientError::UnexpectedResponse)?;
+            let payload = data
+                .get(..written)
+                .ok_or(ClientError::UnexpectedResponse)?
+                .to_vec();
+            RangeCache::insert(
+                self.cache.as_ref(),
+                RangeKey {
+                    file: RevisionKey {
+                        node: state.node,
+                        revision: result.revision,
+                    },
+                    offset,
+                    length: result.written,
+                },
+                payload,
+            )
+            .await;
+        }
+        Ok(result)
+    }
+
+    async fn flush_file(&self, handle: FileHandle, lock_owner: Option<u64>) -> Result<()> {
+        let state = self.handle(handle).await?;
+        let _mutation = state.mutation.lock().await;
+        if let Some(inner) = state.inner {
+            self.inner.flush_file(inner, lock_owner).await
+        } else {
+            // Offline handles are necessarily read-only. There are no dirty
+            // bytes or remote locks to flush, so FUSE close must still succeed.
+            Ok(())
+        }
+    }
+
+    async fn sync_file(&self, handle: FileHandle, data_only: bool) -> Result<()> {
+        let state = self.handle(handle).await?;
+        let _mutation = state.mutation.lock().await;
+        if let Some(inner) = state.inner {
+            self.inner.sync_file(inner, data_only).await
+        } else {
+            // A cached read-only handle has no pending mutations.
+            Ok(())
+        }
+    }
+
+    async fn sync_directory(&self, node: NodeId) -> Result<()> {
+        self.inner.sync_directory(node).await
+    }
+
+    async fn allocate_file(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        length: u64,
+    ) -> Result<WriteResult> {
+        let state = self.handle(handle).await?;
+        let _mutation = state.mutation.lock().await;
+        let result = self
+            .inner
+            .allocate_file(require_online_handle(&state)?, offset, length)
+            .await?;
+        self.invalidate_node(state.node).await;
+        self.update_handle(handle, result).await;
+        Ok(result)
+    }
+
+    async fn get_xattr(
+        &self,
+        node: NodeId,
+        name: Name,
+        offset: u64,
+        length: u64,
+    ) -> Result<XattrRead> {
+        self.inner.get_xattr(node, name, offset, length).await
+    }
+
+    async fn set_xattr(
+        &self,
+        node: NodeId,
+        name: Name,
+        value: &[u8],
+        mode: XattrSetMode,
+        position: u32,
+    ) -> Result<()> {
+        self.inner
+            .set_xattr(node, name, value, mode, position)
+            .await?;
+        self.invalidate_node(node).await;
+        Ok(())
+    }
+
+    async fn list_xattrs(&self, node: NodeId) -> Result<Vec<Name>> {
+        self.inner.list_xattrs(node).await
+    }
+
+    async fn remove_xattr(&self, node: NodeId, name: Name) -> Result<()> {
+        self.inner.remove_xattr(node, name).await?;
+        self.invalidate_node(node).await;
+        Ok(())
+    }
+
+    async fn copy_file_range(
+        &self,
+        input: FileHandle,
+        input_offset: u64,
+        output: FileHandle,
+        output_offset: u64,
+        length: u64,
+    ) -> Result<WriteResult> {
+        let input_state = self.handle(input).await?;
+        let output_state = self.handle(output).await?;
+        let input_handle = require_online_handle(&input_state)?;
+        let output_handle = require_online_handle(&output_state)?;
+        let result = self
+            .inner
+            .copy_file_range(
+                input_handle,
+                input_offset,
+                output_handle,
+                output_offset,
+                length,
+            )
+            .await?;
+        self.invalidate_node(output_state.node).await;
+        self.update_handle(output, result).await;
+        Ok(result)
+    }
+
+    async fn seek_file(&self, handle: FileHandle, offset: u64, whence: SeekWhence) -> Result<u64> {
+        let state = self.handle(handle).await?;
+        self.inner
+            .seek_file(require_online_handle(&state)?, offset, whence)
+            .await
+    }
+
+    async fn safe_ioctl(&self, handle: FileHandle, operation: SafeIoctl) -> Result<u64> {
+        let state = self.handle(handle).await?;
+        self.inner
+            .safe_ioctl(require_online_handle(&state)?, operation)
+            .await
+    }
+
+    async fn map_block(&self, node: NodeId, block_size: u32, block: u64) -> Result<u64> {
+        self.inner.map_block(node, block_size, block).await
+    }
+
+    async fn exchange_data(
+        &self,
+        parent: NodeId,
+        name: Name,
+        new_parent: NodeId,
+        new_name: Name,
+        options: u64,
+    ) -> Result<()> {
+        self.inner
+            .exchange_data(parent, name, new_parent, new_name, options)
+            .await?;
+        self.invalidate_node(parent).await;
+        self.invalidate_node(new_parent).await;
+        Ok(())
+    }
+
+    async fn set_volume_name(&self, name: Name) -> Result<()> {
+        self.inner.set_volume_name(name).await
+    }
+
+    async fn forget_nodes(&self, nodes: Vec<NodeId>) -> Result<()> {
+        self.inner.forget_nodes(nodes).await
+    }
+
+    async fn get_lock(&self, handle: FileHandle, lock: FileLock) -> Result<Option<FileLock>> {
+        let state = self.handle(handle).await?;
+        self.inner
+            .get_lock(require_online_handle(&state)?, lock)
+            .await
+    }
+
+    async fn set_lock(&self, handle: FileHandle, lock: FileLock, wait: bool) -> Result<()> {
+        let state = self.handle(handle).await?;
+        self.inner
+            .set_lock(require_online_handle(&state)?, lock, wait)
+            .await
+    }
+
+    async fn close_file(&self, handle: FileHandle) -> Result<()> {
+        let mutation = self.handle(handle).await?.mutation;
+        let _mutation = mutation.lock().await;
+        let state = self.handles.write().await.remove(&handle).ok_or_else(|| {
+            ClientError::Server(ErrorCode::InvalidHandle, "unknown cached handle".into())
+        })?;
+        if let Some(inner) = state.inner {
+            self.inner.close_file(inner).await
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use quickfs_cache::MemoryCache;
+    use quickfs_protocol::{DirectoryRevision, NodeKind, ROOT_NODE};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const FILE_NODE: NodeId = NodeId(Uuid::from_u128(7));
+    const LINK_NODE: NodeId = NodeId(Uuid::from_u128(8));
+    const LINK_TARGET: &[u8] = b"clip.mov";
+
+    fn filesystem_stats() -> FilesystemStats {
+        FilesystemStats {
+            blocks: 1_000,
+            blocks_free: 600,
+            blocks_available: 500,
+            files: 100,
+            files_free: 80,
+            block_size: 4_096,
+            name_length: 255,
+            fragment_size: 4_096,
+        }
+    }
+
+    struct ToggleFilesystem {
+        offline: AtomicBool,
+        reads: AtomicUsize,
+        data: Vec<u8>,
+    }
+
+    impl ToggleFilesystem {
+        fn check_online(&self) -> Result<()> {
+            if self.offline.load(Ordering::SeqCst) {
+                Err(ClientError::Offline)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn metadata(node: NodeId) -> Metadata {
+            Metadata {
+                node,
+                kind: match node {
+                    ROOT_NODE => NodeKind::Directory,
+                    LINK_NODE => NodeKind::Symlink,
+                    _ => NodeKind::File,
+                },
+                size: match node {
+                    FILE_NODE => 2 * 1024 * 1024,
+                    LINK_NODE => LINK_TARGET.len() as u64,
+                    _ => 0,
+                },
+                mode: if node == FILE_NODE { 0o644 } else { 0o755 },
+                allocated_blocks: if node == FILE_NODE { 4_096 } else { 0 },
+                revision: match node {
+                    FILE_NODE => 17,
+                    LINK_NODE => 18,
+                    _ => 9,
+                },
+                accessed_unix_ms: 1,
+                modified_unix_ms: 1,
+                created_unix_ms: Some(1),
+                backup_unix_ms: None,
+                link_count: if node == ROOT_NODE { 2 } else { 1 },
+                device_major: 0,
+                device_minor: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteFilesystem for ToggleFilesystem {
+        async fn ping(&self, nonce: u64) -> Result<u64> {
+            self.check_online()?;
+            Ok(nonce)
+        }
+
+        async fn stat_filesystem(&self) -> Result<FilesystemStats> {
+            self.check_online()?;
+            Ok(filesystem_stats())
+        }
+
+        async fn get_metadata(&self, node: NodeId) -> Result<Metadata> {
+            self.check_online()?;
+            Ok(Self::metadata(node))
+        }
+
+        async fn list_directory(&self, node: NodeId) -> Result<Vec<DirectoryEntry>> {
+            Ok(self.list_directory_snapshot(node).await?.entries)
+        }
+
+        async fn list_directory_snapshot(&self, _node: NodeId) -> Result<DirectorySnapshot> {
+            self.check_online()?;
+            Ok(DirectorySnapshot {
+                revision: 9 as DirectoryRevision,
+                entries: vec![DirectoryEntry {
+                    node: FILE_NODE,
+                    name: "clip.mov".into(),
+                    kind: NodeKind::File,
+                    metadata: Self::metadata(FILE_NODE),
+                }],
+            })
+        }
+
+        async fn open_file(&self, node: NodeId) -> Result<(FileHandle, u64, u64)> {
+            let opened = self
+                .open_file_with_options(node, FileOpenOptions::READ_ONLY)
+                .await?;
+            Ok((opened.handle, opened.revision, opened.size))
+        }
+
+        async fn open_file_with_options(
+            &self,
+            node: NodeId,
+            _options: FileOpenOptions,
+        ) -> Result<OpenedFile> {
+            self.check_online()?;
+            Ok(OpenedFile {
+                handle: FileHandle(Uuid::new_v4()),
+                revision: Self::metadata(node).revision,
+                size: Self::metadata(node).size,
+            })
+        }
+
+        async fn read_range(
+            &self,
+            handle: FileHandle,
+            offset: u64,
+            length: u64,
+        ) -> Result<Vec<u8>> {
+            Ok(self
+                .read_range_versioned(handle, offset, length)
+                .await?
+                .data)
+        }
+
+        async fn read_range_versioned(
+            &self,
+            _handle: FileHandle,
+            offset: u64,
+            length: u64,
+        ) -> Result<RangeRead> {
+            self.check_online()?;
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let start = usize::try_from(offset).unwrap();
+            let end = usize::try_from(offset.saturating_add(length))
+                .unwrap()
+                .min(self.data.len());
+            Ok(RangeRead {
+                revision: 17,
+                data: self.data[start..end].to_vec(),
+            })
+        }
+
+        async fn close_file(&self, _handle: FileHandle) -> Result<()> {
+            self.check_online()
+        }
+
+        async fn read_link(&self, node: NodeId) -> Result<Vec<u8>> {
+            self.check_online()?;
+            if node == LINK_NODE {
+                Ok(LINK_TARGET.to_vec())
+            } else {
+                Err(ClientError::Server(
+                    ErrorCode::InvalidNode,
+                    "not a cached test symlink".into(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_ranges_and_directory_snapshots_work_offline() {
+        let data: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let inner = Arc::new(ToggleFilesystem {
+            offline: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
+            data: data.clone(),
+        });
+        let cache = Arc::new(MemoryCache::default());
+        let filesystem =
+            CachedFilesystem::new(inner.clone(), cache.clone(), CachePolicy::default()).unwrap();
+
+        filesystem.get_metadata(ROOT_NODE).await.unwrap();
+        filesystem.get_metadata(FILE_NODE).await.unwrap();
+        assert_eq!(
+            filesystem.stat_filesystem().await.unwrap(),
+            filesystem_stats()
+        );
+        assert_eq!(filesystem.read_link(LINK_NODE).await.unwrap(), LINK_TARGET);
+        filesystem.list_directory(ROOT_NODE).await.unwrap();
+        let opened = filesystem.open_file(FILE_NODE).await.unwrap().0;
+        assert_eq!(
+            filesystem.read_range(opened, 123, 4096).await.unwrap(),
+            data[123..4219]
+        );
+        filesystem.close_file(opened).await.unwrap();
+        assert_eq!(inner.reads.load(Ordering::SeqCst), 1);
+
+        inner.offline.store(true, Ordering::SeqCst);
+        let offline = CachedFilesystem::new(inner.clone(), cache, CachePolicy::default()).unwrap();
+        assert_eq!(offline.stat_filesystem().await.unwrap(), filesystem_stats());
+        assert_eq!(offline.read_link(LINK_NODE).await.unwrap(), LINK_TARGET);
+        assert_eq!(offline.list_directory(ROOT_NODE).await.unwrap().len(), 1);
+        let opened = offline.open_file(FILE_NODE).await.unwrap().0;
+        assert_eq!(
+            offline.read_range(opened, 200, 512).await.unwrap(),
+            data[200..712]
+        );
+        assert!(matches!(
+            offline.read_range(opened, 1024 * 1024 + 4, 128).await,
+            Err(ClientError::OfflineCacheMiss)
+        ));
+        offline.flush_file(opened, Some(42)).await.unwrap();
+        offline.sync_file(opened, false).await.unwrap();
+        offline.close_file(opened).await.unwrap();
+    }
+}

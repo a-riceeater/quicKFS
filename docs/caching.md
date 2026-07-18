@@ -1,4 +1,13 @@
 # Caching
 
-The current in-memory interfaces cover metadata by node, directory listings by node/revision, and byte ranges by node/file revision/offset/length. Persistence, eviction policy, read-ahead, and notification-driven invalidation are planned.
+The mount uses a bounded persistent read-through cache for metadata, directory snapshots, symlink targets, filesystem statistics, and byte ranges keyed by node plus exact file revision. Namespaces bind the authenticated certificate fingerprint, persisted server epoch, and username. Payloads are SHA-256 checked, atomically written, owner-private, protected by a namespace lock, and LRU-evicted under a hard byte budget.
 
+After an online mount loses connectivity, already cached immutable revisions remain readable. Arbitrary and overlapping requests are assembled from cached ranges; missing blocks are fetched concurrently while online. Offline read-only handles permit harmless flush/sync/close so an application that successfully consumed cached data does not receive a false close error.
+
+The cache is not an offline synchronization system. Mount startup still authenticates the server and selects a trustworthy epoch/authorization namespace. Write opens and every namespace/content mutation fail closed while disconnected. No operation journal, queued mutation, merge policy, lock lease, or conflict UI exists.
+
+This is intentionally similar to an ordinary SMB client's read/page cache, not to a synchronization product. SMB is not wholly cache-free: clients use caching, opportunistic locks/leases, and durable handles, while optional products such as Windows Offline Files can add disconnected synchronization. A basic share still needs its server for authoritative namespace and mutation decisions.
+
+Allowing QuickFS to mutate while disconnected would create exactly the merge risks that distinction suggests. Two clients could edit overlapping byte ranges, rename or delete the same object, reuse a pathname, or believe they each hold an exclusive lock. The server might also revoke access, change quota, or begin a new export epoch while a client is away. A safe implementation would need a durable idempotent mutation journal, base revisions and preconditions, stable object identity, reauthentication plus permission/quota/lock revalidation, defined rename/delete conflict rules, and user-visible reconciliation. QuickFS deliberately fails writes closed until such a design exists.
+
+Cold-start offline mounting is a separate problem. Without contacting the server, a client cannot authenticate the current server identity and account, confirm the export epoch, learn that permissions were not revoked, or prove that its cached namespace is current. Serving selected data only after a previously authenticated online mount disconnects keeps stale cache entries from becoming an unauthenticated substitute filesystem.

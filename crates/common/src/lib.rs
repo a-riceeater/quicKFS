@@ -7,10 +7,12 @@ use std::{
 };
 
 pub const DEFAULT_MAX_READ_SIZE: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_WRITE_SIZE: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
     pub max_read_size: u64,
+    pub max_write_size: u64,
     pub max_open_handles: usize,
     pub max_known_nodes: usize,
     pub max_total_known_nodes: usize,
@@ -20,6 +22,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_read_size: DEFAULT_MAX_READ_SIZE,
+            max_write_size: DEFAULT_MAX_WRITE_SIZE,
             max_open_handles: 1024,
             max_known_nodes: 8_192,
             max_total_known_nodes: 65_536,
@@ -59,8 +62,9 @@ pub fn normalize_relative(path: &Path) -> Result<PathBuf, ValidationError> {
     }
     Ok(out)
 }
-pub fn validate_filename(name: &str) -> Result<(), ValidationError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+pub fn validate_filename(name: &[u8]) -> Result<(), ValidationError> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
+    {
         Err(ValidationError::InvalidFilename)
     } else {
         Ok(())
@@ -88,5 +92,13 @@ mod tests {
             normalize_relative(Path::new("a/./b")).unwrap(),
             PathBuf::from("a/b")
         );
+    }
+
+    #[test]
+    fn filenames_are_validated_as_lossless_unix_bytes() {
+        assert!(validate_filename(b"clip.mov").is_ok());
+        assert!(validate_filename(&[0xff, b'x']).is_ok());
+        assert!(validate_filename(b"../clip").is_err());
+        assert!(validate_filename(b"bad\0name").is_err());
     }
 }

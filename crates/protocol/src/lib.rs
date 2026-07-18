@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub const PROTOCOL_VERSION: u16 = 3;
-pub const ALPN_PROTOCOL: &[u8] = b"quickfs/3";
+pub const PROTOCOL_VERSION: u16 = 5;
+pub const ALPN_PROTOCOL: &[u8] = b"quickfs/5";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const ROOT_NODE: NodeId = NodeId(Uuid::from_u128(0));
 
@@ -18,6 +18,199 @@ pub struct NodeId(pub Uuid);
 pub struct FileHandle(pub Uuid);
 pub type FileRevision = u64;
 pub type DirectoryRevision = u64;
+
+/// A lossless Unix name. Unlike `String`, this can represent every filename
+/// and extended-attribute byte sequence; a platform adapter may still reject
+/// names that its host operating system cannot express.
+#[derive(Clone, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Name(Vec<u8>);
+
+impl Name {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<u8>> for Name {
+    fn from(value: Vec<u8>) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for Name {
+    fn from(value: String) -> Self {
+        Self::new(value.into_bytes())
+    }
+}
+
+impl From<&str> for Name {
+    fn from(value: &str) -> Self {
+        Self::new(value.as_bytes().to_vec())
+    }
+}
+
+impl std::fmt::Debug for Name {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Name({:?})", String::from_utf8_lossy(&self.0))
+    }
+}
+
+impl std::fmt::Display for Name {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&String::from_utf8_lossy(&self.0))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FileAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+impl FileAccess {
+    pub fn can_read(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    pub fn can_write(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileOpenOptions {
+    pub access: FileAccess,
+    pub truncate: bool,
+    pub append: bool,
+}
+
+impl FileOpenOptions {
+    pub const READ_ONLY: Self = Self {
+        access: FileAccess::ReadOnly,
+        truncate: false,
+        append: false,
+    };
+}
+
+impl Default for FileOpenOptions {
+    fn default() -> Self {
+        Self::READ_ONLY
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RenameMode {
+    Replace,
+    NoReplace,
+    Exchange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LockKind {
+    Read,
+    Write,
+    Unlock,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileLock {
+    pub owner: u64,
+    pub start: u64,
+    /// Inclusive end offset. `u64::MAX` represents a lock through EOF.
+    pub end: u64,
+    pub kind: LockKind,
+    pub pid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttributeChanges {
+    pub size: Option<u64>,
+    pub mode: Option<u32>,
+    pub accessed_unix_ms: Option<u64>,
+    pub modified_unix_ms: Option<u64>,
+    pub backup_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SpecialNodeKind {
+    NamedPipe,
+    CharacterDevice,
+    BlockDevice,
+    Socket,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum XattrSetMode {
+    Upsert,
+    Create,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SeekWhence {
+    Data,
+    Hole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SafeIoctl {
+    /// The portable, read-only FIONREAD query.
+    BytesAvailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FilesystemCapabilities {
+    pub server_epoch: Uuid,
+    pub writable: bool,
+    pub supports_locks: bool,
+    pub supports_atomic_rename: bool,
+    pub supports_directory_sync: bool,
+    pub supports_preallocation: bool,
+    pub supports_symlinks: bool,
+    pub supports_xattrs: bool,
+    pub supports_hard_links: bool,
+    pub supports_special_nodes: bool,
+    pub supports_copy_file_range: bool,
+    pub supports_seek_data_hole: bool,
+    pub supports_safe_ioctl: bool,
+    pub supports_poll: bool,
+    pub supports_bmap: bool,
+    pub supports_exchange_data: bool,
+    pub supports_volume_rename: bool,
+    pub supports_backup_time: bool,
+    pub supports_readdirplus: bool,
+    pub persistent_node_ids: bool,
+    pub restart_lock_replay: bool,
+    pub volume_name: String,
+    pub max_read_size: u64,
+    pub max_write_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FilesystemStats {
+    pub blocks: u64,
+    pub blocks_free: u64,
+    pub blocks_available: u64,
+    pub files: u64,
+    pub files_free: u64,
+    pub block_size: u32,
+    pub name_length: u32,
+    pub fragment_size: u32,
+}
 
 /// A wire-compatible UTF-8 string whose debug representation is redacted and
 /// whose allocation is cleared when it is dropped.
@@ -120,6 +313,8 @@ pub enum Request {
         username: String,
         password: SecretString,
     },
+    GetCapabilities,
+    StatFilesystem,
     GetMetadata {
         node: NodeId,
     },
@@ -128,11 +323,148 @@ pub enum Request {
     },
     OpenFile {
         node: NodeId,
+        options: FileOpenOptions,
+    },
+    CreateFile {
+        parent: NodeId,
+        name: Name,
+        mode: u32,
+        options: FileOpenOptions,
+    },
+    CreateDirectory {
+        parent: NodeId,
+        name: Name,
+        mode: u32,
+    },
+    CreateSymlink {
+        parent: NodeId,
+        name: Name,
+        target: Vec<u8>,
+    },
+    RemoveNode {
+        parent: NodeId,
+        name: Name,
+        directory: bool,
+    },
+    RenameNode {
+        parent: NodeId,
+        name: Name,
+        new_parent: NodeId,
+        new_name: Name,
+        mode: RenameMode,
+    },
+    CreateHardLink {
+        node: NodeId,
+        new_parent: NodeId,
+        new_name: Name,
+    },
+    CreateSpecialNode {
+        parent: NodeId,
+        name: Name,
+        kind: SpecialNodeKind,
+        mode: u32,
+        device_major: u32,
+        device_minor: u32,
+    },
+    ReadLink {
+        node: NodeId,
+    },
+    SetAttributes {
+        node: NodeId,
+        handle: Option<FileHandle>,
+        changes: AttributeChanges,
     },
     ReadRange {
         handle: FileHandle,
         offset: u64,
         length: u64,
+    },
+    WriteRange {
+        handle: FileHandle,
+        offset: u64,
+        length: u64,
+    },
+    FlushFile {
+        handle: FileHandle,
+        lock_owner: Option<u64>,
+    },
+    SyncFile {
+        handle: FileHandle,
+        data_only: bool,
+    },
+    SyncDirectory {
+        node: NodeId,
+    },
+    AllocateFile {
+        handle: FileHandle,
+        offset: u64,
+        length: u64,
+    },
+    GetXattr {
+        node: NodeId,
+        name: Name,
+        offset: u64,
+        length: u64,
+    },
+    SetXattr {
+        node: NodeId,
+        name: Name,
+        mode: XattrSetMode,
+        position: u32,
+        length: u64,
+    },
+    ListXattrs {
+        node: NodeId,
+    },
+    RemoveXattr {
+        node: NodeId,
+        name: Name,
+    },
+    CopyFileRange {
+        input: FileHandle,
+        input_offset: u64,
+        output: FileHandle,
+        output_offset: u64,
+        length: u64,
+    },
+    SeekFile {
+        handle: FileHandle,
+        offset: u64,
+        whence: SeekWhence,
+    },
+    SafeIoctl {
+        handle: FileHandle,
+        operation: SafeIoctl,
+    },
+    MapBlock {
+        node: NodeId,
+        block_size: u32,
+        block: u64,
+    },
+    ExchangeData {
+        parent: NodeId,
+        name: Name,
+        new_parent: NodeId,
+        new_name: Name,
+        options: u64,
+    },
+    SetVolumeName {
+        name: Name,
+    },
+    /// Release nodes for which the kernel has dropped its final lookup
+    /// reference. This is advisory and idempotent: stable node IDs can be
+    /// rediscovered if a later request names one again.
+    ForgetNodes {
+        nodes: Vec<NodeId>,
+    },
+    GetLock {
+        handle: FileHandle,
+        lock: FileLock,
+    },
+    SetLock {
+        handle: FileHandle,
+        lock: FileLock,
+        wait: bool,
     },
     CloseFile {
         handle: FileHandle,
@@ -162,6 +494,8 @@ pub enum Response {
         certificate_fingerprint: [u8; 32],
         proof: SecretProof,
     },
+    Capabilities(FilesystemCapabilities),
+    FilesystemStats(FilesystemStats),
     Metadata(Metadata),
     DirectoryListing {
         revision: DirectoryRevision,
@@ -172,10 +506,62 @@ pub enum Response {
         revision: FileRevision,
         size: u64,
     },
+    FileCreated {
+        metadata: Metadata,
+        handle: FileHandle,
+        revision: FileRevision,
+        size: u64,
+    },
+    NodeCreated(Metadata),
+    HardLinkCreated(Metadata),
+    NodeRemoved,
+    NodeRenamed,
+    LinkTarget(Vec<u8>),
+    AttributesChanged(Metadata),
     ReadData {
         revision: FileRevision,
         length: u64,
     },
+    WriteComplete {
+        written: u64,
+        revision: FileRevision,
+        size: u64,
+    },
+    FileFlushed,
+    FileSynced,
+    DirectorySynced,
+    FileAllocated {
+        revision: FileRevision,
+        size: u64,
+    },
+    XattrData {
+        length: u64,
+        total_size: u64,
+    },
+    XattrSet,
+    XattrNames(Vec<Name>),
+    XattrRemoved,
+    RangeCopied {
+        copied: u64,
+        revision: FileRevision,
+        size: u64,
+    },
+    FileSeeked {
+        offset: u64,
+    },
+    IoctlResult {
+        value: u64,
+    },
+    BlockMapped {
+        block: u64,
+    },
+    DataExchanged,
+    VolumeNameSet,
+    NodesForgotten,
+    LockStatus {
+        conflict: Option<FileLock>,
+    },
+    LockUpdated,
     FileClosed,
     Pong {
         nonce: u64,
@@ -188,26 +574,67 @@ pub struct Metadata {
     pub node: NodeId,
     pub kind: NodeKind,
     pub size: u64,
+    /// Permission and special bits without the file-type bits.
+    #[serde(default)]
+    pub mode: u32,
+    /// Number of allocated 512-byte blocks, when available.
+    #[serde(default)]
+    pub allocated_blocks: u64,
     pub revision: u64,
+    #[serde(default)]
+    pub accessed_unix_ms: u64,
     pub modified_unix_ms: u64,
+    #[serde(default)]
+    pub created_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub backup_unix_ms: Option<u64>,
+    #[serde(default = "default_link_count")]
+    pub link_count: u32,
+    #[serde(default)]
+    pub device_major: u32,
+    #[serde(default)]
+    pub device_minor: u32,
+}
+
+const fn default_link_count() -> u32 {
+    1
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub node: NodeId,
-    pub name: String,
+    pub name: Name,
     pub kind: NodeKind,
+    pub metadata: Metadata,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
     File,
     Directory,
     Symlink,
+    NamedPipe,
+    CharacterDevice,
+    BlockDevice,
+    Socket,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ErrorCode {
     Unauthenticated,
     NotFound,
     PermissionDenied,
+    AlreadyExists,
+    NotDirectory,
+    IsDirectory,
+    NotEmpty,
+    NoAttribute,
+    NoData,
+    NotTty,
+    ReadOnly,
+    Conflict,
+    WouldBlock,
+    NoSpace,
+    Busy,
+    NotSupported,
+    Offline,
     InvalidNode,
     InvalidHandle,
     InvalidRequest,

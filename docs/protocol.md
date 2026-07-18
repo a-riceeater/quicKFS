@@ -1,16 +1,15 @@
-# Protocol version 3
+# Protocol version 5
 
-QUIC/TLS uses the `quickfs/3` ALPN identifier and carries Postcard-encoded, four-byte big-endian length-prefixed control frames (maximum 1 MiB). Every envelope has a protocol version and request UUID. Independent operations use independent bidirectional streams on one session connection.
+QUIC/TLS uses the `quickfs/5` ALPN identifier. Control messages are Postcard-encoded envelopes with a protocol version and request UUID, framed by a four-byte big-endian length with a 1 MiB maximum. Independent operations use independent bidirectional streams on one authenticated connection. Versions are deliberately incompatible rather than silently negotiating different filesystem semantics.
 
-Requests: `Hello`, `Pair`, `Authenticate`, `GetMetadata`, `ListDirectory`, `OpenFile`, `ReadRange`, `CloseFile`, and `Ping`. Responses: `HelloAck`, `PairingProof`, `AuthenticateAck`, `Metadata`, `DirectoryListing`, `FileOpened`, `ReadData`, `FileClosed`, `Pong`, and `Error`.
+Pairing and login remain separated from filesystem access. `Pair` proves possession of a one-time secret while binding the pairing ID, fresh nonce, and exact TLS certificate fingerprint. `Authenticate` is sent only after the selected pin/CA/system trust policy authenticates TLS. Every filesystem request requires login, and every mutation additionally requires both daemon `--allow-writes` and the account's write grant.
 
-Except for hello, pairing, authentication, and ping, operations require successful authentication. Nodes and handles are opaque UUIDs. `ReadRange` supplies handle, offset, and length. `ReadData` supplies actual length and file revision, followed immediately by that many raw stream bytes. Reads are bounded and may be shorter at EOF. Checksums and notifications are reserved for later versions.
+Nodes and file handles are opaque UUIDs. `Name` is an arbitrary byte vector, so Unix filenames and xattr names are lossless rather than restricted to UTF-8. Persistent exports retain an epoch and secret node-key outside the export; clients reject a different epoch during reconnect. Handles are connection-local.
 
-`Pair` carries a one-time pairing UUID, a fresh 32-byte client nonce, and a client HMAC-SHA-256 proof of pairing-secret possession. The proof binds its role, pairing UUID, presented certificate fingerprint, and nonce. The server verifies this proof before consuming the pairing record. `PairingProof` returns a separately domain-separated server proof over the same values, so the client can authenticate the server without reflection. Pairing records are single-use. The client pins the fingerprint only after verifying the server proof and equality with the certificate presented by TLS.
+The request model covers capabilities/statfs, metadata and metadata-bearing directory snapshots, open/create/read/write/flush/sync/close, directory and symlink operations, remove and all rename modes, hardlinks, special nodes, xattrs, preallocation, range copy, data/hole seek, safe ioctl, poll readiness, block mapping, data exchange, volume name, backup time, byte-range locks, and advisory batch node forget. Responses carry updated metadata/revisions where coherency requires them.
 
-`Authenticate` carries a username and password only after the client has
-authenticated the connection's certificate with its selected exact-pin,
-private-CA, or operating-system trust policy. The server verifies a stored
-Argon2id password hash and returns `AuthenticateAck`; it never stores the
-plaintext password. The wire protocol does not yet express roles or per-user
-export permissions. See [Authentication and server trust](authentication.md).
+`ReadRange` and `GetXattr` return a control response followed by exactly the advertised raw byte count. `WriteRange` and `SetXattr` send a bounded raw body after their request frame. Default raw read/write chunks are limited to 8 MiB and are guarded by per-request, per-connection, and global budgets. Server-side copy carries no raw body and may cover a larger range so the server can use reflink/copy-range acceleration.
+
+Mutations are not blindly retried after a transport failure because their outcome may be ambiguous. Safe reads and lookups may reconnect and retry. A logical open handle is reopened only when the persistent server epoch and exact file revision still match; the surviving client then replays its advisory lock history.
+
+See [Authentication and server trust](authentication.md) and [Filesystem semantics](filesystem-semantics.md).

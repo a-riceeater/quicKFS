@@ -52,3 +52,8 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+[patch.crates-io]
+# fuser 0.17 calls libfuse's obsolete API-25 mount entry point on macOS.
+# macFUSE 5.3 requires the current channel-based mount API instead.
+fuser = { path = "vendor/fuser" }

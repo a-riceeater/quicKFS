@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
-//! Read-only bridge from macFUSE's synchronous callbacks to the authenticated
-//! asynchronous [`RemoteFilesystem`] protocol.
+//! macFUSE bridge for an authenticated asynchronous [`RemoteFilesystem`].
+//!
+//! Native callbacks dispatch reply-owning tasks onto the one Tokio runtime
+//! retained by [`Adapter`]. Synchronous methods remain available for focused
+//! unit tests and non-native callers.
 
-use quickfs_client_core::{ClientError, MAX_CLIENT_READ_SIZE, RemoteFilesystem};
+use quickfs_client_core::{
+    ClientError, MAX_CLIENT_READ_SIZE, MAX_CLIENT_WRITE_SIZE, RemoteFilesystem,
+};
 use quickfs_protocol::{
-    DirectoryEntry as RemoteDirectoryEntry, FileHandle as RemoteFileHandle, Metadata, NodeId,
-    NodeKind, ROOT_NODE,
+    AttributeChanges, DirectoryEntry as RemoteDirectoryEntry, FileAccess,
+    FileHandle as RemoteFileHandle, FileLock, FileOpenOptions, FilesystemCapabilities,
+    FilesystemStats, Metadata, Name, NodeId, NodeKind, ROOT_NODE, RenameMode, SafeIoctl,
+    SeekWhence, SpecialNodeKind, XattrSetMode,
 };
 use std::{
     collections::HashMap,
@@ -17,9 +24,19 @@ use std::{
     },
     time::Duration,
 };
-use tokio::runtime::{Builder, Runtime};
+use tokio::{
+    runtime::{Builder, Runtime},
+    sync::RwLock as AsyncRwLock,
+};
+use unicode_normalization::UnicodeNormalization;
 
 pub const ROOT_INODE: u64 = 1;
+
+/// fuser allocates a 16 MiB receive buffer on macOS. Individual protocol
+/// transfers remain bounded by the negotiated client/server limit and are
+/// joined inside one FUSE operation.
+pub const MAX_FUSE_IO_SIZE: u64 = 16 * 1024 * 1024;
+pub const MAX_FUSE_XATTR_SIZE: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LookupResult {
@@ -30,14 +47,29 @@ pub struct LookupResult {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DirectoryEntry {
     pub inode: u64,
-    pub name: String,
+    pub name: Name,
     pub kind: NodeKind,
+    pub metadata: Metadata,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DirectoryListing {
     pub parent_inode: u64,
+    pub revision: u64,
     pub entries: Vec<DirectoryEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreatedNode {
+    pub inode: u64,
+    pub metadata: Metadata,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreatedAndOpenedFile {
+    pub inode: u64,
+    pub metadata: Metadata,
+    pub handle: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,12 +82,18 @@ pub enum AdapterError {
     UnknownInode,
     #[error("unknown file handle")]
     UnknownHandle,
+    #[error("unknown directory handle")]
+    UnknownDirectoryHandle,
+    #[error("file handle does not belong to the requested inode")]
+    HandleInodeMismatch,
     #[error("directory entry was not found")]
     NotFound,
-    #[error("invalid lookup name")]
+    #[error("invalid path component")]
     InvalidName,
     #[error("server returned an invalid directory entry name")]
     InvalidRemoteName,
+    #[error("remote directory contains case-insensitively ambiguous names")]
+    AmbiguousName,
     #[error("local inode number space is exhausted")]
     InodeSpaceExhausted,
     #[error("local file-handle number space is exhausted")]
@@ -66,8 +104,22 @@ pub enum AdapterError {
     UnexpectedMetadata,
     #[error("server returned more bytes than requested")]
     UnexpectedReadLength,
-    #[error("FUSE read exceeds the client safety limit of {0} bytes")]
-    ReadTooLarge(u64),
+    #[error("server reported a partial write")]
+    UnexpectedWriteLength,
+    #[error("remote file revision changed during a ranged read")]
+    StaleRevision,
+    #[error("FUSE request exceeds the adapter safety limit of {0} bytes")]
+    RequestTooLarge(u64),
+    #[error("server advertised an invalid zero I/O limit")]
+    InvalidCapabilities,
+    #[error("operation requires a writable export")]
+    ReadOnly,
+    #[error("operation is not supported by the negotiated filesystem API")]
+    Unsupported,
+    #[error("file was not opened with the required access mode")]
+    InvalidAccess,
+    #[error("file offset plus length overflows")]
+    InvalidRange,
     #[error(transparent)]
     Client(#[from] ClientError),
 }
@@ -81,21 +133,46 @@ struct InodeRecord {
 struct InodeTable {
     by_inode: HashMap<u64, InodeRecord>,
     by_node: HashMap<NodeId, u64>,
+    by_entry: HashMap<(u64, Name), u64>,
+    lookups: HashMap<u64, u64>,
 }
 
-/// A single authenticated mount session. The same Tokio runtime and remote
-/// connection are retained for every callback until unmount.
-pub struct Adapter {
+#[derive(Clone, Copy)]
+struct FileHandleRecord {
+    remote: RemoteFileHandle,
+    inode: u64,
+    access: FileAccess,
+    revision: u64,
+    size: u64,
+}
+
+#[derive(Clone)]
+struct DirectoryHandleRecord {
+    inode: u64,
+    listing: DirectoryListing,
+}
+
+struct AdapterState {
     remote: Arc<dyn RemoteFilesystem>,
     callback_timeout: Duration,
+    capabilities: Mutex<Option<FilesystemCapabilities>>,
     inodes: Mutex<InodeTable>,
-    handles: Mutex<HashMap<u64, RemoteFileHandle>>,
+    handles: Mutex<HashMap<u64, FileHandleRecord>>,
+    handle_operations: Mutex<HashMap<u64, Arc<AsyncRwLock<()>>>>,
+    directory_handles: Mutex<HashMap<u64, DirectoryHandleRecord>>,
     next_inode: AtomicU64,
     next_handle: AtomicU64,
     #[cfg(all(target_os = "macos", feature = "macfuse"))]
     owner_uid: u32,
     #[cfg(all(target_os = "macos", feature = "macfuse"))]
     owner_gid: u32,
+}
+
+/// One authenticated mount session. Clones share all inode/handle state, the
+/// remote connection, and exactly one Tokio runtime.
+#[derive(Clone)]
+pub struct Adapter {
+    state: Arc<AdapterState>,
     runtime: Arc<Runtime>,
 }
 
@@ -129,146 +206,1166 @@ impl Adapter {
             parent_inode: ROOT_INODE,
         };
         Self {
-            remote,
-            callback_timeout,
-            inodes: Mutex::new(InodeTable {
-                by_inode: HashMap::from([(ROOT_INODE, root)]),
-                by_node: HashMap::from([(ROOT_NODE, ROOT_INODE)]),
+            state: Arc::new(AdapterState {
+                remote,
+                callback_timeout,
+                capabilities: Mutex::new(None),
+                inodes: Mutex::new(InodeTable {
+                    by_inode: HashMap::from([(ROOT_INODE, root)]),
+                    by_node: HashMap::from([(ROOT_NODE, ROOT_INODE)]),
+                    by_entry: HashMap::new(),
+                    lookups: HashMap::from([(ROOT_INODE, u64::MAX)]),
+                }),
+                handles: Mutex::new(HashMap::new()),
+                handle_operations: Mutex::new(HashMap::new()),
+                directory_handles: Mutex::new(HashMap::new()),
+                next_inode: AtomicU64::new(ROOT_INODE + 1),
+                next_handle: AtomicU64::new(1),
+                #[cfg(all(target_os = "macos", feature = "macfuse"))]
+                owner_uid: rustix::process::geteuid().as_raw(),
+                #[cfg(all(target_os = "macos", feature = "macfuse"))]
+                owner_gid: rustix::process::getegid().as_raw(),
             }),
-            handles: Mutex::new(HashMap::new()),
-            next_inode: AtomicU64::new(ROOT_INODE + 1),
-            next_handle: AtomicU64::new(1),
-            #[cfg(all(target_os = "macos", feature = "macfuse"))]
-            owner_uid: rustix::process::geteuid().as_raw(),
-            #[cfg(all(target_os = "macos", feature = "macfuse"))]
-            owner_gid: rustix::process::getegid().as_raw(),
             runtime,
         }
     }
 
     pub fn callback_timeout(&self) -> Duration {
-        self.callback_timeout
+        self.state.callback_timeout
     }
 
     pub fn remote(&self) -> &Arc<dyn RemoteFilesystem> {
-        &self.remote
+        &self.state.remote
     }
 
     pub fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
     }
 
-    /// Resolve a child name beneath an inode. macFUSE issues this operation
-    /// before most child `getattr` and `open` calls.
+    pub fn probe_capabilities(&self) -> Result<FilesystemCapabilities, AdapterError> {
+        self.block_on(self.capabilities_async())
+    }
+
+    pub fn cached_capabilities(&self) -> Option<FilesystemCapabilities> {
+        self.state
+            .capabilities
+            .lock()
+            .ok()
+            .and_then(|capabilities| capabilities.clone())
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.cached_capabilities()
+            .is_some_and(|value| value.writable)
+    }
+
     pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<LookupResult, AdapterError> {
-        validate_name(name).map_err(|()| AdapterError::InvalidName)?;
-        let parent = self.inode_record(parent_inode)?;
-        self.execute(async {
-            let entries = self.remote.list_directory(parent.node).await?;
-            let entry = entries
-                .into_iter()
-                .find(|entry| entry.name == name)
-                .ok_or(AdapterError::NotFound)?;
-            validate_remote_name(&entry)?;
-            let inode = self.remember_inode(entry.node, parent_inode)?;
-            let metadata = self.remote.get_metadata(entry.node).await?;
-            validate_metadata(entry.node, &metadata)?;
-            Ok(LookupResult { inode, metadata })
-        })
+        self.block_on(self.lookup_async(parent_inode, Name::from(name)))
     }
 
     pub fn getattr(&self, inode: u64) -> Result<Metadata, AdapterError> {
-        let record = self.inode_record(inode)?;
-        self.execute(async {
-            let metadata = self.remote.get_metadata(record.node).await?;
-            validate_metadata(record.node, &metadata)?;
-            Ok(metadata)
-        })
+        self.block_on(self.getattr_async(inode))
     }
 
     pub fn readdir(&self, inode: u64) -> Result<DirectoryListing, AdapterError> {
+        self.block_on(self.readdir_async(inode))
+    }
+
+    pub fn open(&self, inode: u64) -> Result<u64, AdapterError> {
+        self.block_on(self.open_async(inode, FileOpenOptions::READ_ONLY))
+    }
+
+    pub fn read(&self, handle: u64, offset: u64, length: u64) -> Result<Vec<u8>, AdapterError> {
+        self.block_on(self.read_async(handle, offset, length))
+    }
+
+    pub fn write(&self, handle: u64, offset: u64, data: &[u8]) -> Result<u64, AdapterError> {
+        self.block_on(self.write_async(handle, offset, data))
+    }
+
+    pub fn release(&self, handle: u64) -> Result<(), AdapterError> {
+        self.block_on(self.release_async(handle, false, None))
+    }
+
+    pub(crate) async fn capabilities_async(&self) -> Result<FilesystemCapabilities, AdapterError> {
+        if let Some(capabilities) = self.cached_capabilities() {
+            return Ok(capabilities);
+        }
+        let capabilities = self
+            .execute(async { Ok(self.state.remote.capabilities().await?) })
+            .await?;
+        if capabilities.max_read_size == 0 || capabilities.max_write_size == 0 {
+            return Err(AdapterError::InvalidCapabilities);
+        }
+        let mut cached = self
+            .state
+            .capabilities
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        if cached.is_none() {
+            *cached = Some(capabilities.clone());
+        }
+        Ok(cached.clone().unwrap_or(capabilities))
+    }
+
+    pub(crate) async fn lookup_async(
+        &self,
+        parent_inode: u64,
+        name: Name,
+    ) -> Result<LookupResult, AdapterError> {
+        validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
+        let parent = self.inode_record(parent_inode)?;
+        self.execute(async {
+            let entries = self.state.remote.list_directory(parent.node).await?;
+            let entry = select_remote_entry(entries, &name)?;
+            validate_remote_name(&entry)?;
+            let inode = self.remember_entry(entry.node, parent_inode, &entry.name)?;
+            self.add_lookup(inode, 1)?;
+            let metadata = self.state.remote.get_metadata(entry.node).await?;
+            validate_metadata(entry.node, &metadata)?;
+            Ok(LookupResult { inode, metadata })
+        })
+        .await
+    }
+
+    pub(crate) async fn getattr_async(&self, inode: u64) -> Result<Metadata, AdapterError> {
         let record = self.inode_record(inode)?;
         self.execute(async {
-            let remote_entries = self.remote.list_directory(record.node).await?;
-            let mut entries = Vec::with_capacity(remote_entries.len());
-            for entry in remote_entries {
+            let metadata = self.state.remote.get_metadata(record.node).await?;
+            validate_metadata(record.node, &metadata)?;
+            Ok(metadata)
+        })
+        .await
+    }
+
+    pub(crate) async fn readdir_async(&self, inode: u64) -> Result<DirectoryListing, AdapterError> {
+        let record = self.inode_record(inode)?;
+        self.execute(async {
+            let snapshot = self
+                .state
+                .remote
+                .list_directory_snapshot(record.node)
+                .await?;
+            validate_case_insensitive_directory(&snapshot.entries)?;
+            let mut entries = Vec::with_capacity(snapshot.entries.len());
+            for entry in snapshot.entries {
                 validate_remote_name(&entry)?;
-                // The v3 server resolves safe in-export symlink targets to an
-                // opaque target node, but does not expose a readlink operation.
-                // Match the existing CLI semantics by presenting that target's
-                // actual type to Finder instead of advertising an unusable link.
-                let kind = if entry.kind == NodeKind::Symlink {
-                    let metadata = self.remote.get_metadata(entry.node).await?;
-                    validate_metadata(entry.node, &metadata)?;
-                    metadata.kind
-                } else {
-                    entry.kind
-                };
+                validate_metadata(entry.node, &entry.metadata)?;
+                if entry.kind != entry.metadata.kind {
+                    return Err(AdapterError::UnexpectedMetadata);
+                }
                 entries.push(DirectoryEntry {
-                    inode: self.remember_inode(entry.node, inode)?,
+                    inode: self.remember_entry(entry.node, inode, &entry.name)?,
                     name: entry.name,
-                    kind,
+                    kind: entry.kind,
+                    metadata: entry.metadata,
                 });
             }
             Ok(DirectoryListing {
                 parent_inode: record.parent_inode,
+                revision: snapshot.revision,
                 entries,
             })
         })
+        .await
     }
 
-    pub fn open(&self, inode: u64) -> Result<u64, AdapterError> {
+    pub(crate) async fn opendir_async(&self, inode: u64) -> Result<u64, AdapterError> {
+        let metadata = self.getattr_async(inode).await?;
+        if metadata.kind != NodeKind::Directory {
+            return Err(ClientError::Server(
+                quickfs_protocol::ErrorCode::NotDirectory,
+                "node is not a directory".into(),
+            )
+            .into());
+        }
+        let listing = self.readdir_async(inode).await?;
+        let handle = self.next_handle()?;
+        self.state
+            .directory_handles
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .insert(handle, DirectoryHandleRecord { inode, listing });
+        Ok(handle)
+    }
+
+    pub(crate) fn directory_listing(
+        &self,
+        handle: u64,
+        inode: u64,
+    ) -> Result<DirectoryListing, AdapterError> {
+        let record = self
+            .state
+            .directory_handles
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .get(&handle)
+            .cloned()
+            .ok_or(AdapterError::UnknownDirectoryHandle)?;
+        if record.inode != inode {
+            return Err(AdapterError::HandleInodeMismatch);
+        }
+        Ok(record.listing)
+    }
+
+    pub(crate) fn releasedir(&self, handle: u64) -> Result<(), AdapterError> {
+        self.state
+            .directory_handles
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .remove(&handle)
+            .map(|record| record.inode)
+            .ok_or(AdapterError::UnknownDirectoryHandle)?;
+        // Plain readdir does not create kernel lookup references, but building
+        // its snapshot necessarily discovers every child. Once the directory
+        // handle closes, prune any such zero-reference translations and tell
+        // the server in one batch.
+        let candidates = self
+            .state
+            .inodes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .by_inode
+            .keys()
+            .copied()
+            .map(|inode| (inode, 0))
+            .collect::<Vec<_>>();
+        self.forget_inodes(&candidates)
+    }
+
+    pub(crate) async fn open_async(
+        &self,
+        inode: u64,
+        options: FileOpenOptions,
+    ) -> Result<u64, AdapterError> {
+        if options.access.can_write() {
+            self.require_writable().await?;
+        }
         let record = self.inode_record(inode)?;
         self.execute(async {
-            let (remote_handle, _, _) = self.remote.open_file(record.node).await?;
-            match self.remember_handle(remote_handle) {
+            let opened = self
+                .state
+                .remote
+                .open_file_with_options(record.node, options)
+                .await?;
+            match self.remember_file_handle(inode, options.access, opened) {
                 Ok(handle) => Ok(handle),
                 Err(error) => {
-                    let _ = self.remote.close_file(remote_handle).await;
+                    let _ = self.state.remote.close_file(opened.handle).await;
                     Err(error)
                 }
             }
         })
+        .await
     }
 
-    pub fn read(&self, handle: u64, offset: u64, length: u64) -> Result<Vec<u8>, AdapterError> {
-        if length > MAX_CLIENT_READ_SIZE || offset.checked_add(length).is_none() {
-            return Err(AdapterError::ReadTooLarge(MAX_CLIENT_READ_SIZE));
-        }
-        let remote_handle = self.remote_handle(handle)?;
+    pub(crate) async fn create_file_async(
+        &self,
+        parent_inode: u64,
+        name: Name,
+        mode: u32,
+        options: FileOpenOptions,
+    ) -> Result<CreatedAndOpenedFile, AdapterError> {
+        self.require_writable().await?;
+        validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
+        let parent = self.inode_record(parent_inode)?;
         self.execute(async {
-            let data = self
+            let created = self
+                .state
                 .remote
-                .read_range(remote_handle, offset, length)
+                .create_file(parent.node, name.clone(), mode, options)
                 .await?;
-            if u64::try_from(data.len()).unwrap_or(u64::MAX) > length {
-                return Err(AdapterError::UnexpectedReadLength);
+            validate_metadata(created.metadata.node, &created.metadata)?;
+            let inode = self.remember_entry(created.metadata.node, parent_inode, &name)?;
+            self.add_lookup(inode, 1)?;
+            match self.remember_file_handle(inode, options.access, created.opened) {
+                Ok(handle) => Ok(CreatedAndOpenedFile {
+                    inode,
+                    metadata: created.metadata,
+                    handle,
+                }),
+                Err(error) => {
+                    let _ = self.state.remote.close_file(created.opened.handle).await;
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn create_directory_async(
+        &self,
+        parent_inode: u64,
+        name: Name,
+        mode: u32,
+    ) -> Result<CreatedNode, AdapterError> {
+        self.require_writable().await?;
+        validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
+        let parent = self.inode_record(parent_inode)?;
+        self.execute(async {
+            let metadata = self
+                .state
+                .remote
+                .create_directory(parent.node, name.clone(), mode)
+                .await?;
+            validate_metadata(metadata.node, &metadata)?;
+            let inode = self.remember_entry(metadata.node, parent_inode, &name)?;
+            self.add_lookup(inode, 1)?;
+            Ok(CreatedNode { inode, metadata })
+        })
+        .await
+    }
+
+    pub(crate) async fn create_symlink_async(
+        &self,
+        parent_inode: u64,
+        name: Name,
+        target: Vec<u8>,
+    ) -> Result<CreatedNode, AdapterError> {
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_symlinks {
+            return Err(AdapterError::Unsupported);
+        }
+        validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
+        let parent = self.inode_record(parent_inode)?;
+        self.execute(async {
+            let metadata = self
+                .state
+                .remote
+                .create_symlink(parent.node, name.clone(), target)
+                .await?;
+            validate_metadata(metadata.node, &metadata)?;
+            let inode = self.remember_entry(metadata.node, parent_inode, &name)?;
+            self.add_lookup(inode, 1)?;
+            Ok(CreatedNode { inode, metadata })
+        })
+        .await
+    }
+
+    pub(crate) async fn readlink_async(&self, inode: u64) -> Result<Vec<u8>, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_symlinks {
+            return Err(AdapterError::Unsupported);
+        }
+        let record = self.inode_record(inode)?;
+        self.execute(async { Ok(self.state.remote.read_link(record.node).await?) })
+            .await
+    }
+
+    pub(crate) async fn create_hard_link_async(
+        &self,
+        inode: u64,
+        new_parent_inode: u64,
+        new_name: Name,
+    ) -> Result<CreatedNode, AdapterError> {
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_hard_links {
+            return Err(AdapterError::Unsupported);
+        }
+        validate_name(&new_name).map_err(|()| AdapterError::InvalidName)?;
+        let node = self.inode_record(inode)?.node;
+        let new_parent = self.inode_record(new_parent_inode)?.node;
+        self.execute(async {
+            let metadata = self
+                .state
+                .remote
+                .create_hard_link(node, new_parent, new_name.clone())
+                .await?;
+            validate_metadata(node, &metadata)?;
+            let linked_inode = self.remember_entry(node, new_parent_inode, &new_name)?;
+            self.add_lookup(linked_inode, 1)?;
+            Ok(CreatedNode {
+                inode: linked_inode,
+                metadata,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn create_special_node_async(
+        &self,
+        parent_inode: u64,
+        name: Name,
+        kind: SpecialNodeKind,
+        mode: u32,
+        device_major: u32,
+        device_minor: u32,
+    ) -> Result<CreatedNode, AdapterError> {
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_special_nodes {
+            return Err(AdapterError::Unsupported);
+        }
+        validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
+        let parent = self.inode_record(parent_inode)?.node;
+        self.execute(async {
+            let metadata = self
+                .state
+                .remote
+                .create_special_node(parent, name.clone(), kind, mode, device_major, device_minor)
+                .await?;
+            validate_metadata(metadata.node, &metadata)?;
+            let inode = self.remember_entry(metadata.node, parent_inode, &name)?;
+            self.add_lookup(inode, 1)?;
+            Ok(CreatedNode { inode, metadata })
+        })
+        .await
+    }
+
+    pub(crate) async fn remove_async(
+        &self,
+        parent_inode: u64,
+        name: Name,
+        directory: bool,
+    ) -> Result<(), AdapterError> {
+        self.require_writable().await?;
+        validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
+        let parent = self.inode_record(parent_inode)?;
+        self.execute(async {
+            self.state
+                .remote
+                .remove_node(parent.node, name.clone(), directory)
+                .await?;
+            self.forget_entry(parent_inode, &name)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn rename_async(
+        &self,
+        parent_inode: u64,
+        name: Name,
+        new_parent_inode: u64,
+        new_name: Name,
+        mode: RenameMode,
+    ) -> Result<(), AdapterError> {
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_atomic_rename {
+            return Err(AdapterError::Unsupported);
+        }
+        validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
+        validate_name(&new_name).map_err(|()| AdapterError::InvalidName)?;
+        let parent = self.inode_record(parent_inode)?;
+        let new_parent = self.inode_record(new_parent_inode)?;
+        self.execute(async {
+            self.state
+                .remote
+                .rename_node(
+                    parent.node,
+                    name.clone(),
+                    new_parent.node,
+                    new_name.clone(),
+                    mode,
+                )
+                .await?;
+            self.move_entry(parent_inode, &name, new_parent_inode, &new_name, mode)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn setattr_async(
+        &self,
+        inode: u64,
+        handle: Option<u64>,
+        changes: AttributeChanges,
+    ) -> Result<Metadata, AdapterError> {
+        self.require_writable().await?;
+        let record = self.inode_record(inode)?;
+        let operation = handle
+            .map(|handle| self.file_operation(handle))
+            .transpose()?;
+        let _operation_guard = match &operation {
+            Some(operation) => Some(operation.write().await),
+            None => None,
+        };
+        let remote_handle = match handle {
+            Some(handle) => {
+                let opened = self.file_handle(handle)?;
+                if opened.inode != inode {
+                    return Err(AdapterError::HandleInodeMismatch);
+                }
+                Some(opened.remote)
+            }
+            None => None,
+        };
+        let metadata = self
+            .execute(async {
+                let metadata = self
+                    .state
+                    .remote
+                    .set_attributes(record.node, remote_handle, changes)
+                    .await?;
+                validate_metadata(record.node, &metadata)?;
+                Ok(metadata)
+            })
+            .await?;
+        if let Some(handle) = handle {
+            self.update_file_handle(handle, metadata.revision, metadata.size)?;
+        }
+        Ok(metadata)
+    }
+
+    pub(crate) async fn read_async(
+        &self,
+        handle: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, AdapterError> {
+        validate_io_range(offset, length)?;
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.read().await;
+        let opened = self.file_handle(handle)?;
+        if !opened.access.can_read() {
+            return Err(AdapterError::InvalidAccess);
+        }
+        let capabilities = self.capabilities_async().await?;
+        let chunk_limit = capabilities.max_read_size.min(MAX_CLIENT_READ_SIZE);
+        if chunk_limit == 0 {
+            return Err(AdapterError::InvalidCapabilities);
+        }
+        self.execute(async {
+            let capacity = usize::try_from(length)
+                .map_err(|_| AdapterError::RequestTooLarge(MAX_FUSE_IO_SIZE))?;
+            let mut data = Vec::with_capacity(capacity);
+            let mut remaining = length;
+            let mut position = offset;
+            let mut expected_revision = opened.revision;
+            while remaining > 0 {
+                let requested = remaining.min(chunk_limit);
+                let result = self
+                    .state
+                    .remote
+                    .read_range_versioned(opened.remote, position, requested)
+                    .await?;
+                let received = u64::try_from(result.data.len())
+                    .map_err(|_| AdapterError::UnexpectedReadLength)?;
+                if received > requested {
+                    return Err(AdapterError::UnexpectedReadLength);
+                }
+                if result.revision != 0 {
+                    if expected_revision != 0 && result.revision != expected_revision {
+                        return Err(AdapterError::StaleRevision);
+                    }
+                    expected_revision = result.revision;
+                }
+                data.extend_from_slice(&result.data);
+                if received < requested {
+                    break;
+                }
+                position = position
+                    .checked_add(received)
+                    .ok_or(AdapterError::InvalidRange)?;
+                remaining -= received;
             }
             Ok(data)
         })
+        .await
     }
 
-    pub fn release(&self, handle: u64) -> Result<(), AdapterError> {
-        let remote_handle = self.take_remote_handle(handle)?;
+    pub(crate) async fn write_async(
+        &self,
+        handle: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64, AdapterError> {
+        let length = u64::try_from(data.len())
+            .map_err(|_| AdapterError::RequestTooLarge(MAX_FUSE_IO_SIZE))?;
+        validate_io_range(offset, length)?;
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.write().await;
+        let capabilities = self.require_writable().await?;
+        let opened = self.file_handle(handle)?;
+        if !opened.access.can_write() {
+            return Err(AdapterError::InvalidAccess);
+        }
+        let chunk_limit = capabilities.max_write_size.min(MAX_CLIENT_WRITE_SIZE);
+        if chunk_limit == 0 {
+            return Err(AdapterError::InvalidCapabilities);
+        }
+        let (written, revision, size) = self
+            .execute(async {
+                let mut written = 0_u64;
+                let mut position = offset;
+                let mut revision = opened.revision;
+                let mut size = opened.size;
+                while written < length {
+                    let remaining = length - written;
+                    let amount = remaining.min(chunk_limit);
+                    let start = usize::try_from(written)
+                        .map_err(|_| AdapterError::RequestTooLarge(MAX_FUSE_IO_SIZE))?;
+                    let end = usize::try_from(written + amount)
+                        .map_err(|_| AdapterError::RequestTooLarge(MAX_FUSE_IO_SIZE))?;
+                    let result = self
+                        .state
+                        .remote
+                        .write_range(opened.remote, position, &data[start..end])
+                        .await?;
+                    if result.written != amount {
+                        return Err(AdapterError::UnexpectedWriteLength);
+                    }
+                    written += result.written;
+                    position = position
+                        .checked_add(result.written)
+                        .ok_or(AdapterError::InvalidRange)?;
+                    revision = result.revision;
+                    size = result.size;
+                }
+                Ok((written, revision, size))
+            })
+            .await?;
+        self.update_file_handle(handle, revision, size)?;
+        Ok(written)
+    }
+
+    pub(crate) async fn flush_async(
+        &self,
+        handle: u64,
+        lock_owner: Option<u64>,
+    ) -> Result<(), AdapterError> {
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.write().await;
+        let opened = self.file_handle(handle)?;
         self.execute(async {
-            self.remote.close_file(remote_handle).await?;
+            self.state
+                .remote
+                .flush_file(opened.remote, lock_owner)
+                .await?;
             Ok(())
         })
+        .await
     }
 
-    fn execute<T, F>(&self, future: F) -> Result<T, AdapterError>
-    where
-        F: Future<Output = Result<T, AdapterError>>,
-    {
-        self.runtime.block_on(async {
-            tokio::time::timeout(self.callback_timeout, future)
-                .await
-                .map_err(|_| AdapterError::CallbackTimedOut)?
+    pub(crate) async fn fsync_async(
+        &self,
+        handle: u64,
+        data_only: bool,
+    ) -> Result<(), AdapterError> {
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.write().await;
+        let opened = self.file_handle(handle)?;
+        self.execute(async {
+            self.state
+                .remote
+                .sync_file(opened.remote, data_only)
+                .await?;
+            Ok(())
         })
+        .await
+    }
+
+    pub(crate) async fn fsyncdir_async(&self, inode: u64, handle: u64) -> Result<(), AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_directory_sync {
+            return if capabilities.writable {
+                Err(AdapterError::Unsupported)
+            } else {
+                Ok(())
+            };
+        }
+        self.directory_listing(handle, inode)?;
+        let record = self.inode_record(inode)?;
+        self.execute(async {
+            self.state.remote.sync_directory(record.node).await?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn allocate_async(
+        &self,
+        handle: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), AdapterError> {
+        validate_allocation_range(offset, length)?;
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.write().await;
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_preallocation {
+            return Err(AdapterError::Unsupported);
+        }
+        let opened = self.file_handle(handle)?;
+        if !opened.access.can_write() {
+            return Err(AdapterError::InvalidAccess);
+        }
+        let result = self
+            .execute(async {
+                Ok(self
+                    .state
+                    .remote
+                    .allocate_file(opened.remote, offset, length)
+                    .await?)
+            })
+            .await?;
+        self.update_file_handle(handle, result.revision, result.size)
+    }
+
+    pub(crate) async fn copy_file_range_async(
+        &self,
+        input_handle: u64,
+        input_offset: u64,
+        output_handle: u64,
+        output_offset: u64,
+        length: u64,
+    ) -> Result<u64, AdapterError> {
+        validate_range(input_offset, length)?;
+        validate_range(output_offset, length)?;
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_copy_file_range {
+            return Err(AdapterError::Unsupported);
+        }
+        let input = self.file_handle(input_handle)?;
+        let output = self.file_handle(output_handle)?;
+        if !input.access.can_read() || !output.access.can_write() {
+            return Err(AdapterError::InvalidAccess);
+        }
+        let input_operation = self.file_operation(input_handle)?;
+        let output_operation = self.file_operation(output_handle)?;
+        let same_operation = Arc::ptr_eq(&input_operation, &output_operation);
+        let (first, second) = if input_handle <= output_handle {
+            (&input_operation, &output_operation)
+        } else {
+            (&output_operation, &input_operation)
+        };
+        let _first = first.write().await;
+        let _second = if same_operation {
+            None
+        } else {
+            Some(second.write().await)
+        };
+        let result = self
+            .execute(async {
+                let result = self
+                    .state
+                    .remote
+                    .copy_file_range(
+                        input.remote,
+                        input_offset,
+                        output.remote,
+                        output_offset,
+                        length,
+                    )
+                    .await?;
+                if result.written > length {
+                    return Err(AdapterError::UnexpectedWriteLength);
+                }
+                Ok(result)
+            })
+            .await?;
+        self.update_file_handle(output_handle, result.revision, result.size)?;
+        Ok(result.written)
+    }
+
+    pub(crate) async fn lseek_async(
+        &self,
+        handle: u64,
+        offset: u64,
+        whence: SeekWhence,
+    ) -> Result<u64, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_seek_data_hole {
+            return Err(AdapterError::Unsupported);
+        }
+        let opened = self.file_handle(handle)?;
+        self.execute(async {
+            Ok(self
+                .state
+                .remote
+                .seek_file(opened.remote, offset, whence)
+                .await?)
+        })
+        .await
+    }
+
+    pub(crate) async fn safe_ioctl_async(
+        &self,
+        handle: u64,
+        operation: SafeIoctl,
+    ) -> Result<u64, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_safe_ioctl {
+            return Err(AdapterError::Unsupported);
+        }
+        let opened = self.file_handle(handle)?;
+        self.execute(async {
+            Ok(self
+                .state
+                .remote
+                .safe_ioctl(opened.remote, operation)
+                .await?)
+        })
+        .await
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macfuse"))]
+    pub(crate) fn poll_events(
+        &self,
+        handle: u64,
+        requested: fuser::PollEvents,
+    ) -> Result<fuser::PollEvents, AdapterError> {
+        let opened = self.file_handle(handle)?;
+        let mut ready = fuser::PollEvents::empty();
+        if opened.access.can_read() {
+            ready |= fuser::PollEvents::POLLIN | fuser::PollEvents::POLLRDNORM;
+        }
+        if opened.access.can_write() {
+            ready |= fuser::PollEvents::POLLOUT | fuser::PollEvents::POLLWRNORM;
+        }
+        Ok(ready & requested)
+    }
+
+    pub(crate) async fn map_block_async(
+        &self,
+        inode: u64,
+        block_size: u32,
+        block: u64,
+    ) -> Result<u64, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_bmap {
+            return Err(AdapterError::Unsupported);
+        }
+        let node = self.inode_record(inode)?.node;
+        self.execute(async { Ok(self.state.remote.map_block(node, block_size, block).await?) })
+            .await
+    }
+
+    pub(crate) async fn exchange_data_async(
+        &self,
+        parent_inode: u64,
+        name: Name,
+        new_parent_inode: u64,
+        new_name: Name,
+        options: u64,
+    ) -> Result<(), AdapterError> {
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_exchange_data {
+            return Err(AdapterError::Unsupported);
+        }
+        validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
+        validate_name(&new_name).map_err(|()| AdapterError::InvalidName)?;
+        let parent = self.inode_record(parent_inode)?.node;
+        let new_parent = self.inode_record(new_parent_inode)?.node;
+        self.execute(async {
+            self.state
+                .remote
+                .exchange_data(parent, name, new_parent, new_name, options)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn set_volume_name_async(&self, name: Name) -> Result<(), AdapterError> {
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_volume_rename {
+            return Err(AdapterError::Unsupported);
+        }
+        let cached_name =
+            String::from_utf8(name.as_bytes().to_vec()).map_err(|_| AdapterError::InvalidName)?;
+        self.execute(async {
+            self.state.remote.set_volume_name(name).await?;
+            Ok(())
+        })
+        .await?;
+        if let Ok(mut cached) = self.state.capabilities.lock()
+            && let Some(capabilities) = cached.as_mut()
+        {
+            capabilities.volume_name = cached_name;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn get_lock_async(
+        &self,
+        handle: u64,
+        lock: FileLock,
+    ) -> Result<Option<FileLock>, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_locks {
+            return Err(AdapterError::Unsupported);
+        }
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.write().await;
+        let opened = self.file_handle(handle)?;
+        self.execute(async { Ok(self.state.remote.get_lock(opened.remote, lock).await?) })
+            .await
+    }
+
+    pub(crate) async fn set_lock_async(
+        &self,
+        handle: u64,
+        lock: FileLock,
+        wait: bool,
+    ) -> Result<(), AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_locks {
+            return Err(AdapterError::Unsupported);
+        }
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.write().await;
+        let opened = self.file_handle(handle)?;
+        self.execute(async {
+            self.state
+                .remote
+                .set_lock(opened.remote, lock, wait)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn statfs_async(&self) -> Result<FilesystemStats, AdapterError> {
+        self.execute(async { Ok(self.state.remote.stat_filesystem().await?) })
+            .await
+    }
+
+    pub(crate) async fn xattr_size_async(
+        &self,
+        inode: u64,
+        name: Name,
+    ) -> Result<u64, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_xattrs {
+            return Err(AdapterError::Unsupported);
+        }
+        let node = self.inode_record(inode)?.node;
+        self.execute(async {
+            let read = self.state.remote.get_xattr(node, name, 0, 0).await?;
+            if read.total_size > MAX_FUSE_XATTR_SIZE {
+                return Err(AdapterError::RequestTooLarge(MAX_FUSE_XATTR_SIZE));
+            }
+            Ok(read.total_size)
+        })
+        .await
+    }
+
+    pub(crate) async fn get_xattr_async(
+        &self,
+        inode: u64,
+        name: Name,
+    ) -> Result<Vec<u8>, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_xattrs {
+            return Err(AdapterError::Unsupported);
+        }
+        let node = self.inode_record(inode)?.node;
+        let chunk = capabilities.max_read_size.min(MAX_CLIENT_READ_SIZE);
+        if chunk == 0 {
+            return Err(AdapterError::InvalidCapabilities);
+        }
+        self.execute(async {
+            let first = self
+                .state
+                .remote
+                .get_xattr(node, name.clone(), 0, 0)
+                .await?;
+            if first.total_size > MAX_FUSE_XATTR_SIZE {
+                return Err(AdapterError::RequestTooLarge(MAX_FUSE_XATTR_SIZE));
+            }
+            let capacity = usize::try_from(first.total_size)
+                .map_err(|_| AdapterError::RequestTooLarge(MAX_FUSE_XATTR_SIZE))?;
+            let mut value = Vec::with_capacity(capacity);
+            let mut offset = 0_u64;
+            while offset < first.total_size {
+                let amount = (first.total_size - offset).min(chunk);
+                let read = self
+                    .state
+                    .remote
+                    .get_xattr(node, name.clone(), offset, amount)
+                    .await?;
+                if read.total_size != first.total_size || read.data.len() as u64 != amount {
+                    return Err(AdapterError::UnexpectedReadLength);
+                }
+                value.extend_from_slice(&read.data);
+                offset += amount;
+            }
+            Ok(value)
+        })
+        .await
+    }
+
+    pub(crate) async fn set_xattr_async(
+        &self,
+        inode: u64,
+        name: Name,
+        value: Vec<u8>,
+        mode: XattrSetMode,
+        position: u32,
+    ) -> Result<(), AdapterError> {
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_xattrs {
+            return Err(AdapterError::Unsupported);
+        }
+        if value.len() as u64 > MAX_FUSE_XATTR_SIZE {
+            return Err(AdapterError::RequestTooLarge(MAX_FUSE_XATTR_SIZE));
+        }
+        let chunk = capabilities.max_write_size.min(MAX_CLIENT_WRITE_SIZE);
+        if chunk == 0 {
+            return Err(AdapterError::InvalidCapabilities);
+        }
+        let node = self.inode_record(inode)?.node;
+        self.execute(async {
+            if value.is_empty() {
+                self.state
+                    .remote
+                    .set_xattr(node, name, &[], mode, position)
+                    .await?;
+                return Ok(());
+            }
+            let mut consumed = 0_u64;
+            while consumed < value.len() as u64 {
+                let amount = (value.len() as u64 - consumed).min(chunk);
+                let start = consumed as usize;
+                let end = (consumed + amount) as usize;
+                let chunk_position = u64::from(position)
+                    .checked_add(consumed)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or(AdapterError::InvalidRange)?;
+                self.state
+                    .remote
+                    .set_xattr(
+                        node,
+                        name.clone(),
+                        &value[start..end],
+                        if consumed == 0 {
+                            mode
+                        } else {
+                            XattrSetMode::Replace
+                        },
+                        chunk_position,
+                    )
+                    .await?;
+                consumed += amount;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn list_xattrs_async(&self, inode: u64) -> Result<Vec<Name>, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if !capabilities.supports_xattrs {
+            return Err(AdapterError::Unsupported);
+        }
+        let node = self.inode_record(inode)?.node;
+        self.execute(async { Ok(self.state.remote.list_xattrs(node).await?) })
+            .await
+    }
+
+    pub(crate) async fn remove_xattr_async(
+        &self,
+        inode: u64,
+        name: Name,
+    ) -> Result<(), AdapterError> {
+        let capabilities = self.require_writable().await?;
+        if !capabilities.supports_xattrs {
+            return Err(AdapterError::Unsupported);
+        }
+        let node = self.inode_record(inode)?.node;
+        self.execute(async {
+            self.state.remote.remove_xattr(node, name).await?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn release_async(
+        &self,
+        handle: u64,
+        flush: bool,
+        lock_owner: Option<u64>,
+    ) -> Result<(), AdapterError> {
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.write().await;
+        let opened = self.take_file_handle(handle)?;
+        let flush_result = if flush {
+            self.execute(async {
+                self.state
+                    .remote
+                    .flush_file(opened.remote, lock_owner)
+                    .await?;
+                Ok(())
+            })
+            .await
+        } else {
+            Ok(())
+        };
+        let close_result = self
+            .execute(async {
+                self.state.remote.close_file(opened.remote).await?;
+                Ok(())
+            })
+            .await;
+        let result = flush_result.and(close_result);
+        let _ = self.forget_inode(opened.inode, 0);
+        result
+    }
+
+    pub(crate) fn destroy_mount(&self) {
+        let handles = match self.state.handles.lock() {
+            Ok(mut handles) => handles
+                .drain()
+                .map(|(handle, record)| (handle, record.remote))
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        let mut operations = match self.state.handle_operations.lock() {
+            Ok(mut operations) => operations.drain().collect::<HashMap<_, _>>(),
+            Err(_) => HashMap::new(),
+        };
+        if let Ok(mut directories) = self.state.directory_handles.lock() {
+            directories.clear();
+        }
+        let timeout = self.callback_timeout();
+        let remote = Arc::clone(&self.state.remote);
+        let cleanup = async move {
+            for (handle, remote_handle) in handles {
+                if let Some(operation) = operations.remove(&handle) {
+                    let _operation_guard = operation.write().await;
+                    let _ = tokio::time::timeout(timeout, remote.close_file(remote_handle)).await;
+                } else {
+                    let _ = tokio::time::timeout(timeout, remote.close_file(remote_handle)).await;
+                }
+            }
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Tokio forbids nested `Runtime::block_on`, including when the
+            // current worker belongs to this same shared runtime.
+            drop(self.runtime.spawn(cleanup));
+        } else {
+            self.runtime.block_on(cleanup);
+        }
+    }
+
+    fn block_on<T>(
+        &self,
+        future: impl Future<Output = Result<T, AdapterError>>,
+    ) -> Result<T, AdapterError> {
+        self.runtime.block_on(future)
+    }
+
+    async fn execute<T>(
+        &self,
+        future: impl Future<Output = Result<T, AdapterError>>,
+    ) -> Result<T, AdapterError> {
+        tokio::time::timeout(self.callback_timeout(), future)
+            .await
+            .map_err(|_| AdapterError::CallbackTimedOut)?
+    }
+
+    async fn require_writable(&self) -> Result<FilesystemCapabilities, AdapterError> {
+        let capabilities = self.capabilities_async().await?;
+        if capabilities.writable {
+            Ok(capabilities)
+        } else {
+            Err(AdapterError::ReadOnly)
+        }
     }
 
     fn inode_record(&self, inode: u64) -> Result<InodeRecord, AdapterError> {
-        self.inodes
+        self.state
+            .inodes
             .lock()
             .map_err(|_| AdapterError::StateUnavailable)?
             .by_inode
@@ -277,44 +1374,197 @@ impl Adapter {
             .ok_or(AdapterError::UnknownInode)
     }
 
-    fn remember_inode(&self, node: NodeId, parent_inode: u64) -> Result<u64, AdapterError> {
+    pub(crate) fn remember_entry(
+        &self,
+        node: NodeId,
+        parent_inode: u64,
+        name: &Name,
+    ) -> Result<u64, AdapterError> {
         let mut table = self
+            .state
             .inodes
             .lock()
             .map_err(|_| AdapterError::StateUnavailable)?;
-        if let Some(inode) = table.by_node.get(&node) {
-            return Ok(*inode);
-        }
-        let inode = self
-            .next_inode
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| AdapterError::InodeSpaceExhausted)?;
-        table
-            .by_inode
-            .insert(inode, InodeRecord { node, parent_inode });
-        table.by_node.insert(node, inode);
+        let inode = if let Some(inode) = table.by_node.get(&node) {
+            *inode
+        } else {
+            let inode = self
+                .state
+                .next_inode
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| AdapterError::InodeSpaceExhausted)?;
+            table
+                .by_inode
+                .insert(inode, InodeRecord { node, parent_inode });
+            table.by_node.insert(node, inode);
+            inode
+        };
+        table.by_entry.insert((parent_inode, name.clone()), inode);
         Ok(inode)
     }
 
-    fn remember_handle(&self, remote: RemoteFileHandle) -> Result<u64, AdapterError> {
-        let mut handles = self
-            .handles
+    pub(crate) fn add_lookup(&self, inode: u64, amount: u64) -> Result<(), AdapterError> {
+        let mut table = self
+            .state
+            .inodes
             .lock()
             .map_err(|_| AdapterError::StateUnavailable)?;
-        let handle = self
+        let count = table.lookups.entry(inode).or_default();
+        *count = count.saturating_add(amount);
+        Ok(())
+    }
+
+    pub(crate) fn forget_inode(&self, inode: u64, amount: u64) -> Result<(), AdapterError> {
+        self.forget_inodes(&[(inode, amount)])
+    }
+
+    pub(crate) fn forget_inodes(&self, requests: &[(u64, u64)]) -> Result<(), AdapterError> {
+        let mut forgotten = Vec::new();
+        for (inode, amount) in requests {
+            if let Some(node) = self.evict_inode(*inode, *amount)? {
+                forgotten.push(node);
+            }
+        }
+        if !forgotten.is_empty() {
+            let remote = Arc::clone(&self.state.remote);
+            let timeout = self.callback_timeout();
+            drop(self.runtime.spawn(async move {
+                let _ = tokio::time::timeout(timeout, remote.forget_nodes(forgotten)).await;
+            }));
+        }
+        Ok(())
+    }
+
+    fn evict_inode(&self, inode: u64, amount: u64) -> Result<Option<NodeId>, AdapterError> {
+        if inode == ROOT_INODE {
+            return Ok(None);
+        }
+        let in_use = self
+            .state
+            .handles
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .values()
+            .any(|handle| handle.inode == inode)
+            || self
+                .state
+                .directory_handles
+                .lock()
+                .map_err(|_| AdapterError::StateUnavailable)?
+                .values()
+                .any(|handle| handle.inode == inode);
+        let mut table = self
+            .state
+            .inodes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        let count = table.lookups.entry(inode).or_default();
+        *count = count.saturating_sub(amount);
+        if *count != 0 || in_use {
+            return Ok(None);
+        }
+        table.lookups.remove(&inode);
+        let forgotten = if let Some(record) = table.by_inode.remove(&inode) {
+            table.by_node.remove(&record.node);
+            Some(record.node)
+        } else {
+            None
+        };
+        table
+            .by_entry
+            .retain(|_, entry_inode| *entry_inode != inode);
+        Ok(forgotten)
+    }
+
+    fn forget_entry(&self, parent_inode: u64, name: &Name) -> Result<(), AdapterError> {
+        self.state
+            .inodes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .by_entry
+            .remove(&(parent_inode, name.clone()));
+        Ok(())
+    }
+
+    fn move_entry(
+        &self,
+        parent_inode: u64,
+        name: &Name,
+        new_parent_inode: u64,
+        new_name: &Name,
+        mode: RenameMode,
+    ) -> Result<(), AdapterError> {
+        let mut table = self
+            .state
+            .inodes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        let source_key = (parent_inode, name.clone());
+        let destination_key = (new_parent_inode, new_name.clone());
+        let source = table.by_entry.remove(&source_key);
+        let destination = table.by_entry.remove(&destination_key);
+        if mode == RenameMode::Exchange
+            && let Some(destination) = destination
+        {
+            table.by_entry.insert(source_key, destination);
+            if let Some(record) = table.by_inode.get_mut(&destination) {
+                record.parent_inode = parent_inode;
+            }
+        }
+        if let Some(source) = source {
+            table.by_entry.insert(destination_key, source);
+            if let Some(record) = table.by_inode.get_mut(&source) {
+                record.parent_inode = new_parent_inode;
+            }
+        }
+        Ok(())
+    }
+
+    fn next_handle(&self) -> Result<u64, AdapterError> {
+        self.state
             .next_handle
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
-            .map_err(|_| AdapterError::HandleSpaceExhausted)?;
-        handles.insert(handle, remote);
+            .map_err(|_| AdapterError::HandleSpaceExhausted)
+    }
+
+    fn remember_file_handle(
+        &self,
+        inode: u64,
+        access: FileAccess,
+        opened: quickfs_client_core::OpenedFile,
+    ) -> Result<u64, AdapterError> {
+        let handle = self.next_handle()?;
+        let mut handles = self
+            .state
+            .handles
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        let mut operations = self
+            .state
+            .handle_operations
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        handles.insert(
+            handle,
+            FileHandleRecord {
+                remote: opened.handle,
+                inode,
+                access,
+                revision: opened.revision,
+                size: opened.size,
+            },
+        );
+        operations.insert(handle, Arc::new(AsyncRwLock::new(())));
         Ok(handle)
     }
 
-    fn remote_handle(&self, handle: u64) -> Result<RemoteFileHandle, AdapterError> {
-        self.handles
+    fn file_handle(&self, handle: u64) -> Result<FileHandleRecord, AdapterError> {
+        self.state
+            .handles
             .lock()
             .map_err(|_| AdapterError::StateUnavailable)?
             .get(&handle)
@@ -322,17 +1572,87 @@ impl Adapter {
             .ok_or(AdapterError::UnknownHandle)
     }
 
-    fn take_remote_handle(&self, handle: u64) -> Result<RemoteFileHandle, AdapterError> {
-        self.handles
+    fn update_file_handle(
+        &self,
+        handle: u64,
+        revision: u64,
+        size: u64,
+    ) -> Result<(), AdapterError> {
+        let mut handles = self
+            .state
+            .handles
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        let record = handles
+            .get_mut(&handle)
+            .ok_or(AdapterError::UnknownHandle)?;
+        record.revision = revision;
+        record.size = size;
+        Ok(())
+    }
+
+    fn file_operation(&self, handle: u64) -> Result<Arc<AsyncRwLock<()>>, AdapterError> {
+        self.state
+            .handle_operations
             .lock()
             .map_err(|_| AdapterError::StateUnavailable)?
-            .remove(&handle)
+            .get(&handle)
+            .cloned()
             .ok_or(AdapterError::UnknownHandle)
+    }
+
+    fn take_file_handle(&self, handle: u64) -> Result<FileHandleRecord, AdapterError> {
+        let mut handles = self
+            .state
+            .handles
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        let mut operations = self
+            .state
+            .handle_operations
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        let record = handles.remove(&handle).ok_or(AdapterError::UnknownHandle)?;
+        operations.remove(&handle);
+        Ok(record)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macfuse"))]
+    pub(crate) fn owner_uid(&self) -> u32 {
+        self.state.owner_uid
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macfuse"))]
+    pub(crate) fn owner_gid(&self) -> u32 {
+        self.state.owner_gid
     }
 }
 
-fn validate_name(name: &str) -> Result<(), ()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+fn validate_io_range(offset: u64, length: u64) -> Result<(), AdapterError> {
+    if length > MAX_FUSE_IO_SIZE {
+        return Err(AdapterError::RequestTooLarge(MAX_FUSE_IO_SIZE));
+    }
+    validate_range(offset, length)
+}
+
+fn validate_allocation_range(offset: u64, length: u64) -> Result<(), AdapterError> {
+    if length == 0 {
+        return Err(AdapterError::InvalidRange);
+    }
+    validate_range(offset, length)
+}
+
+fn validate_range(offset: u64, length: u64) -> Result<(), AdapterError> {
+    offset
+        .checked_add(length)
+        .map(|_| ())
+        .ok_or(AdapterError::InvalidRange)
+}
+
+fn validate_name(name: &Name) -> Result<(), ()> {
+    let name = name.as_bytes();
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
+    {
         Err(())
     } else {
         Ok(())
@@ -341,6 +1661,63 @@ fn validate_name(name: &str) -> Result<(), ()> {
 
 fn validate_remote_name(entry: &RemoteDirectoryEntry) -> Result<(), AdapterError> {
     validate_name(&entry.name).map_err(|()| AdapterError::InvalidRemoteName)
+}
+
+/// fuser 0.17 advertises `FUSE_CASE_INSENSITIVE` unconditionally on macOS.
+/// APFS also commonly presents canonically decomposed names, so compare NFD
+/// lowercase forms while preserving exact spelling as the first choice.
+fn normalized_case_name(name: &str) -> String {
+    name.nfd().flat_map(char::to_lowercase).collect()
+}
+
+fn select_remote_entry(
+    mut entries: Vec<RemoteDirectoryEntry>,
+    requested: &Name,
+) -> Result<RemoteDirectoryEntry, AdapterError> {
+    let exact = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.name == *requested).then_some(index))
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [index] => return Ok(entries.swap_remove(*index)),
+        [] => {}
+        _ => return Err(AdapterError::AmbiguousName),
+    }
+
+    let requested = std::str::from_utf8(requested.as_bytes())
+        .map(normalized_case_name)
+        .map_err(|_| AdapterError::NotFound)?;
+    let matching = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            std::str::from_utf8(entry.name.as_bytes())
+                .ok()
+                .is_some_and(|name| normalized_case_name(name) == requested)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [index] => Ok(entries.swap_remove(*index)),
+        [] => Err(AdapterError::NotFound),
+        _ => Err(AdapterError::AmbiguousName),
+    }
+}
+
+fn validate_case_insensitive_directory(
+    entries: &[RemoteDirectoryEntry],
+) -> Result<(), AdapterError> {
+    let mut names = std::collections::HashSet::with_capacity(entries.len());
+    for entry in entries {
+        validate_remote_name(entry)?;
+        if let Ok(name) = std::str::from_utf8(entry.name.as_bytes())
+            && !names.insert(normalized_case_name(name))
+        {
+            return Err(AdapterError::AmbiguousName);
+        }
+    }
+    Ok(())
 }
 
 fn validate_metadata(node: NodeId, metadata: &Metadata) -> Result<(), AdapterError> {
@@ -355,7 +1732,7 @@ fn validate_metadata(node: NodeId, metadata: &Metadata) -> Result<(), AdapterErr
 mod native;
 
 #[cfg(all(target_os = "macos", feature = "macfuse"))]
-pub use native::{MountConfig, mount};
+pub use native::{MacFuseBackend, MountConfig, mount};
 
 #[cfg(all(target_os = "macos", feature = "macfuse"))]
 pub const NATIVE_CALLBACKS_IMPLEMENTED: bool = true;
@@ -365,9 +1742,11 @@ pub const NATIVE_CALLBACKS_IMPLEMENTED: bool = true;
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use quickfs_client_core::Result as ClientResult;
-    use quickfs_protocol::{DirectoryEntry as ProtocolDirectoryEntry, ErrorCode};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use quickfs_client_core::{
+        CreatedFile, OpenedFile, RangeRead, Result as ClientResult, WriteResult,
+    };
+    use quickfs_protocol::{DirectoryEntry as ProtocolDirectoryEntry, ErrorCode, LockKind};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use uuid::Uuid;
 
     const FILE_BYTES: &[u8] = b"hello from quicKFS";
@@ -375,6 +1754,15 @@ mod tests {
     struct MockFilesystem {
         delay: Duration,
         close_count: AtomicUsize,
+        read_lengths: Mutex<Vec<u64>>,
+        write_lengths: Mutex<Vec<usize>>,
+        bytes: Mutex<Vec<u8>>,
+        revision: AtomicU64,
+        operation_log: Mutex<Vec<String>>,
+        delayed_write_response: Option<(u64, Duration)>,
+        read_delay: Duration,
+        active_reads: AtomicUsize,
+        maximum_active_reads: AtomicUsize,
     }
 
     impl MockFilesystem {
@@ -382,13 +1770,36 @@ mod tests {
             Self {
                 delay: Duration::ZERO,
                 close_count: AtomicUsize::new(0),
+                read_lengths: Mutex::new(Vec::new()),
+                write_lengths: Mutex::new(Vec::new()),
+                bytes: Mutex::new(FILE_BYTES.to_vec()),
+                revision: AtomicU64::new(7),
+                operation_log: Mutex::new(Vec::new()),
+                delayed_write_response: None,
+                read_delay: Duration::ZERO,
+                active_reads: AtomicUsize::new(0),
+                maximum_active_reads: AtomicUsize::new(0),
             }
         }
 
         fn delayed(delay: Duration) -> Self {
             Self {
                 delay,
-                close_count: AtomicUsize::new(0),
+                ..Self::immediate()
+            }
+        }
+
+        fn with_delayed_write_response(offset: u64, delay: Duration) -> Self {
+            Self {
+                delayed_write_response: Some((offset, delay)),
+                ..Self::immediate()
+            }
+        }
+
+        fn with_read_delay(delay: Duration) -> Self {
+            Self {
+                read_delay: delay,
+                ..Self::immediate()
             }
         }
 
@@ -406,6 +1817,48 @@ mod tests {
             Ok(nonce)
         }
 
+        async fn capabilities(&self) -> ClientResult<FilesystemCapabilities> {
+            Ok(FilesystemCapabilities {
+                server_epoch: Uuid::from_u128(99),
+                writable: true,
+                supports_locks: true,
+                supports_atomic_rename: true,
+                supports_directory_sync: true,
+                supports_preallocation: true,
+                supports_symlinks: true,
+                supports_xattrs: true,
+                supports_hard_links: true,
+                supports_special_nodes: true,
+                supports_copy_file_range: true,
+                supports_seek_data_hole: true,
+                supports_safe_ioctl: true,
+                supports_poll: true,
+                supports_bmap: true,
+                supports_exchange_data: true,
+                supports_volume_rename: true,
+                supports_backup_time: true,
+                supports_readdirplus: true,
+                persistent_node_ids: true,
+                restart_lock_replay: true,
+                volume_name: "quicKFS".into(),
+                max_read_size: 4,
+                max_write_size: 3,
+            })
+        }
+
+        async fn stat_filesystem(&self) -> ClientResult<FilesystemStats> {
+            Ok(FilesystemStats {
+                blocks: 100,
+                blocks_free: 50,
+                blocks_available: 40,
+                files: 10,
+                files_free: 5,
+                block_size: 4096,
+                name_length: 255,
+                fragment_size: 4096,
+            })
+        }
+
         async fn get_metadata(&self, node: NodeId) -> ClientResult<Metadata> {
             self.wait().await;
             match node.0.as_u128() {
@@ -413,9 +1866,10 @@ mod tests {
                 1 => Ok(metadata(
                     file_node(),
                     NodeKind::File,
-                    u64::try_from(FILE_BYTES.len()).unwrap(),
+                    u64::try_from(self.bytes.lock().unwrap().len()).unwrap(),
                 )),
                 2 => Ok(metadata(directory_node(), NodeKind::Directory, 0)),
+                3 => Ok(metadata(symlink_node(), NodeKind::Symlink, 9)),
                 _ => Err(not_found()),
             }
         }
@@ -428,16 +1882,19 @@ mod tests {
                         node: file_node(),
                         name: "hello.txt".into(),
                         kind: NodeKind::File,
+                        metadata: metadata(file_node(), NodeKind::File, FILE_BYTES.len() as u64),
                     },
                     ProtocolDirectoryEntry {
                         node: directory_node(),
                         name: "folder".into(),
                         kind: NodeKind::Directory,
+                        metadata: metadata(directory_node(), NodeKind::Directory, 0),
                     },
                     ProtocolDirectoryEntry {
-                        node: directory_node(),
-                        name: "folder-link".into(),
+                        node: symlink_node(),
+                        name: "hello-link".into(),
                         kind: NodeKind::Symlink,
+                        metadata: metadata(symlink_node(), NodeKind::Symlink, 9),
                     },
                 ])
             } else if node == directory_node() {
@@ -448,6 +1905,17 @@ mod tests {
         }
 
         async fn open_file(&self, node: NodeId) -> ClientResult<(RemoteFileHandle, u64, u64)> {
+            let opened = self
+                .open_file_with_options(node, FileOpenOptions::READ_ONLY)
+                .await?;
+            Ok((opened.handle, opened.revision, opened.size))
+        }
+
+        async fn open_file_with_options(
+            &self,
+            node: NodeId,
+            _options: FileOpenOptions,
+        ) -> ClientResult<OpenedFile> {
             self.wait().await;
             if node != file_node() {
                 return Err(ClientError::Server(
@@ -455,7 +1923,131 @@ mod tests {
                     "not a regular file".into(),
                 ));
             }
-            Ok((remote_handle(), 7, u64::try_from(FILE_BYTES.len()).unwrap()))
+            Ok(OpenedFile {
+                handle: remote_handle(),
+                revision: self.revision.load(Ordering::Relaxed),
+                size: u64::try_from(self.bytes.lock().unwrap().len()).unwrap(),
+            })
+        }
+
+        async fn create_file(
+            &self,
+            _parent: NodeId,
+            name: Name,
+            mode: u32,
+            options: FileOpenOptions,
+        ) -> ClientResult<CreatedFile> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("create:{name}:{mode:o}:{:?}", options.access));
+            Ok(CreatedFile {
+                metadata: metadata(file_node(), NodeKind::File, 0),
+                opened: OpenedFile {
+                    handle: remote_handle(),
+                    revision: self.revision.load(Ordering::Relaxed),
+                    size: 0,
+                },
+            })
+        }
+
+        async fn create_directory(
+            &self,
+            _parent: NodeId,
+            name: Name,
+            mode: u32,
+        ) -> ClientResult<Metadata> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("mkdir:{name}:{mode:o}"));
+            Ok(metadata(NodeId(Uuid::from_u128(4)), NodeKind::Directory, 0))
+        }
+
+        async fn create_symlink(
+            &self,
+            _parent: NodeId,
+            name: Name,
+            target: Vec<u8>,
+        ) -> ClientResult<Metadata> {
+            self.operation_log.lock().unwrap().push(format!(
+                "symlink:{name}:{}",
+                String::from_utf8_lossy(&target)
+            ));
+            Ok(metadata(
+                NodeId(Uuid::from_u128(5)),
+                NodeKind::Symlink,
+                u64::try_from(target.len()).unwrap(),
+            ))
+        }
+
+        async fn remove_node(
+            &self,
+            _parent: NodeId,
+            name: Name,
+            directory: bool,
+        ) -> ClientResult<()> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("remove:{name}:{directory}"));
+            Ok(())
+        }
+
+        async fn rename_node(
+            &self,
+            _parent: NodeId,
+            name: Name,
+            _new_parent: NodeId,
+            new_name: Name,
+            mode: RenameMode,
+        ) -> ClientResult<()> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("rename:{name}:{new_name}:{mode:?}"));
+            Ok(())
+        }
+
+        async fn read_link(&self, node: NodeId) -> ClientResult<Vec<u8>> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("readlink:{}", node.0));
+            Ok(b"hello.txt".to_vec())
+        }
+
+        async fn set_attributes(
+            &self,
+            node: NodeId,
+            _handle: Option<RemoteFileHandle>,
+            changes: AttributeChanges,
+        ) -> ClientResult<Metadata> {
+            self.operation_log.lock().unwrap().push(format!(
+                "setattr:{:?}:{:?}",
+                changes.size, changes.modified_unix_ms
+            ));
+            if let Some(size) = changes.size {
+                let size = usize::try_from(size).unwrap();
+                self.bytes.lock().unwrap().resize(size, 0);
+            }
+            let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut value = metadata(
+                node,
+                NodeKind::File,
+                u64::try_from(self.bytes.lock().unwrap().len()).unwrap(),
+            );
+            value.revision = revision;
+            if let Some(modified) = changes.modified_unix_ms {
+                value.modified_unix_ms = modified;
+            }
+            if let Some(accessed) = changes.accessed_unix_ms {
+                value.accessed_unix_ms = accessed;
+            }
+            if let Some(mode) = changes.mode {
+                value.mode = mode;
+            }
+            Ok(value)
         }
 
         async fn read_range(
@@ -464,6 +2056,18 @@ mod tests {
             offset: u64,
             length: u64,
         ) -> ClientResult<Vec<u8>> {
+            Ok(self
+                .read_range_versioned(handle, offset, length)
+                .await?
+                .data)
+        }
+
+        async fn read_range_versioned(
+            &self,
+            handle: RemoteFileHandle,
+            offset: u64,
+            length: u64,
+        ) -> ClientResult<RangeRead> {
             self.wait().await;
             if handle != remote_handle() {
                 return Err(ClientError::Server(
@@ -471,15 +2075,148 @@ mod tests {
                     "unknown handle".into(),
                 ));
             }
-            let start = usize::try_from(offset).unwrap_or(usize::MAX);
-            if start >= FILE_BYTES.len() {
-                return Ok(Vec::new());
+            let active = self.active_reads.fetch_add(1, Ordering::Relaxed) + 1;
+            self.maximum_active_reads
+                .fetch_max(active, Ordering::Relaxed);
+            if !self.read_delay.is_zero() {
+                tokio::time::sleep(self.read_delay).await;
             }
-            let requested_end = offset.saturating_add(length);
-            let end = usize::try_from(requested_end)
-                .unwrap_or(usize::MAX)
-                .min(FILE_BYTES.len());
-            Ok(FILE_BYTES[start..end].to_vec())
+            self.read_lengths.lock().unwrap().push(length);
+            let bytes = self.bytes.lock().unwrap();
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            let data = if start >= bytes.len() {
+                Vec::new()
+            } else {
+                let requested_end = offset.saturating_add(length);
+                let end = usize::try_from(requested_end)
+                    .unwrap_or(usize::MAX)
+                    .min(bytes.len());
+                bytes[start..end].to_vec()
+            };
+            self.active_reads.fetch_sub(1, Ordering::Relaxed);
+            Ok(RangeRead {
+                revision: self.revision.load(Ordering::Relaxed),
+                data,
+            })
+        }
+
+        async fn write_range(
+            &self,
+            handle: RemoteFileHandle,
+            offset: u64,
+            data: &[u8],
+        ) -> ClientResult<WriteResult> {
+            if handle != remote_handle() {
+                return Err(ClientError::Server(
+                    ErrorCode::InvalidHandle,
+                    "unknown handle".into(),
+                ));
+            }
+            self.write_lengths.lock().unwrap().push(data.len());
+            let result = {
+                let mut bytes = self.bytes.lock().unwrap();
+                let start = usize::try_from(offset).unwrap();
+                let end = start + data.len();
+                if bytes.len() < end {
+                    bytes.resize(end, 0);
+                }
+                bytes[start..end].copy_from_slice(data);
+                WriteResult {
+                    written: u64::try_from(data.len()).unwrap(),
+                    revision: self.revision.fetch_add(1, Ordering::Relaxed) + 1,
+                    size: u64::try_from(bytes.len()).unwrap(),
+                }
+            };
+            if let Some((delayed_offset, delay)) = self.delayed_write_response
+                && offset == delayed_offset
+            {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(result)
+        }
+
+        async fn flush_file(
+            &self,
+            _handle: RemoteFileHandle,
+            lock_owner: Option<u64>,
+        ) -> ClientResult<()> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("flush:{lock_owner:?}"));
+            Ok(())
+        }
+
+        async fn sync_file(&self, _handle: RemoteFileHandle, data_only: bool) -> ClientResult<()> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("fsync:{data_only}"));
+            Ok(())
+        }
+
+        async fn sync_directory(&self, node: NodeId) -> ClientResult<()> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("fsyncdir:{}", node.0));
+            Ok(())
+        }
+
+        async fn allocate_file(
+            &self,
+            _handle: RemoteFileHandle,
+            offset: u64,
+            length: u64,
+        ) -> ClientResult<WriteResult> {
+            let end = offset.checked_add(length).unwrap();
+            self.bytes
+                .lock()
+                .unwrap()
+                .resize(usize::try_from(end).unwrap(), 0);
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("allocate:{offset}:{length}"));
+            let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(WriteResult {
+                written: length,
+                revision,
+                size: end,
+            })
+        }
+
+        async fn get_lock(
+            &self,
+            _handle: RemoteFileHandle,
+            lock: FileLock,
+        ) -> ClientResult<Option<FileLock>> {
+            self.operation_log.lock().unwrap().push(format!(
+                "getlk:{}:{}:{}:{:?}",
+                lock.owner, lock.start, lock.end, lock.kind
+            ));
+            Ok(Some(lock))
+        }
+
+        async fn set_lock(
+            &self,
+            _handle: RemoteFileHandle,
+            lock: FileLock,
+            wait: bool,
+        ) -> ClientResult<()> {
+            self.operation_log.lock().unwrap().push(format!(
+                "setlk:{}:{}:{}:{:?}:{wait}",
+                lock.owner, lock.start, lock.end, lock.kind
+            ));
+            Ok(())
+        }
+
+        async fn forget_nodes(&self, nodes: Vec<NodeId>) -> ClientResult<()> {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("forget:{}", nodes.len()));
+            Ok(())
         }
 
         async fn close_file(&self, handle: RemoteFileHandle) -> ClientResult<()> {
@@ -496,9 +2233,10 @@ mod tests {
     }
 
     #[test]
-    fn finder_style_lookup_getattr_and_readdir_use_stable_inodes() {
+    fn finder_style_lookup_getattr_and_snapshot_readdir_use_stable_inodes() {
         let remote = Arc::new(MockFilesystem::immediate());
         let adapter = Adapter::new(remote, Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
 
         let root = adapter.getattr(ROOT_INODE).unwrap();
         assert_eq!(root.node, ROOT_NODE);
@@ -513,56 +2251,112 @@ mod tests {
             first
                 .entries
                 .iter()
-                .find(|entry| entry.name == "folder-link")
+                .find(|entry| entry.name == Name::from("hello-link"))
                 .unwrap()
                 .kind,
-            NodeKind::Directory
+            NodeKind::Symlink
         );
 
         let file_entry = first
             .entries
             .iter()
-            .find(|entry| entry.name == "hello.txt")
+            .find(|entry| entry.name == Name::from("hello.txt"))
             .unwrap();
         let lookup = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
         assert_eq!(lookup.inode, file_entry.inode);
         assert_eq!(lookup.metadata.kind, NodeKind::File);
-        assert_eq!(adapter.getattr(lookup.inode).unwrap(), lookup.metadata);
-
-        assert!(matches!(
-            adapter.lookup(ROOT_INODE, "missing"),
-            Err(AdapterError::NotFound)
-        ));
-        assert!(matches!(
-            adapter.lookup(ROOT_INODE, "../escape"),
-            Err(AdapterError::InvalidName)
-        ));
+        let folded_lookup = adapter.lookup(ROOT_INODE, "HeLLo.TxT").unwrap();
+        assert_eq!(folded_lookup.inode, lookup.inode);
     }
 
     #[test]
-    fn open_read_and_release_translate_local_and_remote_handles() {
+    fn arbitrary_range_read_is_split_at_negotiated_limit() {
         let remote = Arc::new(MockFilesystem::immediate());
         let adapter = Adapter::new(remote.clone(), Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
         let file = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
-
         let handle = adapter.open(file.inode).unwrap();
-        assert_eq!(adapter.read(handle, 1, 4).unwrap(), b"ello");
-        assert!(adapter.read(handle, u64::MAX, 1).is_err());
-        assert!(matches!(
-            adapter.read(handle, 0, MAX_CLIENT_READ_SIZE + 1),
-            Err(AdapterError::ReadTooLarge(MAX_CLIENT_READ_SIZE))
-        ));
 
+        assert_eq!(adapter.read(handle, 1, 11).unwrap(), b"ello from q");
+        assert_eq!(*remote.read_lengths.lock().unwrap(), [4, 4, 3]);
         adapter.release(handle).unwrap();
         assert_eq!(remote.close_count.load(Ordering::Relaxed), 1);
-        assert!(matches!(
-            adapter.read(handle, 0, 1),
-            Err(AdapterError::UnknownHandle)
+    }
+
+    #[test]
+    fn positioned_write_is_split_and_updates_remote_bytes() {
+        let remote = Arc::new(MockFilesystem::immediate());
+        let adapter = Adapter::new(remote.clone(), Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
+        let file = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
+        let options = FileOpenOptions {
+            access: FileAccess::ReadWrite,
+            truncate: false,
+            append: false,
+        };
+        let handle = adapter
+            .block_on(adapter.open_async(file.inode, options))
+            .unwrap();
+
+        assert_eq!(adapter.write(handle, 6, b"media-work").unwrap(), 10);
+        assert_eq!(*remote.write_lengths.lock().unwrap(), [3, 3, 3, 1]);
+        assert_eq!(adapter.read(handle, 6, 10).unwrap(), b"media-work");
+    }
+
+    #[test]
+    fn concurrent_writes_cannot_regress_the_local_handle_revision() {
+        let remote = Arc::new(MockFilesystem::with_delayed_write_response(
+            100,
+            Duration::from_millis(30),
         ));
-        assert!(matches!(
-            adapter.release(handle),
-            Err(AdapterError::UnknownHandle)
-        ));
+        let adapter = Adapter::new(remote, Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
+        let file = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
+        let handle = adapter
+            .block_on(adapter.open_async(
+                file.inode,
+                FileOpenOptions {
+                    access: FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            ))
+            .unwrap();
+
+        let (first, second) = adapter
+            .block_on(async {
+                let (first, second) = tokio::join!(
+                    adapter.write_async(handle, 100, b"aaa"),
+                    adapter.write_async(handle, 103, b"bbb")
+                );
+                Ok((first?, second?))
+            })
+            .unwrap();
+        assert_eq!((first, second), (3, 3));
+        assert_eq!(adapter.file_handle(handle).unwrap().revision, 9);
+        assert_eq!(adapter.read(handle, 100, 6).unwrap(), b"aaabbb");
+    }
+
+    #[test]
+    fn random_reads_on_one_handle_remain_concurrent() {
+        let remote = Arc::new(MockFilesystem::with_read_delay(Duration::from_millis(20)));
+        let adapter = Adapter::new(remote.clone(), Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
+        let file = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
+        let handle = adapter.open(file.inode).unwrap();
+
+        adapter
+            .block_on(async {
+                let (first, second) = tokio::join!(
+                    adapter.read_async(handle, 0, 3),
+                    adapter.read_async(handle, 6, 3)
+                );
+                first?;
+                second?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(remote.maximum_active_reads.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -578,13 +2372,313 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn destroy_is_safe_when_invoked_from_a_runtime_worker() {
+        let remote = Arc::new(MockFilesystem::immediate());
+        let adapter = Adapter::new(remote.clone(), Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
+        let file = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
+        let handle = adapter.open(file.inode).unwrap();
+        assert!(handle > 0);
+
+        let mounted = adapter.clone();
+        adapter.runtime().block_on(async move {
+            mounted.destroy_mount();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+        assert_eq!(remote.close_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn mutation_durability_lock_and_stat_paths_reach_the_remote_filesystem() {
+        let remote = Arc::new(MockFilesystem::immediate());
+        let adapter = Adapter::new(remote.clone(), Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
+
+        let created_file = adapter
+            .block_on(adapter.create_file_async(
+                ROOT_INODE,
+                "new.mov".into(),
+                0o640,
+                FileOpenOptions {
+                    access: FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            ))
+            .unwrap();
+        assert_eq!(created_file.metadata.kind, NodeKind::File);
+        adapter.release(created_file.handle).unwrap();
+
+        let directory = adapter
+            .block_on(adapter.create_directory_async(ROOT_INODE, "media".into(), 0o750))
+            .unwrap();
+        assert_eq!(directory.metadata.kind, NodeKind::Directory);
+        let symlink = adapter
+            .block_on(adapter.create_symlink_async(
+                ROOT_INODE,
+                "current.mov".into(),
+                b"hello.txt".to_vec(),
+            ))
+            .unwrap();
+        assert_eq!(
+            adapter
+                .block_on(adapter.readlink_async(symlink.inode))
+                .unwrap(),
+            b"hello.txt"
+        );
+
+        let file = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
+        let handle = adapter
+            .block_on(adapter.open_async(
+                file.inode,
+                FileOpenOptions {
+                    access: FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            ))
+            .unwrap();
+        let changed = adapter
+            .block_on(adapter.setattr_async(
+                file.inode,
+                Some(handle),
+                AttributeChanges {
+                    size: Some(24),
+                    mode: Some(0o640),
+                    accessed_unix_ms: Some(1000),
+                    modified_unix_ms: Some(1234),
+                    backup_unix_ms: None,
+                },
+            ))
+            .unwrap();
+        assert_eq!(changed.size, 24);
+        assert_eq!(changed.mode, 0o640);
+        assert_eq!(changed.accessed_unix_ms, 1000);
+        assert_eq!(changed.modified_unix_ms, 1234);
+        adapter
+            .block_on(adapter.allocate_async(handle, 24, 8))
+            .unwrap();
+        adapter
+            .block_on(adapter.flush_async(handle, Some(77)))
+            .unwrap();
+        adapter
+            .block_on(adapter.fsync_async(handle, false))
+            .unwrap();
+        let directory_handle = adapter.block_on(adapter.opendir_async(ROOT_INODE)).unwrap();
+        adapter
+            .block_on(adapter.fsyncdir_async(ROOT_INODE, directory_handle))
+            .unwrap();
+        adapter.releasedir(directory_handle).unwrap();
+
+        let lock = FileLock {
+            owner: 77,
+            start: 4,
+            end: 15,
+            kind: LockKind::Write,
+            pid: 42,
+        };
+        assert_eq!(
+            adapter
+                .block_on(adapter.get_lock_async(handle, lock))
+                .unwrap(),
+            Some(lock)
+        );
+        adapter
+            .block_on(adapter.set_lock_async(handle, lock, true))
+            .unwrap();
+        let stats = adapter.block_on(adapter.statfs_async()).unwrap();
+        assert_eq!(stats.block_size, 4096);
+
+        adapter
+            .block_on(adapter.rename_async(
+                ROOT_INODE,
+                "folder".into(),
+                ROOT_INODE,
+                "edited".into(),
+                RenameMode::Replace,
+            ))
+            .unwrap();
+        adapter
+            .block_on(adapter.remove_async(ROOT_INODE, "hello.txt".into(), false))
+            .unwrap();
+        adapter
+            .block_on(adapter.release_async(handle, true, Some(77)))
+            .unwrap();
+
+        let log = remote.operation_log.lock().unwrap();
+        for expected in [
+            "create:new.mov:640:ReadWrite",
+            "mkdir:media:750",
+            "symlink:current.mov:hello.txt",
+            "setattr:Some(24):Some(1234)",
+            "allocate:24:8",
+            "flush:Some(77)",
+            "fsync:false",
+            "getlk:77:4:15:Write",
+            "setlk:77:4:15:Write:true",
+            "rename:folder:edited:Replace",
+            "remove:hello.txt:false",
+        ] {
+            assert!(
+                log.iter().any(|operation| operation == expected),
+                "{expected}"
+            );
+        }
+        assert!(
+            log.iter()
+                .any(|operation| operation.starts_with("fsyncdir:"))
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|operation| operation.as_str() == "flush:Some(77)")
+                .count(),
+            2
+        );
+        assert_eq!(remote.close_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn rejects_oversized_and_overflowing_ranges() {
+        let remote = Arc::new(MockFilesystem::immediate());
+        let adapter = Adapter::new(remote, Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            adapter.read(1, 0, MAX_FUSE_IO_SIZE + 1),
+            Err(AdapterError::RequestTooLarge(MAX_FUSE_IO_SIZE))
+        ));
+        assert!(matches!(
+            validate_io_range(u64::MAX, 1),
+            Err(AdapterError::InvalidRange)
+        ));
+        assert!(validate_allocation_range(0, MAX_FUSE_IO_SIZE + 1).is_ok());
+        assert!(matches!(
+            validate_allocation_range(0, 0),
+            Err(AdapterError::InvalidRange)
+        ));
+        assert!(matches!(
+            validate_allocation_range(u64::MAX, 1),
+            Err(AdapterError::InvalidRange)
+        ));
+    }
+
+    #[test]
+    fn case_insensitive_lookup_normalizes_unicode_and_rejects_ambiguity() {
+        let decomposed = ProtocolDirectoryEntry {
+            node: NodeId(Uuid::from_u128(10)),
+            name: "Cafe\u{301}.mov".into(),
+            kind: NodeKind::File,
+            metadata: metadata(NodeId(Uuid::from_u128(10)), NodeKind::File, 0),
+        };
+        let selected =
+            select_remote_entry(vec![decomposed.clone()], &Name::from("CAFÉ.MOV")).unwrap();
+        assert_eq!(selected, decomposed);
+
+        let composed = ProtocolDirectoryEntry {
+            node: NodeId(Uuid::from_u128(11)),
+            name: "Café.mov".into(),
+            kind: NodeKind::File,
+            metadata: metadata(NodeId(Uuid::from_u128(11)), NodeKind::File, 0),
+        };
+        let entries = vec![decomposed.clone(), composed.clone()];
+        assert_eq!(
+            select_remote_entry(entries.clone(), &composed.name).unwrap(),
+            composed
+        );
+        assert!(matches!(
+            select_remote_entry(entries.clone(), &Name::from("CAFÉ.MOV")),
+            Err(AdapterError::AmbiguousName)
+        ));
+        assert!(matches!(
+            validate_case_insensitive_directory(&entries),
+            Err(AdapterError::AmbiguousName)
+        ));
+    }
+
+    #[test]
+    fn non_utf8_names_are_selected_only_by_exact_lossless_bytes() {
+        let raw = Name::new(b"clip-\xff.mov".to_vec());
+        let entry = ProtocolDirectoryEntry {
+            node: NodeId(Uuid::from_u128(12)),
+            name: raw.clone(),
+            kind: NodeKind::File,
+            metadata: metadata(NodeId(Uuid::from_u128(12)), NodeKind::File, 0),
+        };
+        assert_eq!(
+            select_remote_entry(vec![entry.clone()], &raw).unwrap(),
+            entry
+        );
+        assert!(matches!(
+            select_remote_entry(vec![entry], &Name::new(b"CLIP-\xff.MOV".to_vec())),
+            Err(AdapterError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn forget_and_batch_forget_evict_inodes_and_notify_the_remote_session() {
+        let remote = Arc::new(MockFilesystem::immediate());
+        let adapter = Adapter::new(remote.clone(), Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
+        let file = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
+        let directory = adapter.lookup(ROOT_INODE, "folder").unwrap();
+
+        adapter
+            .forget_inodes(&[(file.inode, 1), (directory.inode, 1)])
+            .unwrap();
+        adapter.runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if remote
+                        .operation_log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|operation| operation == "forget:2")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert!(matches!(
+            adapter.getattr(file.inode),
+            Err(AdapterError::UnknownInode)
+        ));
+        assert!(matches!(
+            adapter.getattr(directory.inode),
+            Err(AdapterError::UnknownInode)
+        ));
+        assert_ne!(
+            adapter.lookup(ROOT_INODE, "hello.txt").unwrap().inode,
+            file.inode
+        );
+    }
+
     fn metadata(node: NodeId, kind: NodeKind, size: u64) -> Metadata {
         Metadata {
             node,
             kind,
             size,
+            mode: match kind {
+                NodeKind::Directory => 0o755,
+                NodeKind::File => 0o644,
+                NodeKind::Symlink => 0o777,
+                NodeKind::NamedPipe
+                | NodeKind::CharacterDevice
+                | NodeKind::BlockDevice
+                | NodeKind::Socket => 0o600,
+            },
+            allocated_blocks: size.div_ceil(512),
             revision: 7,
+            accessed_unix_ms: 1_700_000_000_000,
             modified_unix_ms: 1_700_000_000_000,
+            created_unix_ms: Some(1_600_000_000_000),
+            backup_unix_ms: None,
+            link_count: if kind == NodeKind::Directory { 2 } else { 1 },
+            device_major: 0,
+            device_minor: 0,
         }
     }
 
@@ -594,6 +2688,10 @@ mod tests {
 
     fn directory_node() -> NodeId {
         NodeId(Uuid::from_u128(2))
+    }
+
+    fn symlink_node() -> NodeId {
+        NodeId(Uuid::from_u128(3))
     }
 
     fn remote_handle() -> RemoteFileHandle {

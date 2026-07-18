@@ -162,9 +162,15 @@ Unmount before terminating the process:
 diskutil unmount "$HOME/Volumes/quickfs"
 ```
 
-There is no reconnect policy yet. If the QUIC session or server disappears, unmount the volume, restore connectivity, and start `quickfs-mount` again. After macFUSE is installed, use `quickfs-client-cli` to isolate trust/authentication or remote filesystem problems without creating a mount.
+The mount performs bounded single-flight reconnect and accepts only the same persisted server epoch. Revision-matched handles are reopened and their locks replayed; an ambiguous mutation is never retried. Previously cached reads can continue after a disconnect, but cache misses and all mutations fail closed. A mount cannot cold-start while the server is offline. If reconnect reports an epoch/revision conflict, restore the intended server state or unmount/remount rather than bypassing the stale-state check. Use `quickfs-client-cli` to isolate trust/authentication or remote filesystem problems without creating a mount.
 
 If the GUI or a client command says macFUSE is missing even after installation, verify that `/Library/Filesystems/macfuse.fs/Contents/Info.plist` exists, complete any approval or restart requested by the installer, and launch quicKFS again. The preflight is repeated on every process launch, so there is no cached result to clear.
+
+## An optional filesystem operation returns `ENOTSUP`
+
+QuickFS negotiates optional operations at both the network and macFUSE boundaries. The current macFUSE 5.3 kernel backend on macOS 15.1 does not advertise native `copy_file_range`, `readdirplus`, or `exchangedata` messages. Normal application copies still work through ranged reads/writes, directory listings already arrive from the server with metadata, and atomic rename swapping is supported. [macFUSE dropped the distinct `exchangedata(2)` volume capability on macOS 11](https://macfuse.github.io/2020/10/30/macfuse-4.0.0.html), so that syscall cannot reach QuickFS on modern macOS even though the protocol and adapter callback exist. `SEEK_DATA`/`SEEK_HOLE` is handled through Darwin's seek ioctls and is supported.
+
+[The FSKit backend requires macOS 15.4 or later](https://github.com/macfuse/macfuse/wiki/FUSE-Backends). On an earlier release, continue using the kernel backend; selecting `--macfuse-backend fskit` will fail before mounting. Invalid UTF-8 path components are also rejected by modern macOS before a FUSE filesystem receives them. These host boundaries are not fixed by retrying or weakening mount options.
 
 ## Build or test failures
 

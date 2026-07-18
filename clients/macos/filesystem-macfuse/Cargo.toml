@@ -11,12 +11,15 @@ rpassword.workspace=true
 rustix.workspace=true
 thiserror.workspace=true
 tokio.workspace=true
+unicode-normalization="0.1"
 zeroize.workspace=true
 quickfs-client-core={path="../../../crates/client-core"}
+quickfs-cache={path="../../../crates/cache"}
 quickfs-protocol={path="../../../crates/protocol"}
 quickfs-transport-quic={path="../../../crates/transport-quic"}
 [target.'cfg(target_os = "macos")'.dependencies]
 fuser={workspace=true,optional=true}
+libc="0.2"
 quickfs-macos-support={path="../../../crates/macos-support"}
 [features]
 default=[]

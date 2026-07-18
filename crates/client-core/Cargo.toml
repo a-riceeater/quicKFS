@@ -6,6 +6,7 @@ license.workspace=true
 publish.workspace=true
 [dependencies]
 async-trait.workspace=true
+futures.workspace=true
 hex.workspace=true
 rustix.workspace=true
 rustls.workspace=true
@@ -15,7 +16,9 @@ thiserror.workspace=true
 tokio.workspace=true
 getrandom = "0.4"
 uuid.workspace=true
+zeroize.workspace=true
 quickfs-auth={path="../auth"}
+quickfs-cache={path="../cache"}
 quickfs-protocol={path="../protocol"}
 quickfs-transport-quic={path="../transport-quic"}
 [lints]

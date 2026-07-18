@@ -1,6 +1,6 @@
 # Setup guide
 
-This guide creates a local server, user account, trusted client, and read-only session. The local walkthrough uses pairing; a later section configures public/enterprise PKI or managed pins without per-client administrator contact. Linux is the initial server target; the daemon also runs on macOS for development.
+This guide creates a local server, user account, trusted client, and optionally writable mount. The local walkthrough uses pairing; a later section configures public/enterprise PKI or managed pins without per-client administrator contact. Linux is the deployment server target; the daemon also runs on macOS for development, without Linux-only special-node creation.
 
 ## How pairing and login fit together
 
@@ -96,13 +96,22 @@ cargo run -p quickfs-server-daemon -- user add \
 
 Enter and confirm a password of at least 12 bytes at the hidden prompts. The server stores a salted Argon2id hash.
 
+Read access is the default. To authorize this account for writes, grant it explicitly:
+
+```sh
+cargo run -p quickfs-server-daemon -- user grant-write \
+  --state-dir .quickfs \
+  alice
+```
+
 ## Start the server
 
 ```sh
 RUST_LOG=info cargo run -p quickfs-server-daemon -- serve \
   --bind 127.0.0.1:4433 \
   --export-root ./shared \
-  --state-dir .quickfs
+  --state-dir .quickfs \
+  --allow-writes
 ```
 
 Use `--bind 0.0.0.0:4433` to accept remote connections, and allow UDP port 4433 through the relevant firewall. Keep the server running. Ctrl+C and SIGTERM initiate graceful shutdown.
@@ -168,7 +177,7 @@ target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
   --username alice
 ```
 
-Enter the account password at the hidden prompt. The mount verifies the server before that prompt, reconnects and verifies it again before transmitting the password, then keeps that authenticated session alive. Open `$HOME/Volumes/quickfs` in Finder. Files and directories are presented read-only.
+Enter the account password at the hidden prompt. The mount verifies the server before that prompt, reconnects and verifies it again before transmitting the password, then retains one shared Tokio runtime around an authenticated reconnecting filesystem and persistent read cache. Open `$HOME/Volumes/quickfs` in Finder. The volume is writable only when both the daemon and account gates above are enabled; otherwise it mounts read-only.
 
 Keep the terminal process running. When finished, unmount cleanly from another terminal and allow `quickfs-mount` to exit:
 
