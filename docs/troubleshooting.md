@@ -144,13 +144,33 @@ quickfs-client-cli --server 127.0.0.1:4443 ... ping
 
 ## macFUSE will not mount
 
-Native mounting is not implemented in the current repository. `clients/macos/filesystem-macfuse` is an adapter skeleton only. Use `quickfs-client-cli` to exercise the server without macFUSE.
+The native target requires macFUSE 4 or newer and `pkgconf`; default workspace builds deliberately do not link them. Install macFUSE from the [official website](https://macfuse.io/), install `pkgconf` separately, then build the feature-gated binary:
+
+```sh
+brew install pkgconf
+pkg-config --modversion fuse
+cargo build -p quickfs-filesystem-macfuse --features macfuse --bin quickfs-mount
+```
+
+If Cargo reports that `fuse.pc` is missing, first confirm that the macFUSE installation completed and that `pkg-config --modversion fuse` works in the same shell. For a non-Homebrew installation, add the directory containing `fuse.pc` to `PKG_CONFIG_PATH`; do not point it at an untrusted SDK. Apple Silicon systems may require explicit approval of the third-party system extension and a restart before the first mount. Follow the macFUSE installer/system-settings instructions rather than weakening macOS security controls.
+
+Use an existing empty directory as the mountpoint and keep the foreground process running. If authentication fails, verify the mount uses the same `--server`, `--server-name`, and `--state-dir` as the successful CLI command. The pin/CA policy is checked before the password is requested and again before it is sent.
+
+Unmount before terminating the process:
+
+```sh
+diskutil unmount "$HOME/Volumes/quickfs"
+```
+
+There is no reconnect policy yet. If the QUIC session or server disappears, unmount the volume, restore connectivity, and start `quickfs-mount` again. After macFUSE is installed, use `quickfs-client-cli` to isolate trust/authentication or remote filesystem problems without creating a mount.
+
+If the GUI or a client command says macFUSE is missing even after installation, verify that `/Library/Filesystems/macfuse.fs/Contents/Info.plist` exists, complete any approval or restart requested by the installer, and launch quicKFS again. The preflight is repeated on every process launch, so there is no cached result to clear.
 
 ## Build or test failures
 
 ### `feature edition2024 is required`
 
-The project uses the stable Rust 2024 edition and requires Rust/Cargo 1.85 or newer. This error commonly occurs when Linux invokes an older Cargo package supplied by the distribution, such as Cargo 1.75.
+The project uses the stable Rust 2024 edition and requires Rust/Cargo 1.88 or newer. This error commonly occurs when Linux invokes an older Cargo package supplied by the distribution, such as Cargo 1.75.
 
 Do not add `cargo-features = ["edition2024"]` to the manifests. That suggestion applies to Cargo versions from before the edition was stabilized and would not make the project build correctly on stable Cargo 1.75.
 

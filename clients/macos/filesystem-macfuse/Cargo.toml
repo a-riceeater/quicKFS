@@ -5,10 +5,30 @@ edition.workspace=true
 license.workspace=true
 publish.workspace=true
 [dependencies]
+anyhow.workspace=true
+clap.workspace=true
+rpassword.workspace=true
+rustix.workspace=true
+thiserror.workspace=true
+tokio.workspace=true
+zeroize.workspace=true
 quickfs-client-core={path="../../../crates/client-core"}
+quickfs-protocol={path="../../../crates/protocol"}
+quickfs-transport-quic={path="../../../crates/transport-quic"}
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser={workspace=true,optional=true}
+quickfs-macos-support={path="../../../crates/macos-support"}
 [features]
 default=[]
-macfuse=[]
+macfuse=["dep:fuser"]
 [lints]
 workspace=true
 
+[[bin]]
+name="quickfs-mount"
+path="src/main.rs"
+required-features=["macfuse"]
+
+[dev-dependencies]
+async-trait.workspace=true
+uuid.workspace=true

@@ -104,6 +104,8 @@ RUST_LOG=info quickfs-server-daemon serve \
 quickfs-client-cli [OPTIONS] <COMMAND>
 ```
 
+On macOS, every client subcommand first verifies that the standard macFUSE filesystem bundle is installed. If it is missing, the command exits before pairing, trust, authentication, or filesystem work begins and prints the [official installation URL](https://macfuse.io/). Help and version output remain available, and the runtime preflight is macOS-only.
+
 | Option | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
 | `--server <ADDRESS>` | `QUICKFS_SERVER` | `127.0.0.1:4433` | Server UDP address. |
@@ -193,8 +195,42 @@ quickfs-client-cli --username alice \
 
 `--length` is required. Offset defaults to zero. Reads beyond EOF return available bytes, zero-length reads succeed, and output is raw file content.
 
+## macOS `quickfs-mount`
+
+The native mount is built separately because it links against the macFUSE 4 SDK:
+
+```sh
+cargo build -p quickfs-filesystem-macfuse --features macfuse --bin quickfs-mount
+mkdir -p "$HOME/Volumes/quickfs"
+target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
+  --server 127.0.0.1:4433 \
+  --server-name localhost \
+  --state-dir .quickfs-client \
+  --username alice
+```
+
+The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, authenticates once, and keeps one `RemoteFilesystem` connection and one Tokio runtime for the mount lifetime. Leave it running while the volume is in use; Finder can browse directories and open/read files. Unmount from another terminal:
+
+```sh
+diskutil unmount "$HOME/Volumes/quickfs"
+```
+
+| Option | Environment variable | Default | Purpose |
+| --- | --- | --- | --- |
+| `--server <ADDRESS>` | `QUICKFS_SERVER` | `127.0.0.1:4433` | Server UDP address. |
+| `--server-name <NAME>` | — | `localhost` | Logical TLS identity and exact-pin key. |
+| `--state-dir <PATH>` | `QUICKFS_CLIENT_STATE_DIR` | `.quickfs-client` | Existing exact-pin trust database. |
+| `--username <NAME>` | `QUICKFS_USERNAME` | Required | Account used to authenticate the retained session. |
+| `--timeout-ms <MS>` | — | `30000` | Connection and transport-operation timeout. |
+| `--callback-timeout-ms <MS>` | — | `30000` | Maximum time a macFUSE callback waits for its remote operation. |
+| `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Use the operating-system public/managed roots. |
+| `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Use an explicit enterprise-CA bundle. |
+| `--volume-name <NAME>` | — | `quicKFS` | Volume label shown by macOS. |
+
+Without a CA option, the mount reads the same private exact-pin database created by `quickfs-client-cli pair` or `trust import`. `--trust-system-roots` and `--ca-cert` are mutually exclusive. The mount is intentionally read-only: directories are `0555`, files are `0444`, and macOS write/xattr sidecars are disabled.
+
 ## Logging and limitations
 
 Use `RUST_LOG=info` or `RUST_LOG=quickfs_server_daemon=debug`. Logs must not contain passwords, pairing codes, or file contents.
 
-The implementation remains experimental and read-only. Per-user export permissions, recovery and live-session revocation, distributed-login defense, native mounting, reconnect/retry, and production deployment hardening are incomplete. Do not expose it directly to the public Internet.
+The implementation remains experimental and read-only. Per-user export permissions, recovery and live-session revocation, distributed-login defense, reconnect/retry, installed-macFUSE integration testing, and production deployment hardening are incomplete. A lost QUIC session currently requires unmounting and starting `quickfs-mount` again. Do not expose it directly to the public Internet.

@@ -3,11 +3,11 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use quickfs_client_core::{NetworkFilesystem, RemoteFilesystem, resolve_path, verify_pairing};
-use quickfs_transport_quic::{
-    PairingClient, QuicClient, TransportError, certificate_sha256, load_certificates,
+use quickfs_client_core::{
+    NetworkFilesystem, RemoteFilesystem, ServerTrust, load_trusted_server_pin, resolve_path,
+    verify_pairing,
 };
-use rustls::pki_types::CertificateDer;
+use quickfs_transport_quic::{PairingClient, certificate_sha256, load_certificates};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -136,6 +136,7 @@ struct TrustedServer {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    quickfs_macos_support::require_macfuse()?;
     let timeout = Duration::from_millis(cli.timeout_ms);
     match &cli.command {
         Command::Pair { pairing_id, code } => {
@@ -185,7 +186,7 @@ async fn pair(cli: &Cli, pairing_id: Uuid, code: Option<String>, timeout: Durati
 }
 
 async fn run_authenticated(cli: &Cli, timeout: Duration) -> Result<()> {
-    let trust = ServerTrust::from_cli(cli)?;
+    let trust = server_trust_from_cli(cli)?;
     let username = cli
         .username
         .clone()
@@ -247,56 +248,20 @@ async fn run_authenticated(cli: &Cli, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-enum ServerTrust {
-    Pinned([u8; 32]),
-    EnterpriseCa(Vec<CertificateDer<'static>>),
-    SystemRoots,
-}
-
-impl ServerTrust {
-    fn from_cli(cli: &Cli) -> Result<Self> {
-        if cli.trust_system_roots {
-            return Ok(Self::SystemRoots);
-        }
-        if let Some(path) = &cli.ca_cert {
-            let authorities = load_certificates(path).with_context(|| {
-                format!("failed to load enterprise CA bundle '{}'", path.display())
-            })?;
-            return Ok(Self::EnterpriseCa(authorities));
-        }
-        let fingerprint = load_trust(&cli.state_dir, cli.server, &cli.server_name).context(
-            "no exact pin is configured; pair first, import a managed pin, or use \
-             --ca-cert/--trust-system-roots for centrally managed PKI",
-        )?;
-        Ok(Self::Pinned(fingerprint))
+fn server_trust_from_cli(cli: &Cli) -> Result<ServerTrust> {
+    if cli.trust_system_roots {
+        return Ok(ServerTrust::system_roots());
     }
-
-    async fn connect(
-        &self,
-        server: SocketAddr,
-        server_name: &str,
-        timeout: Duration,
-    ) -> std::result::Result<QuicClient, TransportError> {
-        match self {
-            Self::Pinned(fingerprint) => {
-                QuicClient::connect_pinned(server, server_name, *fingerprint, timeout).await
-            }
-            Self::EnterpriseCa(authorities) => {
-                QuicClient::connect_with_ca(server, server_name, authorities.clone(), timeout).await
-            }
-            Self::SystemRoots => {
-                QuicClient::connect_with_system_roots(server, server_name, timeout).await
-            }
-        }
+    if let Some(path) = &cli.ca_cert {
+        let authorities = load_certificates(path)
+            .with_context(|| format!("failed to load enterprise CA bundle '{}'", path.display()))?;
+        return Ok(ServerTrust::enterprise_ca(authorities));
     }
-
-    fn description(&self) -> &'static str {
-        match self {
-            Self::Pinned(_) => "the configured exact certificate pin",
-            Self::EnterpriseCa(_) => "the configured enterprise CA bundle and server name",
-            Self::SystemRoots => "the operating-system trust policy and server name",
-        }
-    }
+    let fingerprint = load_trust(&cli.state_dir, cli.server, &cli.server_name).context(
+        "no exact pin is configured; pair first, import a managed pin, or use \
+         --ca-cert/--trust-system-roots for centrally managed PKI",
+    )?;
+    Ok(ServerTrust::pinned(fingerprint))
 }
 
 fn manage_trust(cli: &Cli, command: &TrustSubcommand) -> Result<()> {
@@ -392,18 +357,7 @@ fn ensure_unpaired(root: &Path, address: SocketAddr, server_name: &str) -> Resul
 }
 
 fn load_trust(root: &Path, address: SocketAddr, server_name: &str) -> Result<[u8; 32]> {
-    let path = trust_path(root);
-    let database = read_trust_database(root, &path)?;
-    let record = database
-        .servers
-        .iter()
-        .find(|record| record.address == address && record.server_name == server_name)
-        .ok_or_else(|| anyhow::anyhow!("no pinned identity for this address and server name"))?;
-    let decoded = hex::decode(&record.certificate_sha256)
-        .context("pinned certificate fingerprint is malformed")?;
-    decoded
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("pinned certificate fingerprint has the wrong length"))
+    load_trusted_server_pin(root, address, server_name).map_err(Into::into)
 }
 
 fn save_trust_locked(

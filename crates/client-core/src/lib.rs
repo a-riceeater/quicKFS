@@ -7,6 +7,9 @@ use quickfs_transport_quic::{PairingClient, QuicClient, TransportError};
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod trust;
+pub use trust::{ServerTrust, TrustStoreError, load_trusted_server_pin};
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("transport: {0}")]

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/*",
   "clients/macos/client-cli",
+  "clients/macos/client-gui/src-tauri",
   "clients/macos/filesystem-macfuse",
   "servers/linux/server-daemon",
 ]
@@ -10,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/quickfs/quickfs"
 publish = false
@@ -23,6 +24,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 futures = "0.3"
+fuser = "0.17"
 hex = "0.4"
 hmac = "0.12"
 postcard = { version = "1", default-features = false, features = ["alloc"] }

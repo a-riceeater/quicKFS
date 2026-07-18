@@ -14,4 +14,4 @@ quicKFS is currently an experimental read-only prototype. Start with the setup g
 - [Caching](caching.md): implemented interfaces and planned cache work.
 - [Roadmap](roadmap.md): planned milestones.
 
-Native macFUSE mounting, write support, persistent caching, and production authentication are not yet implemented.
+Native read-only macFUSE mounting is available behind the `macfuse` feature. Reconnect, write support, persistent caching, per-user authorization, and production hardening are not yet implemented.

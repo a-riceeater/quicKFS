@@ -19,7 +19,17 @@ cargo test --workspace
 cargo doc --workspace --no-deps
 ```
 
-Use `./scripts/test.sh` when only the workspace test suite is needed. Tests must not depend on a globally installed macFUSE extension.
+Use `./scripts/test.sh` when only the workspace test suite is needed. Tests do not depend on a globally installed macFUSE extension. On a Mac without the SDK, `check.sh` uses fuser's compile-only `macos-no-mount` mode for Clippy so the complete callback and binary API still receive static analysis; an actual native build and mount require macFUSE 4.
+
+The Tauri desktop client has an additional frontend quality gate:
+
+```sh
+cd clients/macos/client-gui
+npm install
+npm run check
+npm run build
+cargo check -p quickfs-client-gui
+```
 
 ## Focused commands
 
@@ -60,4 +70,3 @@ RUST_LOG=quickfs_server_daemon=debug cargo run -p quickfs-server-daemon -- serve
 - Preserve `#![forbid(unsafe_code)]` unless a platform binding makes narrowly isolated unsafe code unavoidable.
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for pull-request and protocol-change expectations.
-

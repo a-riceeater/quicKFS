@@ -1,0 +1,18 @@
+[package]
+name = "quickfs-client-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+serde.workspace = true
+tauri = { version = "2", features = [] }
+quickfs-client-core = { path = "../../../../crates/client-core" }
+quickfs-macos-support = { path = "../../../../crates/macos-support" }
+
+[lints]
+workspace = true

@@ -24,7 +24,7 @@ Use the same client `--server` and `--server-name` values during pairing and lat
 
 ## Prerequisites
 
-Install Git and Rust/Cargo 1.85 or newer. Rust 1.85 is the first stable release supporting Rust 2024. The repository's `rust-toolchain.toml` selects current stable through rustup.
+Install Git and Rust/Cargo 1.88 or newer. Rust 1.85 was the first stable release supporting Rust 2024; the current dependency graph sets the project's supported minimum at 1.88. The repository's `rust-toolchain.toml` selects current stable through rustup.
 
 On Linux, distribution Cargo packages may be too old:
 
@@ -36,7 +36,13 @@ rustc --version
 cargo --version
 ```
 
-Both versions must be at least 1.85. `command -v cargo` should normally report `$HOME/.cargo/bin/cargo`. macFUSE is not required; native mounting is not implemented yet.
+Both versions must be at least 1.88. `command -v cargo` should normally report `$HOME/.cargo/bin/cargo`. Normal workspace builds and tests do not require an installed macFUSE runtime. Running the GUI, client CLI, or native mount on macOS does: each process checks at startup and stops with an installation link when it is absent. Install macFUSE from the [official website](https://macfuse.io/), install `pkgconf` for native development, and complete any system-extension approval requested by macOS:
+
+```sh
+brew install pkgconf
+```
+
+quicKFS does not install, approve, or update the system extension for you. The Linux server daemon and clients running on non-macOS platforms do not perform this check.
 
 ## Build
 
@@ -46,7 +52,11 @@ cd quickfs
 cargo build --workspace
 ```
 
-The debug binaries are `target/debug/quickfs-server-daemon` and `target/debug/quickfs-client-cli`.
+The default debug binaries are `target/debug/quickfs-server-daemon` and `target/debug/quickfs-client-cli`. On a macFUSE-equipped Mac, build `target/debug/quickfs-mount` explicitly:
+
+```sh
+cargo build -p quickfs-filesystem-macfuse --features macfuse --bin quickfs-mount
+```
 
 ## Create an export
 
@@ -144,6 +154,29 @@ cargo run -p quickfs-client-cli -- --username alice \
 The address and server name default to local development values. The client refuses an unexpected server certificate before prompting for a password.
 
 The account password is distinct from the one-time pairing code. It is checked on every new connection against the Argon2id hash stored by the server. Pairing codes are not reusable login credentials, and pairing never creates an account.
+
+## Mount the export in Finder on macOS
+
+After pairing and building `quickfs-mount`, create an empty mountpoint and start the foreground mount process with the same address, server name, state directory, and user used by the CLI:
+
+```sh
+mkdir -p "$HOME/Volumes/quickfs"
+target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
+  --server 127.0.0.1:4433 \
+  --server-name localhost \
+  --state-dir .quickfs-client \
+  --username alice
+```
+
+Enter the account password at the hidden prompt. The mount verifies the server before that prompt, reconnects and verifies it again before transmitting the password, then keeps that authenticated session alive. Open `$HOME/Volumes/quickfs` in Finder. Files and directories are presented read-only.
+
+Keep the terminal process running. When finished, unmount cleanly from another terminal and allow `quickfs-mount` to exit:
+
+```sh
+diskutil unmount "$HOME/Volumes/quickfs"
+```
+
+For enterprise CA or platform-root deployments, pass the same `--ca-cert` or `--trust-system-roots` option used by the diagnostic client. See the [usage reference](usage.md#macos-quickfs-mount) for all mount options.
 
 ## Enterprise setup without per-client pairing
 

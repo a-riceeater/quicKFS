@@ -1,16 +1,18 @@
 # quicKFS
 
-quicKFS is an experimental read-only network filesystem foundation for high-latency and unstable links. It uses QUIC directly through Quinn. The current prototype provides a Linux server, a platform-independent Rust client, and a macOS CLI; native mounting is not implemented yet.
+quicKFS is an experimental read-only network filesystem foundation for high-latency and unstable links. It uses QUIC directly through Quinn. The current prototype provides a Linux server, a platform-independent Rust client/CLI, and a feature-gated macFUSE mount for macOS.
 
 ```text
-macFUSE adapter (planned) → client core → QUIC/TLS → Linux daemon → export directory
+Finder → macFUSE adapter → client core → QUIC/TLS → Linux daemon → export directory
 ```
 
-Implemented: mutual-proof pairing, managed exact pins, operating-system/public PKI and private-CA server validation, externally issued identity rotation, Argon2id-backed user accounts, throttled and resource-bounded authenticated sessions, metadata, directory listings, session-scoped file open/close, arbitrary bounded ranged reads, opaque node IDs, and an in-memory cache interface. Planned: per-user export authorization, native macFUSE callbacks, reconnect/retry policy, persistent caching, writes, and Windows/WinFsp support.
+Implemented: mutual-proof pairing, managed exact pins, operating-system/public PKI and private-CA server validation, externally issued identity rotation, Argon2id-backed user accounts, throttled and resource-bounded authenticated sessions, metadata, directory listings, session-scoped file open/close, arbitrary bounded ranged reads, opaque node IDs, a read-only macFUSE adapter, and an in-memory cache interface. Planned: per-user export authorization, reconnect/retry policy, persistent caching, writes, and Windows/WinFsp support.
+
+On macOS, the desktop app and client commands require [macFUSE](https://macfuse.io/). They verify the installed runtime at process startup and stop with installation guidance when it is missing; server commands and non-macOS clients are unaffected.
 
 ## Build and run
 
-Requires Rust 1.85 or newer (Rust 2024 edition). The repository's rustup toolchain file selects current stable Rust.
+Requires Rust 1.88 or newer. The repository uses Rust 2024 and its rustup toolchain file selects current stable Rust.
 
 ```sh
 cargo build --workspace
