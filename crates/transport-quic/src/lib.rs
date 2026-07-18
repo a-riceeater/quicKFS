@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
-use quickfs_protocol::{CodecError, MAX_FRAME_SIZE, decode, encode};
+use quickfs_protocol::{
+    ALPN_PROTOCOL, CodecError, Envelope, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response,
+    decode, encode,
+};
 use quinn::{Connection, Endpoint};
 pub use quinn::{RecvStream, SendStream};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
+use rustls_platform_verifier::BuilderVerifierExt;
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
-    io::BufReader,
+    fs,
+    io::Read,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
     time::Duration,
 };
-use zeroize::Zeroize;
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+pub const MAX_CERTIFICATE_BUNDLE_SIZE: u64 = 4 * 1024 * 1024;
+pub const MAX_PRIVATE_KEY_SIZE: u64 = 64 * 1024;
+const MAX_CERTIFICATES_PER_BUNDLE: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -32,6 +41,8 @@ pub enum TransportError {
     Codec(#[from] CodecError),
     #[error("TLS: {0}")]
     Tls(String),
+    #[error("protocol: {0}")]
+    Protocol(String),
     #[error("timeout")]
     Timeout,
 }
@@ -47,33 +58,54 @@ impl QuicClient {
         certificate: CertificateDer<'static>,
         timeout: Duration,
     ) -> Result<Self, TransportError> {
+        Self::connect_with_ca(server, server_name, vec![certificate], timeout).await
+    }
+
+    /// Connect using a deployed private-CA bundle. Standard X.509 chain,
+    /// validity, key-usage, and server-name validation all remain enabled.
+    pub async fn connect_with_ca(
+        server: SocketAddr,
+        server_name: &str,
+        authorities: Vec<CertificateDer<'static>>,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
         install_crypto_provider();
+        if authorities.is_empty() {
+            return Err(TransportError::Tls(
+                "certificate-authority bundle is empty".into(),
+            ));
+        }
+        if authorities.len() > MAX_CERTIFICATES_PER_BUNDLE {
+            return Err(TransportError::Tls(
+                "certificate-authority bundle contains too many certificates".into(),
+            ));
+        }
         let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(certificate)
-            .map_err(|e| TransportError::Tls(e.to_string()))?;
+        for authority in authorities {
+            roots
+                .add(authority)
+                .map_err(|error| TransportError::Tls(error.to_string()))?;
+        }
         let crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let config = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-                .map_err(|e| TransportError::Tls(e.to_string()))?,
-        ));
-        let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))?;
-        endpoint.set_default_client_config(config);
-        let connection = tokio::time::timeout(
-            timeout,
-            endpoint
-                .connect(server, server_name)
-                .map_err(|e| TransportError::Tls(e.to_string()))?,
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)??;
-        Ok(Self {
-            endpoint,
-            connection,
-            timeout,
-        })
+        Self::connect_with_crypto(server, server_name, crypto, timeout).await
+    }
+
+    /// Connect using the operating system's native trust policy. This is the
+    /// public-PKI path and also supports enterprise roots installed through
+    /// MDM, Group Policy, or another platform-management mechanism.
+    pub async fn connect_with_system_roots(
+        server: SocketAddr,
+        server_name: &str,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        install_crypto_provider();
+        let crypto = rustls::ClientConfig::builder()
+            .with_platform_verifier()
+            .map_err(|error| TransportError::Tls(error.to_string()))?
+            .with_no_client_auth();
+        Self::connect_with_crypto(server, server_name, crypto, timeout).await
     }
 
     pub async fn connect_pinned(
@@ -83,17 +115,6 @@ impl QuicClient {
         timeout: Duration,
     ) -> Result<Self, TransportError> {
         Self::connect_with_verifier(server, server_name, Some(fingerprint), timeout).await
-    }
-
-    /// Opens a connection that accepts the presented certificate only so an
-    /// authenticated pairing proof can bind it to an out-of-band secret.
-    /// Callers must not send credentials or filesystem requests on this mode.
-    pub async fn connect_for_pairing(
-        server: SocketAddr,
-        server_name: &str,
-        timeout: Duration,
-    ) -> Result<Self, TransportError> {
-        Self::connect_with_verifier(server, server_name, None, timeout).await
     }
 
     async fn connect_with_verifier(
@@ -108,6 +129,16 @@ impl QuicClient {
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
+        Self::connect_with_crypto(server, server_name, crypto, timeout).await
+    }
+
+    async fn connect_with_crypto(
+        server: SocketAddr,
+        server_name: &str,
+        mut crypto: rustls::ClientConfig,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
         let config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|error| TransportError::Tls(error.to_string()))?,
@@ -138,7 +169,7 @@ impl QuicClient {
         let certificate = certificates
             .first()
             .ok_or_else(|| TransportError::Tls("server certificate chain is empty".into()))?;
-        Ok(Sha256::digest(certificate.as_ref()).into())
+        Ok(certificate_sha256(certificate))
     }
     pub async fn stream(&self) -> Result<(SendStream, RecvStream), TransportError> {
         Ok(
@@ -147,12 +178,98 @@ impl QuicClient {
                 .map_err(|_| TransportError::Timeout)??,
         )
     }
+    pub async fn send_frame<T: Serialize>(
+        &self,
+        send: &mut SendStream,
+        value: &T,
+    ) -> Result<(), TransportError> {
+        tokio::time::timeout(self.timeout, write_frame(send, value))
+            .await
+            .map_err(|_| TransportError::Timeout)?
+    }
+    pub async fn receive_frame<T: DeserializeOwned>(
+        &self,
+        recv: &mut RecvStream,
+    ) -> Result<T, TransportError> {
+        tokio::time::timeout(self.timeout, read_frame(recv))
+            .await
+            .map_err(|_| TransportError::Timeout)?
+    }
+    pub async fn receive_exact(
+        &self,
+        recv: &mut RecvStream,
+        data: &mut [u8],
+    ) -> Result<(), TransportError> {
+        tokio::time::timeout(self.timeout, recv.read_exact(data))
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+        Ok(())
+    }
     pub fn connection(&self) -> &Connection {
         &self.connection
     }
     pub fn close(&self) {
         self.connection.close(0u32.into(), b"client shutdown");
         let _ = &self.endpoint;
+    }
+}
+
+/// A deliberately restricted connection that accepts an initially untrusted
+/// certificate but can issue only the pairing protocol request. Keeping this
+/// separate from `QuicClient` makes it impossible for callers to send login
+/// credentials over the certificate-accepting transport through this API.
+pub struct PairingClient {
+    inner: QuicClient,
+}
+
+impl PairingClient {
+    pub async fn connect(
+        server: SocketAddr,
+        server_name: &str,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        Ok(Self {
+            inner: QuicClient::connect_with_verifier(server, server_name, None, timeout).await?,
+        })
+    }
+
+    pub fn peer_certificate_fingerprint(&self) -> Result<[u8; 32], TransportError> {
+        self.inner.peer_certificate_fingerprint()
+    }
+
+    pub async fn pair(
+        &self,
+        pairing_id: Uuid,
+        client_nonce: [u8; 32],
+        client_proof: [u8; 32],
+    ) -> Result<Response, TransportError> {
+        let mut request = Envelope::new(Request::Pair {
+            pairing_id,
+            client_nonce,
+            client_proof: client_proof.into(),
+        });
+        let (mut send, mut recv) = self.inner.stream().await?;
+        let write_result = self.inner.send_frame(&mut send, &request).await;
+        request.message.clear_secrets();
+        write_result?;
+        send.finish()?;
+        let response: Envelope<Response> = self.inner.receive_frame(&mut recv).await?;
+        if response.version != PROTOCOL_VERSION {
+            return Err(TransportError::Protocol(format!(
+                "unsupported response protocol version {}",
+                response.version
+            )));
+        }
+        if response.request_id != request.request_id {
+            return Err(TransportError::Protocol(
+                "pairing response request identifier did not match".into(),
+            ));
+        }
+        Ok(response.message)
+    }
+
+    pub fn close(&self) {
+        self.inner.close();
     }
 }
 
@@ -227,38 +344,159 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
 }
 pub fn server_endpoint(
     bind: SocketAddr,
-    cert: CertificateDer<'static>,
+    certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<Endpoint, TransportError> {
     install_crypto_provider();
-    let config = quinn::ServerConfig::with_single_cert(vec![cert], key)
-        .map_err(|e| TransportError::Tls(e.to_string()))?;
+    let crypto = server_crypto_config(certificates, key)?;
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+        .map_err(|error| TransportError::Tls(error.to_string()))?;
+    let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     Ok(Endpoint::server(config, bind)?)
+}
+
+/// Validate that a PEM-derived certificate chain and private key form a
+/// usable QUIC/TLS server identity without binding a network socket.
+pub fn validate_server_identity(
+    certificates: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<(), TransportError> {
+    install_crypto_provider();
+    let crypto = server_crypto_config(certificates, key)?;
+    quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+        .map_err(|error| TransportError::Tls(error.to_string()))?;
+    Ok(())
+}
+
+fn server_crypto_config(
+    certificates: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<rustls::ServerConfig, TransportError> {
+    if certificates.is_empty() {
+        return Err(TransportError::Tls(
+            "server certificate chain is empty".into(),
+        ));
+    }
+    if certificates.len() > MAX_CERTIFICATES_PER_BUNDLE {
+        return Err(TransportError::Tls(
+            "server certificate chain contains too many certificates".into(),
+        ));
+    }
+    let mut crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .map_err(|error| TransportError::Tls(error.to_string()))?;
+    crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+    Ok(crypto)
 }
 
 fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
+pub fn certificate_sha256(certificate: &CertificateDer<'_>) -> [u8; 32] {
+    Sha256::digest(certificate.as_ref()).into()
+}
 pub fn load_certificate(path: &Path) -> Result<CertificateDer<'static>, TransportError> {
-    let mut r = BufReader::new(File::open(path)?);
-    rustls_pemfile::certs(&mut r)
+    load_certificates(path)?
+        .into_iter()
         .next()
-        .ok_or_else(|| TransportError::Tls("certificate missing".into()))?
-        .map_err(TransportError::Io)
+        .ok_or_else(|| TransportError::Tls("certificate bundle is empty".into()))
+}
+pub fn load_certificate_pem(path: &Path) -> Result<Vec<u8>, TransportError> {
+    read_bounded_file(path, MAX_CERTIFICATE_BUNDLE_SIZE, "certificate bundle")
+}
+pub fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, TransportError> {
+    let pem = load_certificate_pem(path)?;
+    parse_certificates_pem(&pem)
+}
+pub fn parse_certificates_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TransportError> {
+    validate_buffer_size(pem.len(), MAX_CERTIFICATE_BUNDLE_SIZE, "certificate bundle")?;
+    let certificates = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| TransportError::Tls(error.to_string()))?;
+    if certificates.is_empty() {
+        return Err(TransportError::Tls("certificate bundle is empty".into()));
+    }
+    if certificates.len() > MAX_CERTIFICATES_PER_BUNDLE {
+        return Err(TransportError::Tls(
+            "certificate bundle contains too many certificates".into(),
+        ));
+    }
+    Ok(certificates)
 }
 pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TransportError> {
-    let mut r = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut r)?
-        .ok_or_else(|| TransportError::Tls("private key missing".into()))
+    let pem = load_private_key_pem(path)?;
+    parse_private_key_pem(&pem)
+}
+pub fn load_private_key_pem(path: &Path) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+    Ok(Zeroizing::new(read_bounded_file(
+        path,
+        MAX_PRIVATE_KEY_SIZE,
+        "private key",
+    )?))
+}
+pub fn parse_private_key_pem(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TransportError> {
+    validate_buffer_size(pem.len(), MAX_PRIVATE_KEY_SIZE, "private key")?;
+    PrivateKeyDer::from_pem_slice(pem).map_err(|error| TransportError::Tls(error.to_string()))
+}
+
+fn read_bounded_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, TransportError> {
+    let initial = fs::metadata(path)?;
+    if !initial.is_file() {
+        return Err(TransportError::Tls(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    validate_declared_size(initial.len(), maximum, label)?;
+
+    let file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(TransportError::Tls(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    validate_declared_size(opened.len(), maximum, label)?;
+
+    let mut data = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+    file.take(maximum.saturating_add(1))
+        .read_to_end(&mut data)?;
+    validate_buffer_size(data.len(), maximum, label)?;
+    Ok(data)
+}
+
+fn validate_declared_size(size: u64, maximum: u64, label: &str) -> Result<(), TransportError> {
+    if size == 0 {
+        return Err(TransportError::Tls(format!("{label} is empty")));
+    }
+    if size > maximum {
+        return Err(TransportError::Tls(format!(
+            "{label} exceeds the {maximum}-byte safety limit"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_buffer_size(data_len: usize, maximum: u64, label: &str) -> Result<(), TransportError> {
+    let size = u64::try_from(data_len)
+        .map_err(|_| TransportError::Tls(format!("{label} size does not fit u64")))?;
+    if size == 0 {
+        return Err(TransportError::Tls(format!("{label} is empty")));
+    }
+    if size > maximum {
+        return Err(TransportError::Tls(format!(
+            "{label} exceeds the {maximum}-byte safety limit"
+        )));
+    }
+    Ok(())
 }
 pub async fn write_frame<T: Serialize>(
     send: &mut SendStream,
     value: &T,
 ) -> Result<(), TransportError> {
-    let mut data = encode(value)?;
+    let data = Zeroizing::new(encode(value)?);
     send.write_all(&(data.len() as u32).to_be_bytes()).await?;
     send.write_all(&data).await?;
-    data.zeroize();
     Ok(())
 }
 pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, TransportError> {
@@ -268,7 +506,37 @@ pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T,
     if size > MAX_FRAME_SIZE {
         return Err(CodecError::TooLarge(size).into());
     }
-    let mut data = vec![0; size];
+    let mut data = Zeroizing::new(vec![0; size]);
     recv.read_exact(&mut data).await?;
     Ok(decode(&data)?)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_inputs_are_regular_nonempty_and_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = directory.path().join("empty.pem");
+        fs::write(&empty, []).unwrap();
+        assert!(load_certificate_pem(&empty).is_err());
+        assert!(load_private_key_pem(&empty).is_err());
+        assert!(load_certificate_pem(directory.path()).is_err());
+
+        let oversized_certificate = directory.path().join("oversized-certificate.pem");
+        fs::File::create(&oversized_certificate)
+            .unwrap()
+            .set_len(MAX_CERTIFICATE_BUNDLE_SIZE + 1)
+            .unwrap();
+        assert!(load_certificate_pem(&oversized_certificate).is_err());
+
+        let oversized_key = directory.path().join("oversized-key.pem");
+        fs::File::create(&oversized_key)
+            .unwrap()
+            .set_len(MAX_PRIVATE_KEY_SIZE + 1)
+            .unwrap();
+        assert!(load_private_key_pem(&oversized_key).is_err());
+    }
 }

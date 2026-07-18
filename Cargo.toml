@@ -25,12 +25,13 @@ dashmap = "6"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
-postcard = { version = "1", features = ["alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 quinn = "0.11"
 rcgen = "0.14"
 rpassword = "7"
+rustix = { version = "1", features = ["process"] }
 rustls = "0.23"
-rustls-pemfile = "2"
+rustls-platform-verifier = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -23,3 +23,8 @@ quickfs-server-core={path="../../../crates/server-core"}
 quickfs-transport-quic={path="../../../crates/transport-quic"}
 [lints]
 workspace=true
+
+[dev-dependencies]
+quickfs-client-core={path="../../../crates/client-core"}
+rcgen.workspace=true
+tempfile.workspace=true

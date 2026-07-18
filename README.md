@@ -6,7 +6,7 @@ quicKFS is an experimental read-only network filesystem foundation for high-late
 macFUSE adapter (planned) → client core → QUIC/TLS → Linux daemon → export directory
 ```
 
-Implemented: pairing-assisted certificate pinning, Argon2id-backed user accounts, authenticated sessions, metadata, directory listings, file open/close, arbitrary bounded ranged reads, opaque node IDs, and an in-memory cache interface. Planned: per-user export authorization, native macFUSE callbacks, reconnect/retry policy, persistent caching, writes, and Windows/WinFsp support.
+Implemented: mutual-proof pairing, managed exact pins, operating-system/public PKI and private-CA server validation, externally issued identity rotation, Argon2id-backed user accounts, throttled and resource-bounded authenticated sessions, metadata, directory listings, session-scoped file open/close, arbitrary bounded ranged reads, opaque node IDs, and an in-memory cache interface. Planned: per-user export authorization, native macFUSE callbacks, reconnect/retry policy, persistent caching, writes, and Windows/WinFsp support.
 
 ## Build and run
 
@@ -19,7 +19,7 @@ cargo run -p quickfs-server-daemon -- user add --state-dir .quickfs alice
 cargo run -p quickfs-server-daemon -- serve --bind 127.0.0.1:4433 --export-root ./shared --state-dir .quickfs
 ```
 
-Start with the [setup guide](docs/setup.md), [command reference](docs/usage.md), and [authentication explanation](docs/authentication.md). The [documentation index](docs/README.md) links architecture, development, protocol, troubleshooting, security, and roadmap material. Contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
+Start with the [setup guide](docs/setup.md), which covers both initialize → user → serve → pair → login and enterprise CA/managed-pin deployment without per-client pairing. The [command reference](docs/usage.md), [authentication explanation](docs/authentication.md), and [documentation index](docs/README.md) provide the remaining protocol, security, troubleshooting, and development details. Contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 > **Security warning:** authentication remains experimental and authorization is not yet per-user. Do not expose the prototype to the public Internet.
 

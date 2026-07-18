@@ -16,13 +16,24 @@ quickfs-server-daemon init \
 
 `--state-dir` defaults to `.quickfs`. Supply `--server-name` more than once when the identity needs multiple names. Initialization refuses to overwrite existing identity files.
 
+To use a certificate issued by a public or enterprise CA, replace `--server-name` with both external identity inputs:
+
+```sh
+quickfs-server-daemon init \
+  --state-dir /var/lib/quickfs \
+  --certificate server-fullchain.pem \
+  --private-key server-key.pem
+```
+
+The certificate file must contain the leaf first and then any intermediates. The unencrypted PEM key must match the leaf. QuickFS parses the chain, verifies the leaf/key match and TLS usability, and copies both into private server state. The client performs lifetime, requested-name, and CA-chain validation when it connects. Protect and retire the source key file separately; copying it does not change the source file's permissions or lifecycle.
+
 ### `user add`
 
 ```sh
 quickfs-server-daemon user add --state-dir /var/lib/quickfs alice
 ```
 
-Prompts twice for a password of at least 12 bytes and stores only a salted Argon2id hash. Usernames are 1–64 ASCII letters, digits, `.`, `_`, or `-`. Duplicate users are rejected.
+Prompts twice for a password of 12–1024 bytes and stores only a salted Argon2id hash. Usernames are 1–64 ASCII letters, digits, `.`, `_`, or `-`. Duplicate users are rejected.
 
 Other lifecycle commands are:
 
@@ -43,7 +54,18 @@ quickfs-server-daemon pair create \
   --expires-seconds 300
 ```
 
-Creates a single-use pairing ID and 160-bit secret. The default lifetime is five minutes. The running server reads pairing records from the state directory, so it does not need a restart.
+Creates a single-use pairing ID and 160-bit secret. The default lifetime is five minutes and the maximum is one hour. The running server reads pairing records from the state directory, so it does not need a restart.
+
+### `identity install`
+
+```sh
+quickfs-server-daemon identity install \
+  --state-dir /var/lib/quickfs \
+  --certificate renewed-fullchain.pem \
+  --private-key renewed-key.pem
+```
+
+Validates the replacement chain/key, writes a new protected identity generation, and atomically selects it. Restart the daemon to load it. CA-trusting clients can accept ordinary leaf renewal; exact-pin clients require a coordinated pin update or new pairing.
 
 ## Server `serve`
 
@@ -58,8 +80,14 @@ quickfs-server-daemon serve [OPTIONS] --export-root <PATH>
 | `--state-dir <PATH>` | `QUICKFS_STATE_DIR` | `.quickfs` | Identity, accounts, and pairing state. |
 | `--max-read-size <BYTES>` | — | `8388608` | Largest permitted ranged read. |
 | `--max-open-handles <COUNT>` | — | `1024` | Maximum tracked open files. |
-| `--request-timeout-ms <MS>` | — | `30000` | Configured timeout; full enforcement remains incomplete. |
+| `--max-known-nodes-per-connection <COUNT>` | — | `8192` | Maximum node IDs retained by one connection, including the root. |
+| `--max-total-known-nodes <COUNT>` | — | `65536` | Global budget for retained non-root node IDs across connections. |
+| `--request-timeout-ms <MS>` | — | `30000` | Full request timeout, including frame I/O and filesystem work. |
 | `--max-concurrent-requests <COUNT>` | — | `128` | Global request concurrency bound. |
+| `--max-in-flight-read-bytes <BYTES>` | — | `67108864` | Global memory budget reserved by concurrent raw reads. |
+| `--max-concurrent-connections <COUNT>` | — | `256` | Global accepted-connection bound. |
+| `--max-concurrent-auth <COUNT>` | — | `4` | Global Argon2 worker bound. |
+| `--auth-attempts-per-minute <COUNT>` | — | `30` | Rolling login-attempt limit per source IP (maximum `1000`). |
 
 Example:
 
@@ -82,9 +110,11 @@ quickfs-client-cli [OPTIONS] <COMMAND>
 | `--server-name <NAME>` | — | `localhost` | Logical identity associated with the pin. |
 | `--state-dir <PATH>` | `QUICKFS_CLIENT_STATE_DIR` | `.quickfs-client` | Client trust database directory. |
 | `--username <NAME>` | `QUICKFS_USERNAME` | — | Account for authenticated commands. |
-| `--timeout-ms <MS>` | — | `30000` | Connection and stream-open timeout. |
+| `--timeout-ms <MS>` | — | `30000` | Connection, stream-open, frame, and response-data timeout. |
+| `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Validate with the operating-system public/managed trust policy and `--server-name`. |
+| `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Validate with a deployed private-CA bundle and `--server-name`. |
 
-The client no longer accepts `--cert` or the shared `--token`. Pairing establishes trust, and passwords are entered through a hidden prompt.
+The client no longer accepts `--cert` or the shared `--token`. Without a CA option it requires an exact pin established through pairing or managed import. Passwords are entered through a hidden prompt. `--trust-system-roots` and `--ca-cert` are mutually exclusive and apply to authenticated commands, not `pair`, `forget`, or `trust import`.
 
 ### `pair`
 
@@ -95,7 +125,7 @@ quickfs-client-cli \
   pair --pairing-id <PAIRING_ID>
 ```
 
-The command prompts for the code and pins the authenticated certificate fingerprint. `--code` or `QUICKFS_PAIRING_CODE` exists for automation but can expose the secret through process configuration; interactive entry is preferred.
+The command prompts for the code and pins the authenticated certificate fingerprint. A client proof is verified before the server consumes the pairing, so a wrong code can be corrected using the same pairing record. Pairing is refused when a pin already exists; use `forget` only after investigating and deliberately authorizing a server identity change. `--code` or `QUICKFS_PAIRING_CODE` exists for automation but can expose the secret through process configuration; interactive entry is preferred.
 
 ### `forget`
 
@@ -107,6 +137,24 @@ quickfs-client-cli \
 ```
 
 Removes exactly that address/name pin. Use it only for a deliberate server reset or identity rotation, then pair again. The client never replaces a changed identity silently.
+
+### `trust import`
+
+Provision an exact pin through an authenticated enterprise-management channel without contacting the server:
+
+```sh
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  trust import --sha256 <64_HEX_DIGITS>
+
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  trust import --certificate server-fullchain.pem
+```
+
+Colon-separated fingerprints are accepted. With a PEM chain, the first certificate is pinned. Import uses the same locked, private trust database as pairing and refuses to replace an existing address/name pin. Later authenticated commands use that pin when neither CA option is supplied.
 
 ### `ping`
 
@@ -149,4 +197,4 @@ quickfs-client-cli --username alice \
 
 Use `RUST_LOG=info` or `RUST_LOG=quickfs_server_daemon=debug`. Logs must not contain passwords, pairing codes, or file contents.
 
-The implementation remains experimental and read-only. Per-user export permissions, recovery and live-session revocation, server-wide login throttling, native mounting, reconnect/retry, and production deployment hardening are incomplete. Do not expose it directly to the public Internet.
+The implementation remains experimental and read-only. Per-user export permissions, recovery and live-session revocation, distributed-login defense, native mounting, reconnect/retry, and production deployment hardening are incomplete. Do not expose it directly to the public Internet.

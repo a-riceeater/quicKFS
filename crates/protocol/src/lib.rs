@@ -3,9 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
+pub const ALPN_PROTOCOL: &[u8] = b"quickfs/3";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const ROOT_NODE: NodeId = NodeId(Uuid::from_u128(0));
 
@@ -17,6 +18,66 @@ pub struct NodeId(pub Uuid);
 pub struct FileHandle(pub Uuid);
 pub type FileRevision = u64;
 pub type DirectoryRevision = u64;
+
+/// A wire-compatible UTF-8 string whose debug representation is redacted and
+/// whose allocation is cleared when it is dropped.
+#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretString([REDACTED])")
+    }
+}
+
+/// A fixed-size authentication proof whose debug representation is redacted
+/// and whose bytes are cleared when it is dropped.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
+pub struct SecretProof([u8; 32]);
+
+impl SecretProof {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for SecretProof {
+    fn from(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for SecretProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretProof([REDACTED])")
+    }
+}
 
 impl RequestId {
     pub fn new() -> Self {
@@ -53,10 +114,11 @@ pub enum Request {
     Pair {
         pairing_id: Uuid,
         client_nonce: [u8; 32],
+        client_proof: SecretProof,
     },
     Authenticate {
         username: String,
-        password: String,
+        password: SecretString,
     },
     GetMetadata {
         node: NodeId,
@@ -82,8 +144,10 @@ pub enum Request {
 
 impl Request {
     pub fn clear_secrets(&mut self) {
-        if let Self::Authenticate { password, .. } = self {
-            password.zeroize();
+        match self {
+            Self::Pair { client_proof, .. } => client_proof.zeroize(),
+            Self::Authenticate { password, .. } => password.zeroize(),
+            _ => {}
         }
     }
 }
@@ -96,7 +160,7 @@ pub enum Response {
     AuthenticateAck,
     PairingProof {
         certificate_fingerprint: [u8; 32],
-        proof: [u8; 32],
+        proof: SecretProof,
     },
     Metadata(Metadata),
     DirectoryListing {
@@ -218,5 +282,28 @@ mod tests {
             decode::<Request>(&vec![0; MAX_FRAME_SIZE + 1]),
             Err(CodecError::TooLarge(_))
         ));
+    }
+
+    #[test]
+    fn authentication_debug_output_redacts_password() {
+        let request = Request::Authenticate {
+            username: "alice".into(),
+            password: "correct horse battery staple".to_string().into(),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("correct horse"));
+    }
+
+    #[test]
+    fn pairing_debug_output_redacts_proofs() {
+        let request = Request::Pair {
+            pairing_id: Uuid::nil(),
+            client_nonce: [1; 32],
+            client_proof: [2; 32].into(),
+        };
+        let output = format!("{request:?}");
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("2, 2, 2"));
     }
 }

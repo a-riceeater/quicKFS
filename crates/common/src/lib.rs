@@ -8,9 +8,12 @@ use std::{
 
 pub const DEFAULT_MAX_READ_SIZE: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Limits {
     pub max_read_size: u64,
     pub max_open_handles: usize,
+    pub max_known_nodes: usize,
+    pub max_total_known_nodes: usize,
     pub request_timeout_ms: u64,
 }
 impl Default for Limits {
@@ -18,6 +21,8 @@ impl Default for Limits {
         Self {
             max_read_size: DEFAULT_MAX_READ_SIZE,
             max_open_handles: 1024,
+            max_known_nodes: 8_192,
+            max_total_known_nodes: 65_536,
             request_timeout_ms: 30_000,
         }
     }

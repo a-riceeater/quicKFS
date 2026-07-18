@@ -22,7 +22,7 @@ quickfs-server-daemon serve --state-dir .quickfs ...
 
 Do not repeatedly initialize or delete this directory. Doing so changes server identity and invalidates every client pin.
 
-## The client says the server is not paired
+## The client says no exact pin is configured
 
 Create a fresh pairing on the server:
 
@@ -30,11 +30,11 @@ Create a fresh pairing on the server:
 quickfs-server-daemon pair create --state-dir .quickfs
 ```
 
-Then pair from the client with the printed ID and enter the code at the prompt. Confirm that `--server` and `--server-name` are identical during pairing and later use because the trust record is keyed by both.
+Then pair from the client with the printed ID and enter the code at the prompt. Confirm that `--server` and `--server-name` are identical during pairing and later use because the trust record is keyed by both. In a managed deployment, import the centrally authenticated pin instead, or explicitly select `--ca-cert`/`--trust-system-roots`; those modes do not require a local exact pin.
 
 ## Pairing fails
 
-Pairing codes expire after five minutes by default and are single-use. Create a new pairing rather than reusing an old record. Check that the client received the full grouped code through a trusted channel and that both machines have reasonable clocks.
+Pairing codes expire after five minutes by default and are single-use after a successful proof. A wrong code does not consume the record. Check that the client received the full grouped code through a trusted channel and that both machines have reasonable clocks.
 
 Do not send a username or password until pairing succeeds. The temporary certificate-accepting mode is used internally only by the `pair` command.
 
@@ -49,6 +49,29 @@ quickfs-client-cli --server <ADDRESS> --server-name <NAME> pair --pairing-id <NE
 
 There is no automatic insecure override.
 
+For a centrally distributed replacement pin, use `trust import --sha256 …` or
+`trust import --certificate …` after `forget`. Distribute the new value and
+authenticate it through the organization's management channel before removing
+the old pin.
+
+## Enterprise certificate validation fails
+
+The value passed as `--server-name` must match a DNS name or IP subject
+alternative name in the leaf certificate. Check that the server was given the
+complete PEM chain with the leaf first, intermediates after it, and a matching
+unencrypted PEM private key. With `--ca-cert`, confirm the configured bundle
+contains the intended issuing trust anchor. With `--trust-system-roots`, confirm
+the root is present in the operating-system trust policy. Certificate validity
+also depends on reasonable server and client clocks.
+
+CA modes never fall back to pairing or an old exact pin when validation fails.
+Fix the certificate, name, chain, clock, or trust deployment instead of bypassing
+the error.
+
+After `quickfs-server-daemon identity install`, restart the daemon. The running
+process retains the identity it loaded at startup; the next start atomically
+selects the newly installed generation.
+
 ## Username/password authentication fails
 
 Verify the username and add it if necessary:
@@ -58,7 +81,28 @@ quickfs-server-daemon user add --state-dir .quickfs alice
 quickfs-client-cli --username alice ping
 ```
 
-After five failed attempts on one connection, that connection rejects further attempts. The CLI creates a new connection per invocation. Passwords are case-sensitive and are never intentionally logged. Do not include passwords, pairing codes, private state, or trust databases in issue reports.
+After five failed attempts on one connection, that connection rejects further attempts. Reconnects remain subject to the per-source rolling rate limit. Passwords are case-sensitive and are never intentionally logged. Do not include passwords, pairing codes, private state, or trust databases in issue reports.
+
+## Private state permissions are unsafe
+
+On Unix, the server requires state directories to be owned by its effective user with mode `0700` and private files with mode `0600`; the client applies the same ownership and mode policy to its trust database. Both reject symlinks for private state. Repair a state directory only after verifying that every path is the intended one:
+
+```sh
+chmod 700 .quickfs .quickfs/pairings .quickfs-client
+chmod 600 .quickfs/server.crt .quickfs/server.key .quickfs/users.json .quickfs/pairings/*.json
+chmod 600 .quickfs-client/trusted-servers.json
+```
+
+The server refuses any nesting between the export root and state directory in either direction. Move them into disjoint directory trees instead of weakening that check.
+
+User administration, identity installation, and client trust updates use
+create-once lock files to prevent concurrent writers from losing each other's
+changes. If a process is killed during one of those updates, it can leave
+`.quickfs/.users.lock`, `.quickfs/.identity.lock`, or
+`.quickfs-client/.trusted-servers.lock` behind. First verify that no QuickFS
+administration, identity-installation, or pairing command is still running,
+then remove only the stale lock file. Never delete a lock held by a live
+process.
 
 ## A path is not found
 
