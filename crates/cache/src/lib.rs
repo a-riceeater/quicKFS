@@ -143,6 +143,11 @@ pub trait DirectoryCache: Send + Sync {
         self.insert(key, value).await;
     }
     async fn invalidate(&self, node: NodeId);
+    /// Invalidate snapshots that embed metadata for `node` as one of their
+    /// children. File data, xattr, and attribute mutations do not necessarily
+    /// change the parent directory's revision, so key-only invalidation is not
+    /// sufficient for coherent readdirplus/offline metadata.
+    async fn invalidate_containing(&self, _node: NodeId) {}
 }
 
 #[async_trait]
@@ -165,6 +170,14 @@ pub trait FilesystemStateCache: Send + Sync {
     async fn store_readthrough_filesystem_stats(&self, value: FilesystemStats) {
         self.insert_filesystem_stats(value).await;
     }
+}
+
+/// Atomically invalidate every cache projection whose correctness depends on
+/// one node. Persistent implementations use one manifest transaction so a
+/// stream of small FUSE writes does not pay several fsyncs per chunk.
+#[async_trait]
+pub trait NodeCacheInvalidation: Send + Sync {
+    async fn invalidate_node_state(&self, node: NodeId);
 }
 
 #[derive(Default)]
@@ -210,6 +223,11 @@ impl DirectoryCache for MemoryCache {
     async fn invalidate(&self, node: NodeId) {
         self.directories.retain(|key, _| key.node != node);
     }
+
+    async fn invalidate_containing(&self, node: NodeId) {
+        self.directories
+            .retain(|_, entries| !entries.iter().any(|entry| entry.node == node));
+    }
 }
 
 #[async_trait]
@@ -238,6 +256,17 @@ impl RangeCache for MemoryCache {
     }
 
     async fn invalidate(&self, node: NodeId) {
+        self.ranges.retain(|key, _| key.file.node != node);
+    }
+}
+
+#[async_trait]
+impl NodeCacheInvalidation for MemoryCache {
+    async fn invalidate_node_state(&self, node: NodeId) {
+        self.metadata.remove(&node);
+        self.directories.retain(|key, entries| {
+            key.node != node && !entries.iter().any(|entry| entry.node == node)
+        });
         self.ranges.retain(|key, _| key.file.node != node);
     }
 }
@@ -701,7 +730,35 @@ impl PersistentCache {
     }
 
     pub fn invalidate_node(&self, node: NodeId) -> Result<(), CacheError> {
-        self.remove_matching(|key| key.node() == Some(node))
+        let mut state = self.lock_state()?;
+        let mut removed = state
+            .entries
+            .keys()
+            .filter(|key| key.node() == Some(node))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let candidates = state
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                (matches!(key, EntryKey::Directory(_)) && !removed.contains(key))
+                    .then_some((key.clone(), entry.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (key, entry) in candidates {
+            let entries = match self.read_disk_entry(&entry) {
+                Ok(bytes) => serde_json::from_slice::<Vec<DirectoryEntry>>(&bytes).ok(),
+                Err(CacheError::CorruptEntry) => None,
+                Err(error) => return Err(error),
+            };
+            if entries
+                .as_ref()
+                .is_none_or(|entries| entries.iter().any(|entry| entry.node == node))
+            {
+                removed.insert(key);
+            }
+        }
+        self.remove_keys_locked(&mut state, &removed.into_iter().collect::<Vec<_>>())
     }
 
     fn invalidate_metadata(&self, node: NodeId) -> Result<(), CacheError> {
@@ -714,6 +771,32 @@ impl PersistentCache {
         self.remove_matching(
             |key| matches!(key, EntryKey::Directory(candidate) if candidate.node == node),
         )
+    }
+
+    fn invalidate_directories_containing(&self, node: NodeId) -> Result<(), CacheError> {
+        let mut state = self.lock_state()?;
+        let candidates = state
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                matches!(key, EntryKey::Directory(_)).then_some((key.clone(), entry.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        for (key, entry) in candidates {
+            let entries = match self.read_disk_entry(&entry) {
+                Ok(bytes) => serde_json::from_slice::<Vec<DirectoryEntry>>(&bytes).ok(),
+                Err(CacheError::CorruptEntry) => None,
+                Err(error) => return Err(error),
+            };
+            if entries
+                .as_ref()
+                .is_none_or(|entries| entries.iter().any(|entry| entry.node == node))
+            {
+                removed.push(key);
+            }
+        }
+        self.remove_keys_locked(&mut state, &removed)
     }
 
     fn invalidate_ranges(&self, node: NodeId) -> Result<(), CacheError> {
@@ -1024,6 +1107,10 @@ impl DirectoryCache for PersistentCache {
     async fn invalidate(&self, node: NodeId) {
         let _ = self.invalidate_directories(node);
     }
+
+    async fn invalidate_containing(&self, node: NodeId) {
+        let _ = self.invalidate_directories_containing(node);
+    }
 }
 
 #[async_trait]
@@ -1049,6 +1136,13 @@ impl FilesystemStateCache for PersistentCache {
 
     async fn insert_filesystem_stats(&self, value: FilesystemStats) {
         let _ = self.insert_filesystem_stats_value(value);
+    }
+}
+
+#[async_trait]
+impl NodeCacheInvalidation for PersistentCache {
+    async fn invalidate_node_state(&self, node: NodeId) {
+        let _ = self.invalidate_node(node);
     }
 }
 
@@ -1135,6 +1229,14 @@ impl DirectoryCache for NonBlockingPersistentCache {
         })
         .await;
     }
+
+    async fn invalidate_containing(&self, node: NodeId) {
+        DirectoryCache::invalidate_containing(self.memory.as_ref(), node).await;
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.invalidate_directories_containing(node);
+        })
+        .await;
+    }
 }
 
 #[async_trait]
@@ -1217,6 +1319,18 @@ impl FilesystemStateCache for NonBlockingPersistentCache {
         self.enqueue(move |cache| {
             let _ = cache.insert_filesystem_stats_value(value);
         });
+    }
+}
+
+#[async_trait]
+impl NodeCacheInvalidation for NonBlockingPersistentCache {
+    async fn invalidate_node_state(&self, node: NodeId) {
+        NodeCacheInvalidation::invalidate_node_state(self.memory.as_ref(), node).await;
+        self.hot_ranges.invalidate(node);
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.invalidate_node(node);
+        })
+        .await;
     }
 }
 
@@ -1618,6 +1732,15 @@ mod tests {
         }
     }
 
+    fn directory_entry(node: NodeId, name: &str, revision: u64) -> DirectoryEntry {
+        DirectoryEntry {
+            node,
+            name: name.into(),
+            kind: NodeKind::File,
+            metadata: metadata(node, revision),
+        }
+    }
+
     #[tokio::test]
     async fn memory_cache_assembles_contained_and_unaligned_ranges_by_revision() {
         let cache = MemoryCache::default();
@@ -1634,6 +1757,36 @@ mod tests {
         );
         assert!(RangeCache::get(&cache, range(8, 2, 4)).await.is_none());
         assert!(RangeCache::get(&cache, range(7, 3, 6)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_cache_invalidates_every_directory_embedding_changed_child_metadata() {
+        let cache = MemoryCache::default();
+        let changed = NodeId(Uuid::from_u128(40));
+        let unchanged = NodeId(Uuid::from_u128(41));
+        let other_directory = NodeId(Uuid::from_u128(42));
+        let root_key = revision(12);
+        let other_key = RevisionKey {
+            node: other_directory,
+            revision: 13,
+        };
+        DirectoryCache::insert(
+            &cache,
+            root_key,
+            vec![directory_entry(changed, "changed", 20)],
+        )
+        .await;
+        DirectoryCache::insert(
+            &cache,
+            other_key,
+            vec![directory_entry(unchanged, "unchanged", 21)],
+        )
+        .await;
+
+        DirectoryCache::invalidate_containing(&cache, changed).await;
+
+        assert!(DirectoryCache::get(&cache, root_key).await.is_none());
+        assert!(DirectoryCache::get(&cache, other_key).await.is_some());
     }
 
     #[tokio::test]
@@ -1844,6 +1997,43 @@ mod tests {
             reopened.get_metadata_value(second).unwrap().unwrap(),
             metadata(second, 21)
         );
+    }
+
+    #[test]
+    fn persistent_node_invalidation_removes_owned_and_embedding_entries_together() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = open_cache(&temporary, namespace(11, "alice"), 8_192);
+        let changed = NodeId(Uuid::from_u128(50));
+        let unchanged = NodeId(Uuid::from_u128(51));
+        let other_directory = NodeId(Uuid::from_u128(52));
+        let root_key = revision(30);
+        let other_key = RevisionKey {
+            node: other_directory,
+            revision: 31,
+        };
+        cache
+            .insert_directory_value(root_key, &[directory_entry(changed, "changed", 32)])
+            .unwrap();
+        cache
+            .insert_directory_value(other_key, &[directory_entry(unchanged, "unchanged", 33)])
+            .unwrap();
+        cache.insert_metadata_value(metadata(changed, 32)).unwrap();
+        let changed_range = RangeKey {
+            file: RevisionKey {
+                node: changed,
+                revision: 32,
+            },
+            offset: 0,
+            length: 4,
+        };
+        cache.insert_range_value(changed_range, b"data").unwrap();
+
+        cache.invalidate_node(changed).unwrap();
+
+        assert!(cache.get_directory_value(root_key).unwrap().is_none());
+        assert!(cache.get_directory_value(other_key).unwrap().is_some());
+        assert!(cache.get_metadata_value(changed).unwrap().is_none());
+        assert!(cache.get_range_value(changed_range).unwrap().is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

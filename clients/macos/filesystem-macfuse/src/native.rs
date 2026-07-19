@@ -797,7 +797,10 @@ impl Filesystem for Adapter {
         self.spawn_callback(async move {
             match adapter.opendir_async(u64::from(inode)).await {
                 Ok(handle) => {
-                    reply.opened(FileHandle(handle), FopenFlags::FOPEN_CACHE_DIR);
+                    // The adapter retains one coherent enriched snapshot for
+                    // Finder's follow-up callbacks. Do not additionally pin a
+                    // kernel directory cache across create/rename/remove.
+                    reply.opened(FileHandle(handle), FopenFlags::empty());
                 }
                 Err(error) => {
                     report_callback_error("opendir", &error);

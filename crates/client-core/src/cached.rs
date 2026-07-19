@@ -8,27 +8,33 @@ use crate::{
 use async_trait::async_trait;
 use futures::future::join_all;
 use quickfs_cache::{
-    DirectoryCache, FilesystemStateCache, MemoryCache, MetadataCache, RangeCache, RangeKey,
-    RevisionKey,
+    DirectoryCache, FilesystemStateCache, MemoryCache, MetadataCache, NodeCacheInvalidation,
+    RangeCache, RangeKey, RevisionKey,
 };
 use quickfs_protocol::{
     AttributeChanges, DirectoryEntry, DirectoryView, DirectoryViewEntry, DirectoryViewOptions,
     ErrorCode, FileAccess, FileHandle, FileLock, FileOpenOptions, FilesystemCapabilities,
-    FilesystemStats, Metadata, Name, NodeId, RenameMode, SafeIoctl, SeekWhence, SpecialNodeKind,
-    XattrSetMode,
+    FilesystemStats, Metadata, Name, NodeId, ROOT_NODE, RenameMode, SafeIoctl, SeekWhence,
+    SpecialNodeKind, XattrSetMode,
 };
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use uuid::Uuid;
 
+const SMALL_READ_AHEAD_BLOCK_SIZE: u64 = 1024 * 1024;
+const SMALL_READ_THRESHOLD: u64 = 1024 * 1024;
+
 pub trait FilesystemCache:
-    MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache
+    MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache + NodeCacheInvalidation
 {
 }
-impl<T: MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache> FilesystemCache for T {}
+impl<T> FilesystemCache for T where
+    T: MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache + NodeCacheInvalidation
+{
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CachePolicy {
@@ -54,6 +60,55 @@ struct CachedHandle {
     mutation: Arc<Mutex<()>>,
 }
 
+struct RangeFetch {
+    result: OnceCell<std::result::Result<Arc<Vec<u8>>, SharedFetchError>>,
+}
+
+#[derive(Clone)]
+enum SharedFetchError {
+    Server(ErrorCode, String),
+    UnexpectedResponse,
+    ReadTooLarge(u64),
+    WriteTooLarge(u64),
+    StaleRevision,
+    Offline,
+    OfflineCacheMiss,
+    AmbiguousMutation,
+}
+
+impl From<ClientError> for SharedFetchError {
+    fn from(error: ClientError) -> Self {
+        match error {
+            // A transport failure has already passed through the resilient
+            // reconnect layer. Followers of the same fetch must observe the
+            // same offline result instead of starting another reconnect storm.
+            ClientError::Transport(_) | ClientError::Offline => Self::Offline,
+            ClientError::Server(code, message) => Self::Server(code, message),
+            ClientError::UnexpectedResponse => Self::UnexpectedResponse,
+            ClientError::ReadTooLarge(limit) => Self::ReadTooLarge(limit),
+            ClientError::WriteTooLarge(limit) => Self::WriteTooLarge(limit),
+            ClientError::StaleRevision => Self::StaleRevision,
+            ClientError::OfflineCacheMiss => Self::OfflineCacheMiss,
+            ClientError::AmbiguousMutation => Self::AmbiguousMutation,
+        }
+    }
+}
+
+impl From<SharedFetchError> for ClientError {
+    fn from(error: SharedFetchError) -> Self {
+        match error {
+            SharedFetchError::Server(code, message) => Self::Server(code, message),
+            SharedFetchError::UnexpectedResponse => Self::UnexpectedResponse,
+            SharedFetchError::ReadTooLarge(limit) => Self::ReadTooLarge(limit),
+            SharedFetchError::WriteTooLarge(limit) => Self::WriteTooLarge(limit),
+            SharedFetchError::StaleRevision => Self::StaleRevision,
+            SharedFetchError::Offline => Self::Offline,
+            SharedFetchError::OfflineCacheMiss => Self::OfflineCacheMiss,
+            SharedFetchError::AmbiguousMutation => Self::AmbiguousMutation,
+        }
+    }
+}
+
 /// Adds a revision-keyed read-through/offline cache without weakening remote
 /// write, fsync, or lock semantics. Offline access is intentionally read-only.
 pub struct CachedFilesystem {
@@ -63,7 +118,8 @@ pub struct CachedFilesystem {
     handles: RwLock<HashMap<FileHandle, CachedHandle>>,
     capabilities: RwLock<Option<FilesystemCapabilities>>,
     refreshing_directories: Arc<Mutex<HashSet<NodeId>>>,
-    range_fetches: Mutex<HashMap<RangeKey, Arc<Mutex<()>>>>,
+    range_fetches: Mutex<HashMap<RangeKey, Arc<RangeFetch>>>,
+    directory_parents: RwLock<HashMap<NodeId, NodeId>>,
 }
 
 impl CachedFilesystem {
@@ -86,6 +142,7 @@ impl CachedFilesystem {
             capabilities: RwLock::new(None),
             refreshing_directories: Arc::new(Mutex::new(HashSet::new())),
             range_fetches: Mutex::new(HashMap::new()),
+            directory_parents: RwLock::new(HashMap::from([(ROOT_NODE, ROOT_NODE)])),
         })
     }
 
@@ -138,9 +195,7 @@ impl CachedFilesystem {
     }
 
     async fn invalidate_node(&self, node: NodeId) {
-        MetadataCache::invalidate(self.cache.as_ref(), node).await;
-        DirectoryCache::invalidate(self.cache.as_ref(), node).await;
-        RangeCache::invalidate(self.cache.as_ref(), node).await;
+        NodeCacheInvalidation::invalidate_node_state(self.cache.as_ref(), node).await;
     }
 
     async fn offline_directory(&self, node: NodeId) -> Result<DirectorySnapshot> {
@@ -223,12 +278,21 @@ impl CachedFilesystem {
         let requested_end = offset
             .checked_add(requested)
             .ok_or(ClientError::UnexpectedResponse)?;
-        let mut block_offset = offset / self.policy.block_size * self.policy.block_size;
+        // Header probes and thumbnail reads should not pull 16 MiB from every
+        // file Finder touches. Sequential/copy-sized requests retain the large
+        // aligned block, while small random reads use a bounded 1 MiB window.
+        let block_size = if length < SMALL_READ_THRESHOLD {
+            self.policy.block_size.min(SMALL_READ_AHEAD_BLOCK_SIZE)
+        } else {
+            self.policy.block_size
+        };
+        let mut block_offset = offset / block_size * block_size;
         let mut blocks = Vec::new();
         while block_offset < requested_end {
             let block_length = self
                 .policy
                 .block_size
+                .min(block_size)
                 .min(state.size.saturating_sub(block_offset));
             blocks.push(RangeKey {
                 file: RevisionKey {
@@ -239,7 +303,7 @@ impl CachedFilesystem {
                 length: block_length,
             });
             block_offset = block_offset
-                .checked_add(self.policy.block_size)
+                .checked_add(block_size)
                 .ok_or(ClientError::UnexpectedResponse)?;
         }
         Ok(blocks)
@@ -251,51 +315,65 @@ impl CachedFilesystem {
         state: &CachedHandle,
         block: RangeKey,
     ) -> Result<Vec<u8>> {
-        let gate = {
+        let fetch = {
             let mut fetches = self.range_fetches.lock().await;
             fetches
                 .entry(block)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .or_insert_with(|| {
+                    Arc::new(RangeFetch {
+                        result: OnceCell::new(),
+                    })
+                })
                 .clone()
         };
-        let guard = gate.lock().await;
-        let result = async {
-            if let Some(data) = RangeCache::get(self.cache.as_ref(), block).await {
-                return Ok(data);
-            }
-            let read = self
-                .inner
-                .read_range_versioned(inner_handle, block.offset, block.length)
-                .await?;
-            if read.revision != state.revision {
-                return Err(ClientError::StaleRevision);
-            }
-            let actual =
-                u64::try_from(read.data.len()).map_err(|_| ClientError::UnexpectedResponse)?;
-            if actual > block.length {
-                return Err(ClientError::UnexpectedResponse);
-            }
-            if actual > 0 {
-                let actual_key = RangeKey {
-                    length: actual,
-                    ..block
-                };
-                RangeCache::store_readthrough(self.cache.as_ref(), actual_key, read.data.clone())
-                    .await;
-            }
-            Ok(read.data)
-        }
-        .await;
-        drop(guard);
+        let result = fetch
+            .result
+            .get_or_init(|| async {
+                let loaded = async {
+                    if let Some(data) = RangeCache::get(self.cache.as_ref(), block).await {
+                        return Ok(Arc::new(data));
+                    }
+                    let read = self
+                        .inner
+                        .read_range_versioned(inner_handle, block.offset, block.length)
+                        .await?;
+                    if read.revision != state.revision {
+                        return Err(ClientError::StaleRevision);
+                    }
+                    let actual = u64::try_from(read.data.len())
+                        .map_err(|_| ClientError::UnexpectedResponse)?;
+                    if actual > block.length {
+                        return Err(ClientError::UnexpectedResponse);
+                    }
+                    if actual > 0 {
+                        let actual_key = RangeKey {
+                            length: actual,
+                            ..block
+                        };
+                        RangeCache::store_readthrough(
+                            self.cache.as_ref(),
+                            actual_key,
+                            read.data.clone(),
+                        )
+                        .await;
+                    }
+                    Ok(Arc::new(read.data))
+                }
+                .await;
+                loaded.map_err(SharedFetchError::from)
+            })
+            .await
+            .clone();
         let mut fetches = self.range_fetches.lock().await;
         if fetches
             .get(&block)
-            .is_some_and(|registered| Arc::ptr_eq(registered, &gate))
-            && Arc::strong_count(&gate) == 2
+            .is_some_and(|registered| Arc::ptr_eq(registered, &fetch))
         {
             fetches.remove(&block);
         }
         result
+            .map(|data| data.as_ref().clone())
+            .map_err(ClientError::from)
     }
 
     async fn update_handle(&self, logical: FileHandle, result: WriteResult) {
@@ -408,14 +486,26 @@ impl RemoteFilesystem for CachedFilesystem {
                 DirectoryCache::store_readthrough_snapshot(self.cache.as_ref(), key, entries).await;
                 self.cache_metadata(view.directory.clone()).await;
                 self.cache_metadata(view.parent.clone()).await;
+                self.directory_parents
+                    .write()
+                    .await
+                    .insert(node, view.parent.node);
                 Ok(view)
             }
             Err(error) if is_offline(&error) => {
                 let snapshot = self.offline_directory(node).await?;
                 let directory = self.cached_metadata(node).await?;
+                let parent_node = self
+                    .directory_parents
+                    .read()
+                    .await
+                    .get(&node)
+                    .copied()
+                    .ok_or(ClientError::OfflineCacheMiss)?;
+                let parent = self.cached_metadata(parent_node).await?;
                 Ok(DirectoryView {
                     revision: snapshot.revision,
-                    parent: directory.clone(),
+                    parent,
                     directory,
                     xattrs: None,
                     entries: snapshot
@@ -498,6 +588,10 @@ impl RemoteFilesystem for CachedFilesystem {
         let metadata = self.inner.create_directory(parent, name, mode).await?;
         self.invalidate_node(parent).await;
         MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        self.directory_parents
+            .write()
+            .await
+            .insert(metadata.node, parent);
         Ok(metadata)
     }
 
@@ -579,6 +673,7 @@ impl RemoteFilesystem for CachedFilesystem {
         self.invalidate_node(parent).await;
         if let Some(node) = cached_child {
             self.invalidate_node(node).await;
+            self.directory_parents.write().await.remove(&node);
         }
         Ok(())
     }
@@ -591,11 +686,44 @@ impl RemoteFilesystem for CachedFilesystem {
         new_name: Name,
         mode: RenameMode,
     ) -> Result<()> {
+        let source = self
+            .offline_directory(parent)
+            .await
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .entries
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .map(|entry| entry.node)
+            });
+        let destination = self
+            .offline_directory(new_parent)
+            .await
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .entries
+                    .into_iter()
+                    .find(|entry| entry.name == new_name)
+                    .map(|entry| entry.node)
+            });
         self.inner
             .rename_node(parent, name, new_parent, new_name, mode)
             .await?;
         self.invalidate_node(parent).await;
         self.invalidate_node(new_parent).await;
+        let mut directory_parents = self.directory_parents.write().await;
+        if let Some(source) = source {
+            directory_parents.insert(source, new_parent);
+        }
+        if mode == RenameMode::Exchange {
+            if let Some(destination) = destination {
+                directory_parents.insert(destination, parent);
+            }
+        } else if let Some(destination) = destination {
+            directory_parents.remove(&destination);
+        }
         Ok(())
     }
 
@@ -1003,7 +1131,9 @@ mod tests {
 
     struct ToggleFilesystem {
         offline: AtomicBool,
+        fail_reads: AtomicBool,
         reads: AtomicUsize,
+        read_lengths: std::sync::Mutex<Vec<u64>>,
         metadata_reads: AtomicUsize,
         directory_reads: AtomicUsize,
         directory_delay_ms: AtomicU64,
@@ -1131,9 +1261,13 @@ mod tests {
         ) -> Result<RangeRead> {
             self.check_online()?;
             self.reads.fetch_add(1, Ordering::SeqCst);
+            self.read_lengths.lock().unwrap().push(length);
             let delay_ms = self.read_delay_ms.load(Ordering::SeqCst);
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            if self.fail_reads.load(Ordering::SeqCst) {
+                return Err(ClientError::Offline);
             }
             let start = usize::try_from(offset).unwrap();
             let end = usize::try_from(offset.saturating_add(length))
@@ -1169,7 +1303,9 @@ mod tests {
             .collect();
         let inner = Arc::new(ToggleFilesystem {
             offline: AtomicBool::new(false),
+            fail_reads: AtomicBool::new(false),
             reads: AtomicUsize::new(0),
+            read_lengths: std::sync::Mutex::new(Vec::new()),
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
             directory_delay_ms: AtomicU64::new(0),
@@ -1223,7 +1359,9 @@ mod tests {
     async fn cached_directory_is_returned_while_one_remote_refresh_runs() {
         let inner = Arc::new(ToggleFilesystem {
             offline: AtomicBool::new(false),
+            fail_reads: AtomicBool::new(false),
             reads: AtomicUsize::new(0),
+            read_lengths: std::sync::Mutex::new(Vec::new()),
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
             directory_delay_ms: AtomicU64::new(0),
@@ -1267,7 +1405,9 @@ mod tests {
         let data = vec![0x5a; 2 * 1024 * 1024];
         let inner = Arc::new(ToggleFilesystem {
             offline: AtomicBool::new(false),
+            fail_reads: AtomicBool::new(false),
             reads: AtomicUsize::new(0),
+            read_lengths: std::sync::Mutex::new(Vec::new()),
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
             directory_delay_ms: AtomicU64::new(0),
@@ -1289,6 +1429,67 @@ mod tests {
         );
         assert_eq!(first.unwrap(), vec![0x5a; 4096]);
         assert_eq!(second.unwrap(), vec![0x5a; 4096]);
+        assert_eq!(inner.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn small_random_read_uses_bounded_read_ahead_with_large_policy_blocks() {
+        let data = vec![0x5a; 2 * 1024 * 1024];
+        let inner = Arc::new(ToggleFilesystem {
+            offline: AtomicBool::new(false),
+            fail_reads: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
+            read_lengths: std::sync::Mutex::new(Vec::new()),
+            metadata_reads: AtomicUsize::new(0),
+            directory_reads: AtomicUsize::new(0),
+            directory_delay_ms: AtomicU64::new(0),
+            read_delay_ms: AtomicU64::new(0),
+            data,
+        });
+        let filesystem = CachedFilesystem::new(
+            inner.clone(),
+            Arc::new(MemoryCache::default()),
+            CachePolicy::default(),
+        )
+        .unwrap();
+        let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
+
+        assert_eq!(
+            filesystem.read_range(handle, 64, 4096).await.unwrap(),
+            vec![0x5a; 4096]
+        );
+        assert_eq!(*inner.read_lengths.lock().unwrap(), [1024 * 1024]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_failed_reads_share_one_remote_fetch() {
+        let inner = Arc::new(ToggleFilesystem {
+            offline: AtomicBool::new(false),
+            fail_reads: AtomicBool::new(true),
+            reads: AtomicUsize::new(0),
+            read_lengths: std::sync::Mutex::new(Vec::new()),
+            metadata_reads: AtomicUsize::new(0),
+            directory_reads: AtomicUsize::new(0),
+            directory_delay_ms: AtomicU64::new(0),
+            read_delay_ms: AtomicU64::new(50),
+            data: vec![0x5a; 2 * 1024 * 1024],
+        });
+        let filesystem = CachedFilesystem::new(
+            inner.clone(),
+            Arc::new(MemoryCache::default()),
+            CachePolicy {
+                block_size: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
+        let (first, second) = tokio::join!(
+            filesystem.read_range(handle, 64, 4096),
+            filesystem.read_range(handle, 128, 4096)
+        );
+
+        assert!(matches!(first, Err(ClientError::OfflineCacheMiss)));
+        assert!(matches!(second, Err(ClientError::OfflineCacheMiss)));
         assert_eq!(inner.reads.load(Ordering::SeqCst), 1);
     }
 }

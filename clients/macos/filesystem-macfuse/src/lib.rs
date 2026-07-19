@@ -37,7 +37,11 @@ pub const ROOT_INODE: u64 = 1;
 /// joined inside one FUSE operation.
 pub const MAX_FUSE_IO_SIZE: u64 = 16 * 1024 * 1024;
 pub const MAX_FUSE_XATTR_SIZE: u64 = 64 * 1024 * 1024;
-const DISCOVERED_METADATA_TTL: Duration = Duration::from_secs(1);
+// One enriched directory view is the consistency unit for Finder callbacks.
+// Expiring its child metadata after one second while retaining its names for
+// thirty seconds recreates the exact per-child RPC fan-out v6 was meant to
+// eliminate, and can make a second `ls` slower than the first.
+const DISCOVERED_METADATA_TTL: Duration = Duration::from_secs(30);
 const DISCOVERED_DIRECTORY_TTL: Duration = Duration::from_secs(30);
 const RELEASED_DIRECTORY_ENTRY_RETENTION: Duration = Duration::from_secs(5);
 const MOUNT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -642,8 +646,11 @@ impl Adapter {
                 .create_hard_link(node, new_parent, new_name.clone())
                 .await?;
             validate_metadata(node, &metadata)?;
-            self.remember_metadata(metadata.clone())?;
+            // Link count metadata is embedded in every existing hardlink
+            // parent, not only in the destination directory.
+            self.invalidate_node_views(node)?;
             self.invalidate_directory(new_parent_inode)?;
+            self.remember_metadata(metadata.clone())?;
             let linked_inode = self.remember_entry(node, new_parent_inode, &new_name)?;
             self.add_lookup(linked_inode, 1)?;
             Ok(CreatedNode {
@@ -694,12 +701,16 @@ impl Adapter {
         self.require_writable().await?;
         validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
         let parent = self.inode_record(parent_inode)?;
+        let removed_node = self.entry_node(parent_inode, &name)?;
         self.execute(async {
             self.state
                 .remote
                 .remove_node(parent.node, name.clone(), directory)
                 .await?;
             self.invalidate_directory(parent_inode)?;
+            if let Some(node) = removed_node {
+                self.invalidate_node_views(node)?;
+            }
             self.forget_entry(parent_inode, &name)?;
             Ok(())
         })
@@ -722,6 +733,8 @@ impl Adapter {
         validate_name(&new_name).map_err(|()| AdapterError::InvalidName)?;
         let parent = self.inode_record(parent_inode)?;
         let new_parent = self.inode_record(new_parent_inode)?;
+        let source_node = self.entry_node(parent_inode, &name)?;
+        let destination_node = self.entry_node(new_parent_inode, &new_name)?;
         self.execute(async {
             self.state
                 .remote
@@ -735,6 +748,12 @@ impl Adapter {
                 .await?;
             self.invalidate_directory(parent_inode)?;
             self.invalidate_directory(new_parent_inode)?;
+            if let Some(node) = source_node {
+                self.invalidate_node_views(node)?;
+            }
+            if let Some(node) = destination_node {
+                self.invalidate_node_views(node)?;
+            }
             self.move_entry(parent_inode, &name, new_parent_inode, &new_name, mode)?;
             Ok(())
         })
@@ -774,10 +793,11 @@ impl Adapter {
                     .set_attributes(record.node, remote_handle, changes)
                     .await?;
                 validate_metadata(record.node, &metadata)?;
-                self.remember_metadata(metadata.clone())?;
                 Ok(metadata)
             })
             .await?;
+        self.invalidate_node_views(record.node)?;
+        self.remember_metadata(metadata.clone())?;
         if let Some(handle) = handle {
             self.update_file_handle(handle, metadata.revision, metadata.size)?;
         }
@@ -893,6 +913,8 @@ impl Adapter {
             })
             .await?;
         self.update_file_handle(handle, revision, size)?;
+        let node = self.inode_record(opened.inode)?.node;
+        self.invalidate_node_views(node)?;
         Ok(written)
     }
 
@@ -976,7 +998,10 @@ impl Adapter {
                     .await?)
             })
             .await?;
-        self.update_file_handle(handle, result.revision, result.size)
+        self.update_file_handle(handle, result.revision, result.size)?;
+        let node = self.inode_record(opened.inode)?.node;
+        self.invalidate_node_views(node)?;
+        Ok(())
     }
 
     pub(crate) async fn copy_file_range_async(
@@ -1032,6 +1057,8 @@ impl Adapter {
             })
             .await?;
         self.update_file_handle(output_handle, result.revision, result.size)?;
+        let node = self.inode_record(output.inode)?.node;
+        self.invalidate_node_views(node)?;
         Ok(result.written)
     }
 
@@ -1122,16 +1149,25 @@ impl Adapter {
         }
         validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
         validate_name(&new_name).map_err(|()| AdapterError::InvalidName)?;
+        let source_node = self.entry_node(parent_inode, &name)?;
+        let destination_node = self.entry_node(new_parent_inode, &new_name)?;
         let parent = self.inode_record(parent_inode)?.node;
         let new_parent = self.inode_record(new_parent_inode)?.node;
         self.execute(async {
             self.state
                 .remote
-                .exchange_data(parent, name, new_parent, new_name, options)
+                .exchange_data(parent, name.clone(), new_parent, new_name.clone(), options)
                 .await?;
             Ok(())
         })
-        .await
+        .await?;
+        if let Some(node) = source_node {
+            self.invalidate_node_views(node)?;
+        }
+        if let Some(node) = destination_node {
+            self.invalidate_node_views(node)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn set_volume_name_async(&self, name: Name) -> Result<(), AdapterError> {
@@ -1328,7 +1364,6 @@ impl Adapter {
                     .remote
                     .set_xattr(node, name, &[], mode, position)
                     .await?;
-                self.invalidate_xattrs(node)?;
                 return Ok(());
             }
             let mut consumed = 0_u64;
@@ -1356,10 +1391,11 @@ impl Adapter {
                     .await?;
                 consumed += amount;
             }
-            self.invalidate_xattrs(node)?;
             Ok(())
         })
-        .await
+        .await?;
+        self.invalidate_node_views(node)?;
+        Ok(())
     }
 
     pub(crate) async fn list_xattrs_async(&self, inode: u64) -> Result<Vec<Name>, AdapterError> {
@@ -1398,10 +1434,11 @@ impl Adapter {
         let node = self.inode_record(inode)?.node;
         self.execute(async {
             self.state.remote.remove_xattr(node, name).await?;
-            self.invalidate_xattrs(node)?;
             Ok(())
         })
-        .await
+        .await?;
+        self.invalidate_node_views(node)?;
+        Ok(())
     }
 
     pub(crate) async fn release_async(
@@ -1705,12 +1742,60 @@ impl Adapter {
     }
 
     fn invalidate_directory(&self, inode: u64) -> Result<(), AdapterError> {
+        let node = self.inode_record(inode)?.node;
+        self.invalidate_node_views(node)
+    }
+
+    /// Remove every local projection that embeds this node's metadata. A file
+    /// write or xattr update changes the child's revision without changing its
+    /// parent directory revision, so invalidating only the node's own metadata
+    /// would let a later cached lookup resurrect the stale revision. Scanning
+    /// the small set of active native views also covers every hard-link parent.
+    fn invalidate_node_views(&self, node: NodeId) -> Result<(), AdapterError> {
+        let inode = self
+            .state
+            .inodes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .by_node
+            .get(&node)
+            .copied();
+        self.state
+            .discovered_metadata
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .remove(&node);
+        self.state
+            .discovered_xattrs
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .remove(&node);
         self.state
             .discovered_directories
             .lock()
             .map_err(|_| AdapterError::StateUnavailable)?
-            .remove(&inode);
+            .retain(|directory_inode, cached| {
+                Some(*directory_inode) != inode
+                    && !cached
+                        .listing
+                        .entries
+                        .iter()
+                        .any(|entry| entry.metadata.node == node)
+            });
         Ok(())
+    }
+
+    fn entry_node(&self, parent_inode: u64, name: &Name) -> Result<Option<NodeId>, AdapterError> {
+        let table = self
+            .state
+            .inodes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        Ok(table
+            .by_entry
+            .get(&(parent_inode, name.clone()))
+            .and_then(|inode| table.by_inode.get(inode))
+            .map(|record| record.node))
     }
 
     fn cached_xattrs(&self, node: NodeId) -> Result<Option<CachedXattrs>, AdapterError> {
@@ -1813,15 +1898,6 @@ impl Adapter {
             cached.values.insert(name, value);
             cached.discovered_at = Instant::now();
         }
-        Ok(())
-    }
-
-    fn invalidate_xattrs(&self, node: NodeId) -> Result<(), AdapterError> {
-        self.state
-            .discovered_xattrs
-            .lock()
-            .map_err(|_| AdapterError::StateUnavailable)?
-            .remove(&node);
         Ok(())
     }
 
@@ -2917,6 +2993,37 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(remote.directory_requests.load(Ordering::Relaxed), 1);
         assert_eq!(remote.xattr_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn file_mutation_invalidates_parent_view_that_embeds_old_child_metadata() {
+        let remote = Arc::new(MockFilesystem::immediate());
+        let adapter = Adapter::new(remote, Duration::from_secs(1)).unwrap();
+        adapter.probe_capabilities().unwrap();
+        let listing = adapter.readdir(ROOT_INODE).unwrap();
+        let file = listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == Name::from("hello.txt"))
+            .unwrap();
+        let handle = adapter
+            .block_on(adapter.open_async(
+                file.inode,
+                FileOpenOptions {
+                    access: FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            ))
+            .unwrap();
+        assert!(adapter.cached_directory(ROOT_INODE).unwrap().is_some());
+
+        adapter
+            .block_on(adapter.write_async(handle, 0, b"updated"))
+            .unwrap();
+
+        assert!(adapter.cached_directory(ROOT_INODE).unwrap().is_none());
+        adapter.release(handle).unwrap();
     }
 
     #[test]

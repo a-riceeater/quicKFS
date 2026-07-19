@@ -84,9 +84,11 @@ mod macos {
         /// Read-ahead block size for overlapping and unaligned random reads.
         #[arg(long, default_value_t = 16_384)]
         cache_block_kib: u64,
-        #[arg(long, default_value_t = 10_000)]
+        /// Maximum idle wait for one transport phase. Cold RAID directory
+        /// scans and 16 MiB reads can legitimately exceed ten seconds.
+        #[arg(long, default_value_t = 60_000)]
         timeout_ms: u64,
-        #[arg(long, default_value_t = 45_000)]
+        #[arg(long, default_value_t = 120_000)]
         callback_timeout_ms: u64,
         #[arg(long, default_value_t = 3)]
         reconnect_attempts: usize,

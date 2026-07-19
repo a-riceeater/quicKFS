@@ -87,7 +87,7 @@ quickfs-server-daemon serve [OPTIONS] --export-root <PATH>
 | `--max-known-nodes-per-connection <COUNT>` | — | `8192` | Maximum node IDs retained by one connection, including the root. |
 | `--max-total-known-nodes <COUNT>` | — | `65536` | Global budget for retained non-root node IDs across connections. |
 | `--max-directory-entry-tasks <COUNT>` | — | `64` | Global worker bound for concurrent child metadata/xattr discovery. |
-| `--request-timeout-ms <MS>` | — | `30000` | Full request timeout, including frame I/O and filesystem work. |
+| `--request-timeout-ms <MS>` | — | `120000` | Full request timeout, including cold backing-store work and raw payload transfer. Keep it comfortably above the mount transport-phase timeout. |
 | `--max-concurrent-requests <COUNT>` | — | `128` | Global request concurrency bound. |
 | `--max-in-flight-read-bytes <BYTES>` | — | `134217728` | Global memory budget reserved by concurrent raw reads. |
 | `--max-in-flight-write-bytes <BYTES>` | — | `67108864` | Global raw-write memory budget. |
@@ -249,9 +249,9 @@ umount "$HOME/Volumes/quickfs"
 | `--username <NAME>` | `QUICKFS_USERNAME` | Required | Account used to authenticate the retained session. |
 | `--cache-dir <PATH>` | `QUICKFS_CACHE_DIR` | Client state directory | Private persistent offline-read cache. |
 | `--cache-max-bytes <BYTES>` | `QUICKFS_CACHE_MAX_BYTES` | `21474836480` | Hard payload budget for the persistent cache. |
-| `--cache-block-kib <KiB>` | — | `16384` | Read-ahead block size, clamped to the negotiated server/client read limit. |
-| `--timeout-ms <MS>` | — | `10000` | Connection and transport-operation timeout. |
-| `--callback-timeout-ms <MS>` | — | `45000` | Maximum time a macFUSE callback waits for its remote operation. |
+| `--cache-block-kib <KiB>` | — | `16384` | Sequential/copy read-ahead block size, clamped to the negotiated limit. Requests below 1 MiB use at most 1 MiB read-ahead. |
+| `--timeout-ms <MS>` | — | `60000` | Maximum idle wait for one connection/transport phase. |
+| `--callback-timeout-ms <MS>` | — | `120000` | Maximum time a macFUSE callback waits for its complete remote operation. |
 | `--reconnect-attempts <COUNT>` | — | `3` | Bounded authenticated reconnect attempts. |
 | `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Use the operating-system public/managed roots. |
 | `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Use an explicit enterprise-CA bundle. |

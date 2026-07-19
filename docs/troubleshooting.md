@@ -151,15 +151,38 @@ time ls -la "$HOME/Volumes/quickfs"
 
 If both are slow on the first access, the backing filesystem is spending time in directory enumeration/child metadata I/O. v6 schedules that work concurrently beside the storage; `--max-directory-entry-tasks` defaults to `64` and is a bounded tuning knob for the server. Raising it can hurt a saturated rotational array, so measure before changing it. If the direct v6 list is fast but the cold mount is slow, confirm the mount is actually talking to the upgraded daemon and capture its foreground diagnostics; increasing `--callback-timeout-ms` only hides the symptom.
 
-Repeated access within the adapter's directory TTL and overlapping reads should be local cache hits. Concurrent cold callbacks for the same directory and concurrent overlapping reads are single-flighted rather than duplicated. The client sends a transport keepalive every 10 seconds and permits five idle minutes, so a pause after roughly 30 seconds of inactivity indicates an old client binary or a different network timeout rather than expected v6 behavior.
+Directory views and all metadata/xattr state discovered inside them share the same 30-second lifetime. Repeated access in that window should therefore be local; child metadata must not expire after one second while the names remain cached. Concurrent cold callbacks for the same directory are single-flighted. If a first `ls` completes but an immediate second `ls` stalls for roughly 30 seconds, rebuild the mount from the current source: that pattern identifies the old mismatched child-metadata TTL, which caused a per-child `GetMetadata` wave and let the directory view expire during the wave.
+
+After create, content/attribute/xattr change, link, rename/move, exchange, or remove, the adapter invalidates every directory view embedding the affected node. Native directory opens do not request `FOPEN_CACHE_DIR`, so a completed namespace mutation is visible to the next open/list rather than hidden behind a second kernel cache. Do not add synchronous fuser invalidation notifications inside these callbacks; macFUSE's one receive loop can deadlock while delivering them.
+
+The client sends a transport keepalive every 10 seconds and permits five idle minutes. The mount allows 60 seconds per transport phase and 120 seconds for the complete callback; the daemon's default full-request deadline is 120 seconds. A stall at an older 10/30/45-second boundary indicates an old binary or an explicitly overridden timeout.
 
 ## A ranged read fails
 
 The default maximum read request is 16 MiB (`16777216` bytes); writes remain 8 MiB. Use a smaller `--length` or deliberately adjust the server's `--max-read-size`.
 
-The persistent cache has a bounded 256 MiB process-local hot range tier. Concurrent reads of one aligned block share its persistent lookup or remote fetch, and subsequent small slices should not reread or SHA-256-check the whole block. If repeated reads remain CPU-bound, confirm `quickfs-mount` was rebuilt from the same source revision and that Cargo selected the optimized `sha2` assembly feature.
+The persistent cache has a bounded 256 MiB process-local hot range tier. Sequential/copy-sized reads use aligned blocks up to the configured 16 MiB default; a request below 1 MiB uses at most a 1 MiB aligned block. Concurrent reads of one aligned block share its persistent lookup or remote fetch—including a failed fetch—so one cold-disk timeout does not become a sequence of follower reconnects. Subsequent small slices should not reread or SHA-256-check the whole block. If repeated reads remain CPU-bound, confirm `quickfs-mount` was rebuilt from the same source revision and that Cargo selected the optimized `sha2` assembly feature.
 
 Offsets and lengths are unsigned byte counts. Reads beyond EOF return fewer bytes rather than padding the response.
+
+## A copy reports `fcopyfile failed: Network is down` or the destination is missing
+
+Current macFUSE releases may implement an ordinary copy with ranged reads and writes rather than the optional native `copy_file_range` callback. `ENETDOWN` means the resilient read exhausted its authenticated reconnect path and the requested revision was not already cached; it is not a special `.RW2` or file-size rejection. Keep the mount in the foreground and inspect its first transport error, then compare a direct read using the same endpoint, name, state directory, and account.
+
+Header probes below 1 MiB no longer expand into a cold 16 MiB request, while copy-sized reads retain the larger aligned blocks. The 60-second transport/120-second callback defaults cover a cold large read without letting one failure trigger serial follower reconnects. The server's request deadline defaults to 120 seconds as well; if it is explicitly lower than the client phase timeout, raise it or remove the override.
+
+Root and subdirectory entries use the same read path. A root-only case where a mutation succeeds but a fresh listing omits the destination indicates a stale directory projection, not a successful no-op copy. Rebuild both peers, remount, and verify that the mount no longer requests `FOPEN_CACHE_DIR`; current mutation handling invalidates every active and persistent directory snapshot containing the affected node, including both parents of a move/rename and all hardlink parents.
+
+For a non-destructive read check, copy to a local directory and compare bytes:
+
+```sh
+cp -p "$HOME/Volumes/quickfs/root-file.RW2" /tmp/root-file.RW2
+cmp "$HOME/Volumes/quickfs/root-file.RW2" /tmp/root-file.RW2
+cp -p "$HOME/Volumes/quickfs/subdir/large-file.RW2" /tmp/large-file.RW2
+cmp "$HOME/Volumes/quickfs/subdir/large-file.RW2" /tmp/large-file.RW2
+```
+
+Test creates, copies into the mount, rename/move, replace, and remove only against a disposable writable export. A production/read-only server must never be used for mutation diagnostics.
 
 ## Address already in use
 

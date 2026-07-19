@@ -181,7 +181,10 @@ struct Serve {
     /// Aggregate metadata/xattr workers used across directory requests.
     #[arg(long, default_value_t = 64)]
     max_directory_entry_tasks: usize,
-    #[arg(long, default_value_t = 30_000)]
+    /// End-to-end request deadline, including cold backing-store work and raw
+    /// payload transfer. This must comfortably exceed the mount's transport
+    /// phase deadline so a slow read is not canceled while still progressing.
+    #[arg(long, default_value_t = 120_000)]
     request_timeout_ms: u64,
     #[arg(long, default_value_t = 128)]
     max_concurrent_requests: usize,
