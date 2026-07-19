@@ -12,8 +12,9 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        mpsc,
     },
 };
 
@@ -121,6 +122,12 @@ pub enum CacheError {
 pub trait MetadataCache: Send + Sync {
     async fn get(&self, node: NodeId) -> Option<Metadata>;
     async fn insert(&self, value: Metadata);
+    /// Store metadata discovered by a read without extending the read's
+    /// critical path. In-memory caches complete inline; persistent adapters
+    /// may enqueue durable work on a blocking worker.
+    async fn store_readthrough(&self, value: Metadata) {
+        self.insert(value).await;
+    }
     async fn invalidate(&self, node: NodeId);
 }
 
@@ -128,6 +135,12 @@ pub trait MetadataCache: Send + Sync {
 pub trait DirectoryCache: Send + Sync {
     async fn get(&self, key: RevisionKey) -> Option<Vec<DirectoryEntry>>;
     async fn insert(&self, key: RevisionKey, value: Vec<DirectoryEntry>);
+    /// Store a directory snapshot and its already-returned child metadata.
+    /// Persistent implementations can commit the complete snapshot in one
+    /// manifest transaction instead of one transaction per child.
+    async fn store_readthrough_snapshot(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
+        self.insert(key, value).await;
+    }
     async fn invalidate(&self, node: NodeId);
 }
 
@@ -138,6 +151,9 @@ pub trait RangeCache: Send + Sync {
     /// node revision.
     async fn get(&self, key: RangeKey) -> Option<Vec<u8>>;
     async fn insert(&self, key: RangeKey, value: Vec<u8>);
+    async fn store_readthrough(&self, key: RangeKey, value: Vec<u8>) {
+        self.insert(key, value).await;
+    }
     async fn invalidate(&self, node: NodeId);
 }
 
@@ -145,6 +161,9 @@ pub trait RangeCache: Send + Sync {
 pub trait FilesystemStateCache: Send + Sync {
     async fn get_filesystem_stats(&self) -> Option<FilesystemStats>;
     async fn insert_filesystem_stats(&self, value: FilesystemStats);
+    async fn store_readthrough_filesystem_stats(&self, value: FilesystemStats) {
+        self.insert_filesystem_stats(value).await;
+    }
 }
 
 #[derive(Default)]
@@ -177,6 +196,13 @@ impl DirectoryCache for MemoryCache {
     }
 
     async fn insert(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
+        self.directories.insert(key, value);
+    }
+
+    async fn store_readthrough_snapshot(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
+        for entry in &value {
+            self.metadata.insert(entry.node, entry.metadata.clone());
+        }
         self.directories.insert(key, value);
     }
 
@@ -282,6 +308,63 @@ pub struct PersistentCache {
     _lock_file: File,
 }
 
+/// Runs persistent-cache filesystem work outside Tokio's asynchronous worker
+/// threads. Read-through stores are best-effort background work so filesystem
+/// callbacks never wait for fsync or a contended cache manifest lock.
+#[derive(Clone)]
+pub struct NonBlockingPersistentCache {
+    inner: Arc<PersistentCache>,
+    writer: mpsc::Sender<PersistentWrite>,
+}
+
+type PersistentWrite = Box<dyn FnOnce(&PersistentCache) + Send + 'static>;
+
+impl NonBlockingPersistentCache {
+    pub fn open(
+        root: impl AsRef<Path>,
+        namespace: CacheNamespace,
+        maximum_payload_bytes: u64,
+    ) -> Result<Self, CacheError> {
+        let inner = Arc::new(PersistentCache::open(
+            root,
+            namespace,
+            maximum_payload_bytes,
+        )?);
+        let (writer, writes) = mpsc::channel::<PersistentWrite>();
+        let worker_cache = Arc::clone(&inner);
+        std::thread::Builder::new()
+            .name("quickfs-cache-writer".into())
+            .spawn(move || {
+                while let Ok(write) = writes.recv() {
+                    write(&worker_cache);
+                }
+            })?;
+        Ok(Self { inner, writer })
+    }
+
+    pub fn namespace(&self) -> &CacheNamespace {
+        self.inner.namespace()
+    }
+
+    fn enqueue(&self, write: impl FnOnce(&PersistentCache) + Send + 'static) {
+        let _ = self.writer.send(Box::new(write));
+    }
+
+    async fn enqueue_and_wait(&self, write: impl FnOnce(&PersistentCache) + Send + 'static) {
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        if self
+            .writer
+            .send(Box::new(move |cache| {
+                write(cache);
+                let _ = complete.send(());
+            }))
+            .is_ok()
+        {
+            let _ = completed.await;
+        }
+    }
+}
+
 impl PersistentCache {
     pub fn open(
         root: impl AsRef<Path>,
@@ -365,6 +448,22 @@ impl PersistentCache {
     ) -> Result<(), CacheError> {
         let bytes = serde_json::to_vec(value)?;
         self.insert_entry(EntryKey::Directory(key), &bytes)
+    }
+
+    pub fn insert_directory_snapshot_value(
+        &self,
+        key: RevisionKey,
+        value: &[DirectoryEntry],
+    ) -> Result<(), CacheError> {
+        let mut entries = Vec::with_capacity(value.len().saturating_add(1));
+        entries.push((EntryKey::Directory(key), serde_json::to_vec(value)?));
+        for entry in value {
+            entries.push((
+                EntryKey::Metadata(entry.node),
+                serde_json::to_vec(&entry.metadata)?,
+            ));
+        }
+        self.insert_entries(entries)
     }
 
     pub fn get_range_value(&self, key: RangeKey) -> Result<Option<Vec<u8>>, CacheError> {
@@ -506,55 +605,97 @@ impl PersistentCache {
     }
 
     fn insert_entry(&self, key: EntryKey, bytes: &[u8]) -> Result<(), CacheError> {
-        let stored_length = u64::try_from(bytes.len()).map_err(|_| CacheError::EntryTooLarge)?;
-        if stored_length > self.maximum_payload_bytes {
-            return Err(CacheError::EntryTooLarge);
-        }
+        self.insert_entries(vec![(key, bytes.to_vec())])
+    }
 
-        let key_bytes = serde_json::to_vec(&key)?;
-        let mut hasher = Sha256::new();
-        hasher.update(&key_bytes);
-        hasher.update(bytes);
-        let file_name = format!("{}.bin", hex::encode(hasher.finalize()));
-        let destination = self.directory.join(&file_name);
-        write_private_atomic(&destination, bytes)?;
-
+    fn insert_entries(&self, entries: Vec<(EntryKey, Vec<u8>)>) -> Result<(), CacheError> {
         let mut state = self.lock_state()?;
         let mut proposed = state.clone();
-        let last_access = next_clock(&mut proposed);
-        if let Some(previous) = proposed.entries.remove(&key) {
-            proposed.payload_bytes = proposed
-                .payload_bytes
-                .checked_sub(previous.stored_length)
-                .ok_or(CacheError::InvalidManifest)?;
-        }
-        proposed.payload_bytes = proposed
-            .payload_bytes
-            .checked_add(stored_length)
-            .ok_or(CacheError::EntryTooLarge)?;
-        proposed.entries.insert(
-            key.clone(),
-            DiskEntry {
-                key,
-                file_name: file_name.clone(),
-                stored_length,
-                sha256: Sha256::digest(bytes).into(),
-                last_access,
-            },
-        );
-        evict_to_budget(&mut proposed, self.maximum_payload_bytes)?;
+        let mut written = Vec::new();
+        let result = (|| -> Result<bool, CacheError> {
+            let mut changed = false;
+            for (key, bytes) in entries {
+                let stored_length =
+                    u64::try_from(bytes.len()).map_err(|_| CacheError::EntryTooLarge)?;
+                if stored_length > self.maximum_payload_bytes {
+                    return Err(CacheError::EntryTooLarge);
+                }
 
-        if let Err(error) = self.commit_state(&mut state, proposed) {
-            if !state
-                .entries
-                .values()
-                .any(|entry| entry.file_name == file_name)
-            {
-                let _ = fs::remove_file(destination);
+                let key_bytes = serde_json::to_vec(&key)?;
+                let mut hasher = Sha256::new();
+                hasher.update(&key_bytes);
+                hasher.update(&bytes);
+                let file_name = format!("{}.bin", hex::encode(hasher.finalize()));
+                let payload_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+                if proposed.entries.get(&key).is_some_and(|existing| {
+                    existing.file_name == file_name
+                        && existing.stored_length == stored_length
+                        && existing.sha256 == payload_sha256
+                        && self.read_disk_entry(existing).is_ok()
+                }) {
+                    continue;
+                }
+
+                let destination = self.directory.join(&file_name);
+                write_private_atomic(&destination, &bytes)?;
+                written.push(file_name.clone());
+
+                let last_access = next_clock(&mut proposed);
+                if let Some(previous) = proposed.entries.remove(&key) {
+                    proposed.payload_bytes = proposed
+                        .payload_bytes
+                        .checked_sub(previous.stored_length)
+                        .ok_or(CacheError::InvalidManifest)?;
+                }
+                proposed.payload_bytes = proposed
+                    .payload_bytes
+                    .checked_add(stored_length)
+                    .ok_or(CacheError::EntryTooLarge)?;
+                proposed.entries.insert(
+                    key.clone(),
+                    DiskEntry {
+                        key,
+                        file_name,
+                        stored_length,
+                        sha256: payload_sha256,
+                        last_access,
+                    },
+                );
+                changed = true;
             }
-            return Err(error);
+            if !changed {
+                return Ok(false);
+            }
+            if proposed.entries.len() > MAX_MANIFEST_ENTRIES {
+                return Err(CacheError::InvalidManifest);
+            }
+            evict_to_budget(&mut proposed, self.maximum_payload_bytes)?;
+            self.commit_state(&mut state, proposed)?;
+            Ok(true)
+        })();
+
+        if result.is_err() {
+            for file_name in &written {
+                if !state
+                    .entries
+                    .values()
+                    .any(|entry| entry.file_name == *file_name)
+                {
+                    let _ = remove_cache_file(&self.directory.join(file_name));
+                }
+            }
+        } else if matches!(result, Ok(true)) {
+            for file_name in &written {
+                if !state
+                    .entries
+                    .values()
+                    .any(|entry| entry.file_name == *file_name)
+                {
+                    remove_cache_file(&self.directory.join(file_name))?;
+                }
+            }
         }
-        Ok(())
+        result.map(|_| ())
     }
 
     fn remove_matching(&self, predicate: impl Fn(&EntryKey) -> bool) -> Result<(), CacheError> {
@@ -721,6 +862,10 @@ impl DirectoryCache for PersistentCache {
         let _ = self.insert_directory_value(key, &value);
     }
 
+    async fn store_readthrough_snapshot(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
+        let _ = self.insert_directory_snapshot_value(key, &value);
+    }
+
     async fn invalidate(&self, node: NodeId) {
         let _ = self.invalidate_directories(node);
     }
@@ -749,6 +894,123 @@ impl FilesystemStateCache for PersistentCache {
 
     async fn insert_filesystem_stats(&self, value: FilesystemStats) {
         let _ = self.insert_filesystem_stats_value(value);
+    }
+}
+
+#[async_trait]
+impl MetadataCache for NonBlockingPersistentCache {
+    async fn get(&self, node: NodeId) -> Option<Metadata> {
+        let cache = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || cache.get_metadata_value(node).ok().flatten())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn insert(&self, value: Metadata) {
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.insert_metadata_value(value);
+        })
+        .await;
+    }
+
+    async fn store_readthrough(&self, value: Metadata) {
+        self.enqueue(move |cache| {
+            let _ = cache.insert_metadata_value(value);
+        });
+    }
+
+    async fn invalidate(&self, node: NodeId) {
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.invalidate_metadata(node);
+        })
+        .await;
+    }
+}
+
+#[async_trait]
+impl DirectoryCache for NonBlockingPersistentCache {
+    async fn get(&self, key: RevisionKey) -> Option<Vec<DirectoryEntry>> {
+        let cache = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || cache.get_directory_value(key).ok().flatten())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn insert(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.insert_directory_value(key, &value);
+        })
+        .await;
+    }
+
+    async fn store_readthrough_snapshot(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
+        self.enqueue(move |cache| {
+            let _ = cache.insert_directory_snapshot_value(key, &value);
+        });
+    }
+
+    async fn invalidate(&self, node: NodeId) {
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.invalidate_directories(node);
+        })
+        .await;
+    }
+}
+
+#[async_trait]
+impl RangeCache for NonBlockingPersistentCache {
+    async fn get(&self, key: RangeKey) -> Option<Vec<u8>> {
+        let cache = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || cache.get_range_value(key).ok().flatten())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn insert(&self, key: RangeKey, value: Vec<u8>) {
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.insert_range_value(key, &value);
+        })
+        .await;
+    }
+
+    async fn store_readthrough(&self, key: RangeKey, value: Vec<u8>) {
+        self.enqueue(move |cache| {
+            let _ = cache.insert_range_value(key, &value);
+        });
+    }
+
+    async fn invalidate(&self, node: NodeId) {
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.invalidate_ranges(node);
+        })
+        .await;
+    }
+}
+
+#[async_trait]
+impl FilesystemStateCache for NonBlockingPersistentCache {
+    async fn get_filesystem_stats(&self) -> Option<FilesystemStats> {
+        let cache = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || cache.get_filesystem_stats_value().ok().flatten())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn insert_filesystem_stats(&self, value: FilesystemStats) {
+        self.enqueue_and_wait(move |cache| {
+            let _ = cache.insert_filesystem_stats_value(value);
+        })
+        .await;
+    }
+
+    async fn store_readthrough_filesystem_stats(&self, value: FilesystemStats) {
+        self.enqueue(move |cache| {
+            let _ = cache.insert_filesystem_stats_value(value);
+        });
     }
 }
 
@@ -1102,7 +1364,8 @@ fn sync_directory(_path: &Path) -> Result<(), CacheError> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use quickfs_protocol::{Name, NodeKind, ROOT_NODE};
+    use quickfs_protocol::{Name, NodeId, NodeKind, ROOT_NODE};
+    use uuid::Uuid;
 
     fn revision(revision: u64) -> RevisionKey {
         RevisionKey {
@@ -1129,6 +1392,24 @@ mod tests {
         maximum: u64,
     ) -> PersistentCache {
         PersistentCache::open(temporary.path().join("cache"), namespace, maximum).unwrap()
+    }
+
+    fn metadata(node: NodeId, revision: u64) -> Metadata {
+        Metadata {
+            node,
+            kind: NodeKind::File,
+            size: 0,
+            mode: 0o644,
+            allocated_blocks: 0,
+            revision,
+            accessed_unix_ms: 33,
+            modified_unix_ms: 34,
+            created_unix_ms: Some(32),
+            backup_unix_ms: None,
+            link_count: 1,
+            device_major: 0,
+            device_minor: 0,
+        }
     }
 
     #[tokio::test]
@@ -1254,6 +1535,104 @@ mod tests {
         assert_eq!(
             reopened.get_filesystem_stats_value().unwrap(),
             Some(filesystem_stats)
+        );
+    }
+
+    #[test]
+    fn identical_persistent_insert_is_a_noop() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = open_cache(&temporary, namespace(7, "alice"), 1_024);
+        let key = range(3, 0, 4);
+        cache.insert_range_value(key, b"same").unwrap();
+        let clock_after_first_insert = cache.state.lock().unwrap().clock;
+
+        cache.insert_range_value(key, b"same").unwrap();
+
+        assert_eq!(cache.state.lock().unwrap().clock, clock_after_first_insert);
+        assert_eq!(cache.stats().unwrap().entries, 1);
+        assert_eq!(cache.get_range_value(key).unwrap().unwrap(), b"same");
+    }
+
+    #[test]
+    fn directory_snapshot_batches_child_metadata_and_survives_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache_namespace = namespace(8, "alice");
+        let first = NodeId(Uuid::from_u128(1));
+        let second = NodeId(Uuid::from_u128(2));
+        let entries = vec![
+            DirectoryEntry {
+                node: first,
+                name: "first".into(),
+                kind: NodeKind::File,
+                metadata: metadata(first, 20),
+            },
+            DirectoryEntry {
+                node: second,
+                name: "second".into(),
+                kind: NodeKind::File,
+                metadata: metadata(second, 21),
+            },
+        ];
+        {
+            let cache = open_cache(&temporary, cache_namespace.clone(), 8_192);
+            cache
+                .insert_directory_snapshot_value(revision(19), &entries)
+                .unwrap();
+            assert_eq!(cache.stats().unwrap().entries, 3);
+        }
+
+        let reopened = open_cache(&temporary, cache_namespace, 8_192);
+        assert_eq!(
+            reopened.get_directory_value(revision(19)).unwrap().unwrap(),
+            entries
+        );
+        assert_eq!(
+            reopened.get_metadata_value(first).unwrap().unwrap(),
+            metadata(first, 20)
+        );
+        assert_eq!(
+            reopened.get_metadata_value(second).unwrap().unwrap(),
+            metadata(second, 21)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readthrough_store_does_not_wait_for_a_busy_persistent_writer() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = NonBlockingPersistentCache::open(
+            temporary.path().join("cache"),
+            namespace(9, "alice"),
+            8_192,
+        )
+        .unwrap();
+        let value = metadata(NodeId(Uuid::from_u128(3)), 22);
+        let persistent = Arc::clone(&cache.inner);
+        let (locked, wait_until_locked) = mpsc::channel();
+        let (release, wait_until_released) = mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _writer_blocker = persistent.state.lock().unwrap();
+            locked.send(()).unwrap();
+            wait_until_released.recv().unwrap();
+        });
+        wait_until_locked.recv().unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            MetadataCache::store_readthrough(&cache, value.clone()),
+        )
+        .await
+        .unwrap();
+
+        release.send(()).unwrap();
+        blocker.join().unwrap();
+        MetadataCache::invalidate(&cache, value.node).await;
+        assert!(MetadataCache::get(&cache, value.node).await.is_none());
+        assert!(
+            cache
+                .inner
+                .get_metadata_value(value.node)
+                .unwrap()
+                .is_none()
         );
     }
 

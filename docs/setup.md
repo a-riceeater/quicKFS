@@ -154,9 +154,15 @@ cargo run -p quickfs-client-cli -- \
 Enter the account password when prompted. Then browse and read:
 
 ```sh
-cargo run -p quickfs-client-cli -- --username alice list /
-cargo run -p quickfs-client-cli -- --username alice stat /hello.txt
-cargo run -p quickfs-client-cli -- --username alice \
+cargo run -p quickfs-client-cli -- \
+  --server 127.0.0.1:4433 --server-name localhost \
+  --username alice list /
+cargo run -p quickfs-client-cli -- \
+  --server 127.0.0.1:4433 --server-name localhost \
+  --username alice stat /hello.txt
+cargo run -p quickfs-client-cli -- \
+  --server 127.0.0.1:4433 --server-name localhost \
+  --username alice \
   read /hello.txt --offset 0 --length 4096
 ```
 
@@ -179,10 +185,10 @@ target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
 
 Enter the account password at the hidden prompt. The mount verifies the server before that prompt, reconnects and verifies it again before transmitting the password, then retains one shared Tokio runtime around an authenticated reconnecting filesystem and persistent read cache. Open `$HOME/Volumes/quickfs` in Finder. The volume is writable only when both the daemon and account gates above are enabled; otherwise it mounts read-only.
 
-Keep the terminal process running. When finished, unmount cleanly from another terminal and allow `quickfs-mount` to exit:
+Keep the terminal process running. When finished, press Control+C there for a graceful unmount, or unmount from another terminal and allow `quickfs-mount` to exit:
 
 ```sh
-diskutil unmount "$HOME/Volumes/quickfs"
+umount "$HOME/Volumes/quickfs"
 ```
 
 For enterprise CA or platform-root deployments, pass the same `--ca-cert` or `--trust-system-roots` option used by the diagnostic client. See the [usage reference](usage.md#macos-quickfs-mount) for all mount options.

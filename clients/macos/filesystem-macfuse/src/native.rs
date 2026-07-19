@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{Adapter, AdapterError, CreatedNode, DirectoryListing};
+use super::{Adapter, AdapterError, CreatedNode, DirectoryListing, ROOT_INODE};
 use fuser::{
     BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, ForgetOne, Generation, INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner,
@@ -77,6 +77,15 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
     } else {
         config.volume_name.clone()
     };
+    // Populate the root snapshot before publishing the mount. Finder can
+    // otherwise issue its first LOOKUP/READDIR against a cold RAID directory
+    // and decide the volume is unresponsive while that scan is still running.
+    adapter
+        .readdir(ROOT_INODE)
+        .map_err(|error| io::Error::other(format!("failed to prepare root directory: {error}")))?;
+    adapter
+        .getattr(ROOT_INODE)
+        .map_err(|error| io::Error::other(format!("failed to prepare root metadata: {error}")))?;
     let mut fuser_config = Config::default();
     fuser_config.mount_options.extend([
         if capabilities.writable {
@@ -102,7 +111,42 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
     // potentially blocking callback below moves its reply into the shared
     // Tokio runtime instead, so the one receive loop remains responsive.
     fuser_config.n_threads = Some(1);
-    fuser::mount2(adapter, mountpoint, &fuser_config)
+    let runtime = adapter.runtime().clone();
+    let mut session = fuser::Session::new(adapter, mountpoint, &fuser_config)?;
+    eprintln!("quicKFS mount is ready at {}", mountpoint.display());
+    let mut unmounter = session.unmount_callable();
+    let (mut interrupt, mut terminate) = {
+        let _runtime_guard = runtime.enter();
+        (
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        )
+    };
+    let signal_task = runtime.spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        eprintln!("Unmounting quicKFS...");
+        match tokio::task::spawn_blocking(move || unmounter.unmount()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("graceful unmount failed: {error}; forcing mount process exit");
+                std::process::exit(130);
+            }
+            Err(error) => {
+                eprintln!("unmount worker failed: {error}; forcing mount process exit");
+                std::process::exit(130);
+            }
+        }
+    });
+    let result = session.run();
+    signal_task.abort();
+    match &result {
+        Ok(()) => eprintln!("quicKFS mount session ended"),
+        Err(error) => eprintln!("quicKFS mount session failed: {error}"),
+    }
+    result
 }
 
 fn backend_mount_option(backend: MacFuseBackend) -> Option<MountOption> {
@@ -205,7 +249,12 @@ impl Filesystem for Adapter {
                     &file_attr(&adapter, result.inode, &result.metadata),
                     Generation(0),
                 ),
-                Err(error) => reply.error(errno(&error)),
+                Err(error) => {
+                    if !is_expected_lookup_miss(&error) {
+                        report_callback_error("lookup", &error);
+                    }
+                    reply.error(errno(&error));
+                }
             }
         });
     }
@@ -236,7 +285,10 @@ impl Filesystem for Adapter {
                 Ok(metadata) => {
                     reply.attr(&ATTRIBUTE_TTL, &file_attr(&adapter, inode, &metadata));
                 }
-                Err(error) => reply.error(errno(&error)),
+                Err(error) => {
+                    report_callback_error("getattr", &error);
+                    reply.error(errno(&error));
+                }
             }
         });
     }
@@ -311,7 +363,10 @@ impl Filesystem for Adapter {
                 Ok(metadata) => {
                     reply.attr(&ATTRIBUTE_TTL, &file_attr(&adapter, inode, &metadata));
                 }
-                Err(error) => reply.error(errno(&error)),
+                Err(error) => {
+                    report_callback_error("setattr", &error);
+                    reply.error(errno(&error));
+                }
             }
         });
     }
@@ -321,7 +376,10 @@ impl Filesystem for Adapter {
         self.spawn_callback(async move {
             match adapter.readlink_async(u64::from(inode)).await {
                 Ok(target) => reply.data(&target),
-                Err(error) => reply.error(errno(&error)),
+                Err(error) => {
+                    report_callback_error("readlink", &error);
+                    reply.error(errno(&error));
+                }
             }
         });
     }
@@ -394,7 +452,10 @@ impl Filesystem for Adapter {
                     &file_attr(&adapter, created.inode, &created.metadata),
                     Generation(0),
                 ),
-                Err(error) => reply.error(errno(&error)),
+                Err(error) => {
+                    report_callback_error("mknod", &error);
+                    reply.error(errno(&error));
+                }
             }
         });
     }
@@ -680,7 +741,10 @@ impl Filesystem for Adapter {
                 Ok(handle) => {
                     reply.opened(FileHandle(handle), FopenFlags::FOPEN_CACHE_DIR);
                 }
-                Err(error) => reply.error(errno(&error)),
+                Err(error) => {
+                    report_callback_error("opendir", &error);
+                    reply.error(errno(&error));
+                }
             }
         });
     }
@@ -697,10 +761,13 @@ impl Filesystem for Adapter {
         self.spawn_callback(async move {
             match adapter.directory_listing(u64::from(handle), u64::from(inode)) {
                 Ok(listing) => {
-                    fill_directory(&mut reply, u64::from(inode), offset, &listing);
+                    fill_directory(&adapter, &mut reply, u64::from(inode), offset, &listing);
                     reply.ok();
                 }
-                Err(error) => reply.error(errno(&error)),
+                Err(error) => {
+                    report_callback_error("readdir", &error);
+                    reply.error(errno(&error));
+                }
             }
         });
     }
@@ -716,28 +783,17 @@ impl Filesystem for Adapter {
         let adapter = self.clone();
         self.spawn_callback(async move {
             let inode = u64::from(inode);
-            match adapter.directory_listing(u64::from(handle), inode) {
-                Ok(listing) => {
-                    let current = match adapter.getattr_async(inode).await {
-                        Ok(metadata) => metadata,
-                        Err(error) => {
-                            reply.error(errno(&error));
-                            return;
-                        }
-                    };
-                    let parent = match adapter.getattr_async(listing.parent_inode).await {
-                        Ok(metadata) => metadata,
-                        Err(error) => {
-                            reply.error(errno(&error));
-                            return;
-                        }
-                    };
+            match adapter.directory_listing_with_metadata(u64::from(handle), inode) {
+                Ok((listing, current, parent)) => {
                     fill_directory_plus(
                         &adapter, &mut reply, inode, offset, &listing, &current, &parent,
                     );
                     reply.ok();
                 }
-                Err(error) => reply.error(errno(&error)),
+                Err(error) => {
+                    report_callback_error("readdirplus", &error);
+                    reply.error(errno(&error));
+                }
             }
         });
     }
@@ -1272,6 +1328,7 @@ fn rename_callback(
 }
 
 fn fill_directory(
+    adapter: &Adapter,
     reply: &mut ReplyDirectory,
     inode: u64,
     requested_offset: u64,
@@ -1296,11 +1353,14 @@ fn fill_directory(
         return;
     }
     for entry in &listing.entries {
+        let entry_inode = adapter
+            .remember_entry(entry.metadata.node, inode, &entry.name)
+            .unwrap_or(entry.inode);
         if add_directory_row(
             reply,
             requested_offset,
             &mut index,
-            entry.inode,
+            entry_inode,
             file_type(entry.kind),
             OsStr::from_bytes(entry.name.as_bytes()),
         ) {
@@ -1572,6 +1632,17 @@ fn errno(error: &AdapterError) -> Errno {
         AdapterError::InvalidAccess => Errno::EBADF,
         AdapterError::Client(client) => client_errno(client),
     }
+}
+
+fn report_callback_error(operation: &str, error: &AdapterError) {
+    eprintln!("quicKFS {operation} failed: {error}");
+}
+
+fn is_expected_lookup_miss(error: &AdapterError) -> bool {
+    matches!(
+        error,
+        AdapterError::NotFound | AdapterError::Client(ClientError::Server(ErrorCode::NotFound, _))
+    )
 }
 
 fn client_errno(error: &ClientError) -> Errno {

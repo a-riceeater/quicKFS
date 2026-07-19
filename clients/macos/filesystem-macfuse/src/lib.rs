@@ -6,8 +6,9 @@
 //! retained by [`Adapter`]. Synchronous methods remain available for focused
 //! unit tests and non-native callers.
 
+use futures::{StreamExt, stream};
 use quickfs_client_core::{
-    ClientError, MAX_CLIENT_READ_SIZE, MAX_CLIENT_WRITE_SIZE, RemoteFilesystem,
+    ClientError, DirectorySnapshot, MAX_CLIENT_READ_SIZE, MAX_CLIENT_WRITE_SIZE, RemoteFilesystem,
 };
 use quickfs_protocol::{
     AttributeChanges, DirectoryEntry as RemoteDirectoryEntry, FileAccess,
@@ -22,7 +23,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     runtime::{Builder, Runtime},
@@ -37,6 +38,11 @@ pub const ROOT_INODE: u64 = 1;
 /// joined inside one FUSE operation.
 pub const MAX_FUSE_IO_SIZE: u64 = 16 * 1024 * 1024;
 pub const MAX_FUSE_XATTR_SIZE: u64 = 64 * 1024 * 1024;
+const DISCOVERED_METADATA_TTL: Duration = Duration::from_secs(1);
+const DISCOVERED_DIRECTORY_TTL: Duration = Duration::from_secs(30);
+const DIRECTORY_XATTR_PREFETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const DIRECTORY_XATTR_PREFETCH_CONCURRENCY: usize = 64;
+const RELEASED_DIRECTORY_ENTRY_RETENTION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LookupResult {
@@ -150,6 +156,27 @@ struct FileHandleRecord {
 struct DirectoryHandleRecord {
     inode: u64,
     listing: DirectoryListing,
+    current: Metadata,
+    parent: Metadata,
+}
+
+#[derive(Clone)]
+struct CachedMetadata {
+    value: Metadata,
+    discovered_at: Instant,
+}
+
+#[derive(Clone)]
+struct CachedDirectory {
+    listing: DirectoryListing,
+    discovered_at: Instant,
+}
+
+#[derive(Clone)]
+struct CachedXattrNames {
+    revision: u64,
+    names: Vec<Name>,
+    discovered_at: Instant,
 }
 
 struct AdapterState {
@@ -160,6 +187,9 @@ struct AdapterState {
     handles: Mutex<HashMap<u64, FileHandleRecord>>,
     handle_operations: Mutex<HashMap<u64, Arc<AsyncRwLock<()>>>>,
     directory_handles: Mutex<HashMap<u64, DirectoryHandleRecord>>,
+    discovered_metadata: Mutex<HashMap<NodeId, CachedMetadata>>,
+    discovered_directories: Mutex<HashMap<u64, CachedDirectory>>,
+    discovered_xattr_names: Mutex<HashMap<NodeId, CachedXattrNames>>,
     next_inode: AtomicU64,
     next_handle: AtomicU64,
     #[cfg(all(target_os = "macos", feature = "macfuse"))]
@@ -219,6 +249,9 @@ impl Adapter {
                 handles: Mutex::new(HashMap::new()),
                 handle_operations: Mutex::new(HashMap::new()),
                 directory_handles: Mutex::new(HashMap::new()),
+                discovered_metadata: Mutex::new(HashMap::new()),
+                discovered_directories: Mutex::new(HashMap::new()),
+                discovered_xattr_names: Mutex::new(HashMap::new()),
                 next_inode: AtomicU64::new(ROOT_INODE + 1),
                 next_handle: AtomicU64::new(1),
                 #[cfg(all(target_os = "macos", feature = "macfuse"))]
@@ -314,25 +347,38 @@ impl Adapter {
         name: Name,
     ) -> Result<LookupResult, AdapterError> {
         validate_name(&name).map_err(|()| AdapterError::InvalidName)?;
-        let parent = self.inode_record(parent_inode)?;
-        self.execute(async {
-            let entries = self.state.remote.list_directory(parent.node).await?;
-            let entry = select_remote_entry(entries, &name)?;
-            validate_remote_name(&entry)?;
-            let inode = self.remember_entry(entry.node, parent_inode, &entry.name)?;
+        if let Some(listing) = self.cached_directory(parent_inode)? {
+            return self.lookup_from_listing(parent_inode, &listing, &name);
+        }
+        if let Some(inode) = self.find_entry_inode(parent_inode, &name)? {
+            let metadata = self.getattr_async(inode).await?;
             self.add_lookup(inode, 1)?;
-            let metadata = self.state.remote.get_metadata(entry.node).await?;
-            validate_metadata(entry.node, &metadata)?;
-            Ok(LookupResult { inode, metadata })
-        })
-        .await
+            return Ok(LookupResult { inode, metadata });
+        }
+        let parent = self.inode_record(parent_inode)?;
+        let snapshot = self
+            .execute(async {
+                Ok(self
+                    .state
+                    .remote
+                    .list_directory_snapshot(parent.node)
+                    .await?)
+            })
+            .await?;
+        let listing =
+            self.remember_directory_snapshot(parent_inode, parent.parent_inode, snapshot)?;
+        self.lookup_from_listing(parent_inode, &listing, &name)
     }
 
     pub(crate) async fn getattr_async(&self, inode: u64) -> Result<Metadata, AdapterError> {
         let record = self.inode_record(inode)?;
+        if let Some(metadata) = self.cached_metadata(record.node)? {
+            return Ok(metadata);
+        }
         self.execute(async {
             let metadata = self.state.remote.get_metadata(record.node).await?;
             validate_metadata(record.node, &metadata)?;
+            self.remember_metadata(metadata.clone())?;
             Ok(metadata)
         })
         .await
@@ -340,34 +386,23 @@ impl Adapter {
 
     pub(crate) async fn readdir_async(&self, inode: u64) -> Result<DirectoryListing, AdapterError> {
         let record = self.inode_record(inode)?;
-        self.execute(async {
-            let snapshot = self
-                .state
-                .remote
-                .list_directory_snapshot(record.node)
-                .await?;
-            validate_case_insensitive_directory(&snapshot.entries)?;
-            let mut entries = Vec::with_capacity(snapshot.entries.len());
-            for entry in snapshot.entries {
-                validate_remote_name(&entry)?;
-                validate_metadata(entry.node, &entry.metadata)?;
-                if entry.kind != entry.metadata.kind {
-                    return Err(AdapterError::UnexpectedMetadata);
-                }
-                entries.push(DirectoryEntry {
-                    inode: self.remember_entry(entry.node, inode, &entry.name)?,
-                    name: entry.name,
-                    kind: entry.kind,
-                    metadata: entry.metadata,
-                });
-            }
-            Ok(DirectoryListing {
-                parent_inode: record.parent_inode,
-                revision: snapshot.revision,
-                entries,
+        let snapshot = self
+            .execute(async {
+                Ok(self
+                    .state
+                    .remote
+                    .list_directory_snapshot(record.node)
+                    .await?)
             })
-        })
-        .await
+            .await?;
+        if self
+            .cached_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_xattrs)
+        {
+            self.prefetch_directory_xattrs(record.node, snapshot.revision, &snapshot.entries)
+                .await;
+        }
+        self.remember_directory_snapshot(inode, record.parent_inode, snapshot)
     }
 
     pub(crate) async fn opendir_async(&self, inode: u64) -> Result<u64, AdapterError> {
@@ -379,13 +414,29 @@ impl Adapter {
             )
             .into());
         }
-        let listing = self.readdir_async(inode).await?;
+        let listing = match self.cached_directory(inode)? {
+            Some(listing) => listing,
+            None => self.readdir_async(inode).await?,
+        };
+        let parent = if listing.parent_inode == inode {
+            metadata.clone()
+        } else {
+            self.getattr_async(listing.parent_inode).await?
+        };
         let handle = self.next_handle()?;
         self.state
             .directory_handles
             .lock()
             .map_err(|_| AdapterError::StateUnavailable)?
-            .insert(handle, DirectoryHandleRecord { inode, listing });
+            .insert(
+                handle,
+                DirectoryHandleRecord {
+                    inode,
+                    listing,
+                    current: metadata,
+                    parent,
+                },
+            );
         Ok(handle)
     }
 
@@ -408,29 +459,50 @@ impl Adapter {
         Ok(record.listing)
     }
 
+    pub(crate) fn directory_listing_with_metadata(
+        &self,
+        handle: u64,
+        inode: u64,
+    ) -> Result<(DirectoryListing, Metadata, Metadata), AdapterError> {
+        let record = self
+            .state
+            .directory_handles
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .get(&handle)
+            .cloned()
+            .ok_or(AdapterError::UnknownDirectoryHandle)?;
+        if record.inode != inode {
+            return Err(AdapterError::HandleInodeMismatch);
+        }
+        Ok((record.listing, record.current, record.parent))
+    }
+
     pub(crate) fn releasedir(&self, handle: u64) -> Result<(), AdapterError> {
-        self.state
+        let record = self
+            .state
             .directory_handles
             .lock()
             .map_err(|_| AdapterError::StateUnavailable)?
             .remove(&handle)
-            .map(|record| record.inode)
             .ok_or(AdapterError::UnknownDirectoryHandle)?;
-        // Plain readdir does not create kernel lookup references, but building
-        // its snapshot necessarily discovers every child. Once the directory
-        // handle closes, prune any such zero-reference translations and tell
-        // the server in one batch.
-        let candidates = self
-            .state
-            .inodes
-            .lock()
-            .map_err(|_| AdapterError::StateUnavailable)?
-            .by_inode
-            .keys()
-            .copied()
-            .map(|inode| (inode, 0))
+        // Finder closes a plain-readdir handle before issuing child LOOKUP and
+        // xattr requests. Keep zero-reference translations briefly, then free
+        // only entries that still have no kernel lookup reference. This avoids
+        // the immediate forget/lookup race without leaking an entire recursive
+        // Finder crawl until disconnect.
+        let candidates = record
+            .listing
+            .entries
+            .into_iter()
+            .map(|entry| (entry.inode, 0))
             .collect::<Vec<_>>();
-        self.forget_inodes(&candidates)
+        let adapter = self.clone();
+        drop(self.runtime.spawn(async move {
+            tokio::time::sleep(RELEASED_DIRECTORY_ENTRY_RETENTION).await;
+            let _ = adapter.forget_inodes(&candidates);
+        }));
+        Ok(())
     }
 
     pub(crate) async fn open_async(
@@ -476,6 +548,8 @@ impl Adapter {
                 .create_file(parent.node, name.clone(), mode, options)
                 .await?;
             validate_metadata(created.metadata.node, &created.metadata)?;
+            self.remember_metadata(created.metadata.clone())?;
+            self.invalidate_directory(parent_inode)?;
             let inode = self.remember_entry(created.metadata.node, parent_inode, &name)?;
             self.add_lookup(inode, 1)?;
             match self.remember_file_handle(inode, options.access, created.opened) {
@@ -509,6 +583,8 @@ impl Adapter {
                 .create_directory(parent.node, name.clone(), mode)
                 .await?;
             validate_metadata(metadata.node, &metadata)?;
+            self.remember_metadata(metadata.clone())?;
+            self.invalidate_directory(parent_inode)?;
             let inode = self.remember_entry(metadata.node, parent_inode, &name)?;
             self.add_lookup(inode, 1)?;
             Ok(CreatedNode { inode, metadata })
@@ -535,6 +611,8 @@ impl Adapter {
                 .create_symlink(parent.node, name.clone(), target)
                 .await?;
             validate_metadata(metadata.node, &metadata)?;
+            self.remember_metadata(metadata.clone())?;
+            self.invalidate_directory(parent_inode)?;
             let inode = self.remember_entry(metadata.node, parent_inode, &name)?;
             self.add_lookup(inode, 1)?;
             Ok(CreatedNode { inode, metadata })
@@ -572,6 +650,8 @@ impl Adapter {
                 .create_hard_link(node, new_parent, new_name.clone())
                 .await?;
             validate_metadata(node, &metadata)?;
+            self.remember_metadata(metadata.clone())?;
+            self.invalidate_directory(new_parent_inode)?;
             let linked_inode = self.remember_entry(node, new_parent_inode, &new_name)?;
             self.add_lookup(linked_inode, 1)?;
             Ok(CreatedNode {
@@ -604,6 +684,8 @@ impl Adapter {
                 .create_special_node(parent, name.clone(), kind, mode, device_major, device_minor)
                 .await?;
             validate_metadata(metadata.node, &metadata)?;
+            self.remember_metadata(metadata.clone())?;
+            self.invalidate_directory(parent_inode)?;
             let inode = self.remember_entry(metadata.node, parent_inode, &name)?;
             self.add_lookup(inode, 1)?;
             Ok(CreatedNode { inode, metadata })
@@ -625,6 +707,7 @@ impl Adapter {
                 .remote
                 .remove_node(parent.node, name.clone(), directory)
                 .await?;
+            self.invalidate_directory(parent_inode)?;
             self.forget_entry(parent_inode, &name)?;
             Ok(())
         })
@@ -658,6 +741,8 @@ impl Adapter {
                     mode,
                 )
                 .await?;
+            self.invalidate_directory(parent_inode)?;
+            self.invalidate_directory(new_parent_inode)?;
             self.move_entry(parent_inode, &name, new_parent_inode, &new_name, mode)?;
             Ok(())
         })
@@ -697,6 +782,7 @@ impl Adapter {
                     .set_attributes(record.node, remote_handle, changes)
                     .await?;
                 validate_metadata(record.node, &metadata)?;
+                self.remember_metadata(metadata.clone())?;
                 Ok(metadata)
             })
             .await?;
@@ -1130,6 +1216,12 @@ impl Adapter {
             return Err(AdapterError::Unsupported);
         }
         let node = self.inode_record(inode)?.node;
+        if self
+            .cached_xattr_names(node)?
+            .is_some_and(|names| !names.contains(&name))
+        {
+            return Err(no_attribute_error());
+        }
         self.execute(async {
             let read = self.state.remote.get_xattr(node, name, 0, 0).await?;
             if read.total_size > MAX_FUSE_XATTR_SIZE {
@@ -1153,6 +1245,12 @@ impl Adapter {
         let chunk = capabilities.max_read_size.min(MAX_CLIENT_READ_SIZE);
         if chunk == 0 {
             return Err(AdapterError::InvalidCapabilities);
+        }
+        if self
+            .cached_xattr_names(node)?
+            .is_some_and(|names| !names.contains(&name))
+        {
+            return Err(no_attribute_error());
         }
         self.execute(async {
             let first = self
@@ -1211,6 +1309,7 @@ impl Adapter {
                     .remote
                     .set_xattr(node, name, &[], mode, position)
                     .await?;
+                self.invalidate_xattrs(node)?;
                 return Ok(());
             }
             let mut consumed = 0_u64;
@@ -1238,6 +1337,7 @@ impl Adapter {
                     .await?;
                 consumed += amount;
             }
+            self.invalidate_xattrs(node)?;
             Ok(())
         })
         .await
@@ -1249,8 +1349,15 @@ impl Adapter {
             return Err(AdapterError::Unsupported);
         }
         let node = self.inode_record(inode)?.node;
-        self.execute(async { Ok(self.state.remote.list_xattrs(node).await?) })
-            .await
+        if let Some(names) = self.cached_xattr_names(node)? {
+            return Ok(names);
+        }
+        let revision = self.known_metadata_revision(node).unwrap_or(0);
+        let names = self
+            .execute(async { Ok(self.state.remote.list_xattrs(node).await?) })
+            .await?;
+        self.remember_xattr_names(node, revision, names.clone())?;
+        Ok(names)
     }
 
     pub(crate) async fn remove_xattr_async(
@@ -1265,6 +1372,7 @@ impl Adapter {
         let node = self.inode_record(inode)?.node;
         self.execute(async {
             self.state.remote.remove_xattr(node, name).await?;
+            self.invalidate_xattrs(node)?;
             Ok(())
         })
         .await
@@ -1316,6 +1424,12 @@ impl Adapter {
         };
         if let Ok(mut directories) = self.state.directory_handles.lock() {
             directories.clear();
+        }
+        if let Ok(mut directories) = self.state.discovered_directories.lock() {
+            directories.clear();
+        }
+        if let Ok(mut xattrs) = self.state.discovered_xattr_names.lock() {
+            xattrs.clear();
         }
         let timeout = self.callback_timeout();
         let remote = Arc::clone(&self.state.remote);
@@ -1374,6 +1488,292 @@ impl Adapter {
             .ok_or(AdapterError::UnknownInode)
     }
 
+    fn cached_metadata(&self, node: NodeId) -> Result<Option<Metadata>, AdapterError> {
+        let mut metadata = self
+            .state
+            .discovered_metadata
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        if metadata
+            .get(&node)
+            .is_some_and(|entry| entry.discovered_at.elapsed() <= DISCOVERED_METADATA_TTL)
+        {
+            return Ok(metadata.get(&node).map(|entry| entry.value.clone()));
+        }
+        metadata.remove(&node);
+        Ok(None)
+    }
+
+    fn remember_metadata(&self, value: Metadata) -> Result<(), AdapterError> {
+        self.state
+            .discovered_metadata
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .insert(
+                value.node,
+                CachedMetadata {
+                    value,
+                    discovered_at: Instant::now(),
+                },
+            );
+        Ok(())
+    }
+
+    fn known_metadata_revision(&self, node: NodeId) -> Option<u64> {
+        self.state
+            .discovered_metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.get(&node).map(|entry| entry.value.revision))
+    }
+
+    fn cached_directory(&self, inode: u64) -> Result<Option<DirectoryListing>, AdapterError> {
+        let mut directories = self
+            .state
+            .discovered_directories
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        if directories
+            .get(&inode)
+            .is_some_and(|entry| entry.discovered_at.elapsed() <= DISCOVERED_DIRECTORY_TTL)
+        {
+            return Ok(directories.get(&inode).map(|entry| entry.listing.clone()));
+        }
+        directories.remove(&inode);
+        Ok(None)
+    }
+
+    fn remember_directory_snapshot(
+        &self,
+        inode: u64,
+        parent_inode: u64,
+        snapshot: DirectorySnapshot,
+    ) -> Result<DirectoryListing, AdapterError> {
+        validate_case_insensitive_directory(&snapshot.entries)?;
+        self.reconcile_directory_entries(
+            inode,
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect(),
+        )?;
+        let mut entries = Vec::with_capacity(snapshot.entries.len());
+        for entry in snapshot.entries {
+            validate_remote_name(&entry)?;
+            validate_metadata(entry.node, &entry.metadata)?;
+            if entry.kind != entry.metadata.kind {
+                return Err(AdapterError::UnexpectedMetadata);
+            }
+            self.remember_metadata(entry.metadata.clone())?;
+            entries.push(DirectoryEntry {
+                inode: self.remember_entry(entry.node, inode, &entry.name)?,
+                name: entry.name,
+                kind: entry.kind,
+                metadata: entry.metadata,
+            });
+        }
+        let listing = DirectoryListing {
+            parent_inode,
+            revision: snapshot.revision,
+            entries,
+        };
+        self.state
+            .discovered_directories
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .insert(
+                inode,
+                CachedDirectory {
+                    listing: listing.clone(),
+                    discovered_at: Instant::now(),
+                },
+            );
+        Ok(listing)
+    }
+
+    fn lookup_from_listing(
+        &self,
+        parent_inode: u64,
+        listing: &DirectoryListing,
+        requested: &Name,
+    ) -> Result<LookupResult, AdapterError> {
+        let entries = listing
+            .entries
+            .iter()
+            .map(|entry| RemoteDirectoryEntry {
+                node: entry.metadata.node,
+                name: entry.name.clone(),
+                kind: entry.kind,
+                metadata: entry.metadata.clone(),
+            })
+            .collect();
+        let entry = select_remote_entry(entries, requested)?;
+        let inode = self.remember_entry(entry.node, parent_inode, &entry.name)?;
+        self.add_lookup(inode, 1)?;
+        self.remember_metadata(entry.metadata.clone())?;
+        Ok(LookupResult {
+            inode,
+            metadata: entry.metadata,
+        })
+    }
+
+    fn invalidate_directory(&self, inode: u64) -> Result<(), AdapterError> {
+        self.state
+            .discovered_directories
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .remove(&inode);
+        Ok(())
+    }
+
+    async fn prefetch_directory_xattrs(
+        &self,
+        directory: NodeId,
+        directory_revision: u64,
+        entries: &[RemoteDirectoryEntry],
+    ) {
+        let mut missing = (!self.xattr_names_cached_at_revision(directory, directory_revision))
+            .then_some((directory, directory_revision))
+            .into_iter()
+            .collect::<Vec<_>>();
+        missing.extend(entries.iter().filter_map(|entry| {
+            (!self.xattr_names_cached_at_revision(entry.node, entry.metadata.revision))
+                .then_some((entry.node, entry.metadata.revision))
+        }));
+        if missing.is_empty() {
+            return;
+        }
+        let remote = Arc::clone(&self.state.remote);
+        let requests = stream::iter(missing)
+            .map(move |(node, revision)| {
+                let remote = Arc::clone(&remote);
+                async move {
+                    remote
+                        .list_xattrs(node)
+                        .await
+                        .map(|names| (node, revision, names))
+                }
+            })
+            .buffer_unordered(DIRECTORY_XATTR_PREFETCH_CONCURRENCY);
+        let cache_results = async {
+            tokio::pin!(requests);
+            while let Some(result) = requests.next().await {
+                if let Ok((node, revision, names)) = result {
+                    let _ = self.remember_xattr_names(node, revision, names);
+                }
+            }
+        };
+        let _ = tokio::time::timeout(DIRECTORY_XATTR_PREFETCH_TIMEOUT, cache_results).await;
+    }
+
+    fn xattr_names_cached_at_revision(&self, node: NodeId, revision: u64) -> bool {
+        self.state
+            .discovered_xattr_names
+            .lock()
+            .ok()
+            .and_then(|names| names.get(&node).cloned())
+            .is_some_and(|cached| {
+                cached.revision == revision
+                    && cached.discovered_at.elapsed() <= DISCOVERED_DIRECTORY_TTL
+            })
+    }
+
+    fn cached_xattr_names(&self, node: NodeId) -> Result<Option<Vec<Name>>, AdapterError> {
+        let mut xattrs = self
+            .state
+            .discovered_xattr_names
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        if xattrs
+            .get(&node)
+            .is_some_and(|entry| entry.discovered_at.elapsed() <= DISCOVERED_DIRECTORY_TTL)
+        {
+            return Ok(xattrs.get(&node).map(|entry| entry.names.clone()));
+        }
+        xattrs.remove(&node);
+        Ok(None)
+    }
+
+    fn remember_xattr_names(
+        &self,
+        node: NodeId,
+        revision: u64,
+        names: Vec<Name>,
+    ) -> Result<(), AdapterError> {
+        self.state
+            .discovered_xattr_names
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .insert(
+                node,
+                CachedXattrNames {
+                    revision,
+                    names,
+                    discovered_at: Instant::now(),
+                },
+            );
+        Ok(())
+    }
+
+    fn invalidate_xattrs(&self, node: NodeId) -> Result<(), AdapterError> {
+        self.state
+            .discovered_xattr_names
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .remove(&node);
+        Ok(())
+    }
+
+    fn find_entry_inode(
+        &self,
+        parent_inode: u64,
+        requested: &Name,
+    ) -> Result<Option<u64>, AdapterError> {
+        let table = self
+            .state
+            .inodes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?;
+        if let Some(inode) = table.by_entry.get(&(parent_inode, requested.clone())) {
+            return Ok(Some(*inode));
+        }
+        let requested = match std::str::from_utf8(requested.as_bytes()) {
+            Ok(requested) => normalized_case_name(requested),
+            Err(_) => return Ok(None),
+        };
+        let matching = table
+            .by_entry
+            .iter()
+            .filter_map(|((parent, name), inode)| {
+                (*parent == parent_inode
+                    && std::str::from_utf8(name.as_bytes())
+                        .ok()
+                        .is_some_and(|name| normalized_case_name(name) == requested))
+                .then_some(*inode)
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [inode] => Ok(Some(*inode)),
+            [] => Ok(None),
+            _ => Err(AdapterError::AmbiguousName),
+        }
+    }
+
+    fn reconcile_directory_entries(
+        &self,
+        parent_inode: u64,
+        current_names: std::collections::HashSet<Name>,
+    ) -> Result<(), AdapterError> {
+        self.state
+            .inodes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .by_entry
+            .retain(|(parent, name), _| *parent != parent_inode || current_names.contains(name));
+        Ok(())
+    }
+
     pub(crate) fn remember_entry(
         &self,
         node: NodeId,
@@ -1424,6 +1824,9 @@ impl Adapter {
         let mut forgotten = Vec::new();
         for (inode, amount) in requests {
             if let Some(node) = self.evict_inode(*inode, *amount)? {
+                if let Ok(mut directories) = self.state.discovered_directories.lock() {
+                    directories.remove(inode);
+                }
                 forgotten.push(node);
             }
         }
@@ -1649,6 +2052,14 @@ fn validate_range(offset: u64, length: u64) -> Result<(), AdapterError> {
         .ok_or(AdapterError::InvalidRange)
 }
 
+fn no_attribute_error() -> AdapterError {
+    ClientError::Server(
+        quickfs_protocol::ErrorCode::NoAttribute,
+        "extended attribute does not exist".into(),
+    )
+    .into()
+}
+
 fn validate_name(name: &Name) -> Result<(), ()> {
     let name = name.as_bytes();
     if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
@@ -1763,6 +2174,9 @@ mod tests {
         read_delay: Duration,
         active_reads: AtomicUsize,
         maximum_active_reads: AtomicUsize,
+        metadata_requests: AtomicUsize,
+        directory_requests: AtomicUsize,
+        xattr_requests: AtomicUsize,
     }
 
     impl MockFilesystem {
@@ -1779,6 +2193,9 @@ mod tests {
                 read_delay: Duration::ZERO,
                 active_reads: AtomicUsize::new(0),
                 maximum_active_reads: AtomicUsize::new(0),
+                metadata_requests: AtomicUsize::new(0),
+                directory_requests: AtomicUsize::new(0),
+                xattr_requests: AtomicUsize::new(0),
             }
         }
 
@@ -1861,6 +2278,7 @@ mod tests {
 
         async fn get_metadata(&self, node: NodeId) -> ClientResult<Metadata> {
             self.wait().await;
+            self.metadata_requests.fetch_add(1, Ordering::Relaxed);
             match node.0.as_u128() {
                 0 => Ok(metadata(ROOT_NODE, NodeKind::Directory, 0)),
                 1 => Ok(metadata(
@@ -1876,6 +2294,7 @@ mod tests {
 
         async fn list_directory(&self, node: NodeId) -> ClientResult<Vec<ProtocolDirectoryEntry>> {
             self.wait().await;
+            self.directory_requests.fetch_add(1, Ordering::Relaxed);
             if node == ROOT_NODE {
                 Ok(vec![
                     ProtocolDirectoryEntry {
@@ -2211,6 +2630,16 @@ mod tests {
             Ok(())
         }
 
+        async fn list_xattrs(&self, node: NodeId) -> ClientResult<Vec<Name>> {
+            self.wait().await;
+            self.xattr_requests.fetch_add(1, Ordering::Relaxed);
+            if node == file_node() {
+                Ok(vec![Name::from("user.DOSATTRIB")])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
         async fn forget_nodes(&self, nodes: Vec<NodeId>) -> ClientResult<()> {
             self.operation_log
                 .lock()
@@ -2235,7 +2664,7 @@ mod tests {
     #[test]
     fn finder_style_lookup_getattr_and_snapshot_readdir_use_stable_inodes() {
         let remote = Arc::new(MockFilesystem::immediate());
-        let adapter = Adapter::new(remote, Duration::from_secs(1)).unwrap();
+        let adapter = Adapter::new(remote.clone(), Duration::from_secs(1)).unwrap();
         adapter.probe_capabilities().unwrap();
 
         let root = adapter.getattr(ROOT_INODE).unwrap();
@@ -2245,6 +2674,7 @@ mod tests {
         let first = adapter.readdir(ROOT_INODE).unwrap();
         let second = adapter.readdir(ROOT_INODE).unwrap();
         assert_eq!(first, second);
+        assert_eq!(remote.xattr_requests.load(Ordering::Relaxed), 4);
         assert_eq!(first.parent_inode, ROOT_INODE);
         assert_eq!(first.entries.len(), 3);
         assert_eq!(
@@ -2267,6 +2697,54 @@ mod tests {
         assert_eq!(lookup.metadata.kind, NodeKind::File);
         let folded_lookup = adapter.lookup(ROOT_INODE, "HeLLo.TxT").unwrap();
         assert_eq!(folded_lookup.inode, lookup.inode);
+        assert_eq!(
+            adapter.getattr(file_entry.inode).unwrap(),
+            file_entry.metadata
+        );
+        assert_eq!(remote.metadata_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            adapter
+                .block_on(adapter.list_xattrs_async(file_entry.inode))
+                .unwrap(),
+            [Name::from("user.DOSATTRIB")]
+        );
+        assert!(matches!(
+            adapter.block_on(
+                adapter.xattr_size_async(file_entry.inode, Name::from("com.apple.FinderInfo"))
+            ),
+            Err(AdapterError::Client(ClientError::Server(
+                ErrorCode::NoAttribute,
+                _
+            )))
+        ));
+        assert_eq!(remote.xattr_requests.load(Ordering::Relaxed), 4);
+        assert!(matches!(
+            adapter.lookup(ROOT_INODE, ".DS_Store"),
+            Err(AdapterError::NotFound)
+        ));
+        assert_eq!(remote.directory_requests.load(Ordering::Relaxed), 2);
+
+        let handle = adapter.block_on(adapter.opendir_async(ROOT_INODE)).unwrap();
+        let (listing, current, parent) = adapter
+            .directory_listing_with_metadata(handle, ROOT_INODE)
+            .unwrap();
+        assert_eq!(listing.entries.len(), 3);
+        assert_eq!(current.node, ROOT_NODE);
+        assert_eq!(parent.node, ROOT_NODE);
+        assert_eq!(remote.metadata_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.directory_requests.load(Ordering::Relaxed), 2);
+        adapter.releasedir(handle).unwrap();
+        let reopened_lookup = adapter.lookup(ROOT_INODE, "hello.txt").unwrap();
+        assert_eq!(reopened_lookup.inode, file_entry.inode);
+        assert_eq!(remote.directory_requests.load(Ordering::Relaxed), 2);
+        assert!(
+            !remote
+                .operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|operation| operation.starts_with("forget:"))
+        );
     }
 
     #[test]

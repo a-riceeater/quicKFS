@@ -240,7 +240,7 @@ impl<FS: Filesystem> Session<FS> {
     /// may run concurrent by spawning threads.
     /// # Errors
     /// Returns any final error when the session comes to an end.
-    pub(crate) fn run(self) -> io::Result<()> {
+    pub fn run(self) -> io::Result<()> {
         let Session {
             filesystem,
             ch,

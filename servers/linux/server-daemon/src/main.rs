@@ -872,11 +872,20 @@ async fn handle(
             .await
             .map(Response::Metadata)
             .unwrap_or_else(|error| Response::Error(error.protocol())),
-        Request::ListDirectory { node } => export
-            .list_with_revision(node)
-            .await
-            .map(|(revision, entries)| Response::DirectoryListing { revision, entries })
-            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::ListDirectory { node } => {
+            let export = Arc::clone(&export);
+            match tokio::task::spawn_blocking(move || export.list_with_revision_blocking(node))
+                .await
+            {
+                Ok(result) => result
+                    .map(|(revision, entries)| Response::DirectoryListing { revision, entries })
+                    .unwrap_or_else(|error| Response::Error(error.protocol())),
+                Err(error) => {
+                    tracing::error!(%error, "directory listing worker failed");
+                    internal_error()
+                }
+            }
+        }
         Request::OpenFile { node, options } => export
             .open(node, options)
             .await

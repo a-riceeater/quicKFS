@@ -39,4 +39,4 @@ target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
   --username alice
 ```
 
-Keep the foreground process running. Open the mountpoint in Finder and unmount it with `diskutil unmount "$HOME/Volumes/quickfs"`. The project never installs or approves the macFUSE system extension itself.
+Keep the foreground process running. Open the mountpoint in Finder and press Control+C for a graceful unmount, or run `umount "$HOME/Volumes/quickfs"` from another terminal. The project never installs or approves the macFUSE system extension itself.

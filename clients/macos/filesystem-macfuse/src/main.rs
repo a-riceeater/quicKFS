@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
 mod macos {
     use anyhow::{Context, Result, bail};
     use clap::{Parser, ValueEnum};
-    use quickfs_cache::{CacheNamespace, PersistentCache};
+    use quickfs_cache::{CacheNamespace, NonBlockingPersistentCache};
     use quickfs_client_core::{
         AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, ReconnectPolicy,
         RemoteFilesystem, ResilientFilesystem, ServerTrust, load_trusted_server_pin,
@@ -188,14 +188,13 @@ mod macos {
             .clone()
             .unwrap_or_else(|| cli.state_dir.clone());
         let cache = Arc::new(
-            PersistentCache::open(&cache_root, cache_namespace, cli.cache_max_bytes).with_context(
-                || {
+            NonBlockingPersistentCache::open(&cache_root, cache_namespace, cli.cache_max_bytes)
+                .with_context(|| {
                     format!(
                         "failed to open persistent cache at '{}'",
                         cache_root.display()
                     )
-                },
-            )?,
+                })?,
         );
         let cache_block_size = cli
             .cache_block_kib
@@ -227,7 +226,7 @@ mod macos {
             "read-only"
         };
         println!(
-            "Mounting {access} {} ({}) at {} with reconnect and offline read caching. Unmount with `diskutil unmount '{}'`.",
+            "Preparing {access} {} ({}) for {} with reconnect and offline read caching. Press Control+C or run `umount '{}'` to unmount.",
             cli.server_name,
             cli.server,
             mountpoint.display(),

@@ -168,7 +168,10 @@ Colon-separated fingerprints are accepted. With a PEM chain, the first certifica
 ### `ping`
 
 ```sh
-quickfs-client-cli --username alice ping
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  --username alice ping
 ```
 
 Authenticates and prints `pong 42` on success.
@@ -176,8 +179,14 @@ Authenticates and prints `pong 42` on success.
 ### `list`
 
 ```sh
-quickfs-client-cli --username alice list /
-quickfs-client-cli --username alice list /examples
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  --username alice list /
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  --username alice list /examples
 ```
 
 Paths are resolved client-side by walking opaque node IDs from directory listings.
@@ -185,7 +194,10 @@ Paths are resolved client-side by walking opaque node IDs from directory listing
 ### `stat`
 
 ```sh
-quickfs-client-cli --username alice stat /hello.txt
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  --username alice stat /hello.txt
 ```
 
 Prints node ID, kind, size, revision, and modification time. Revisions are change indicators, not globally ordered versions.
@@ -193,10 +205,16 @@ Prints node ID, kind, size, revision, and modification time. Revisions are chang
 ### `read`
 
 ```sh
-quickfs-client-cli --username alice \
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  --username alice \
   read /hello.txt --offset 0 --length 4096
 
-quickfs-client-cli --username alice \
+quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  --username alice \
   read /archive.bin --offset 1048576 --length 65536 > block.bin
 ```
 
@@ -216,10 +234,10 @@ target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
   --username alice
 ```
 
-The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, and keeps one shared Tokio runtime around an authenticated reconnecting `RemoteFilesystem`. Finder and media applications can use ordinary read/write namespace operations, xattrs/resource forks, hardlinks, locks, random byte ranges, sparse seek, volume rename, and backup time. Server-side copy, `readdirplus`, and `exchangedata` callbacks are capability-gated because current macFUSE/macOS combinations do not necessarily expose those optional messages; see [filesystem semantics](filesystem-semantics.md). Unmount from another terminal:
+The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, and keeps one shared Tokio runtime around an authenticated reconnecting `RemoteFilesystem`. Finder and media applications can use ordinary read/write namespace operations, xattrs/resource forks, hardlinks, locks, random byte ranges, sparse seek, volume rename, and backup time. Server-side copy, `readdirplus`, and `exchangedata` callbacks are capability-gated because current macFUSE/macOS combinations do not necessarily expose those optional messages; see [filesystem semantics](filesystem-semantics.md). Press Control+C in the mount terminal for a graceful unmount, or unmount from another terminal:
 
 ```sh
-diskutil unmount "$HOME/Volumes/quickfs"
+umount "$HOME/Volumes/quickfs"
 ```
 
 | Option | Environment variable | Default | Purpose |

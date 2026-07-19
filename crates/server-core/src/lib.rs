@@ -531,8 +531,8 @@ impl ExportSession {
     }
 
     /// Drop this connection's references to nodes forgotten by the kernel.
-    /// The IDs remain stable and are rediscovered descriptor-relatively if a
-    /// later request uses them again.
+    /// Unreferenced global entries remain as a bounded stable-ID cache and are
+    /// evicted only when new node capacity is required.
     pub fn forget_nodes(&self, requested: &[NodeId]) -> Result<(), ServerError> {
         if requested.len() > MAX_FORGET_NODES {
             return Err(ServerError::InvalidRequest(
@@ -578,6 +578,16 @@ impl ExportSession {
     }
 
     pub async fn list_with_revision(
+        &self,
+        node: NodeId,
+    ) -> Result<(DirectoryRevision, Vec<DirectoryEntry>), ServerError> {
+        self.list_with_revision_blocking(node)
+    }
+
+    /// Perform the descriptor-relative directory walk. Network servers should
+    /// call this on a blocking worker because cold or rotational exports can
+    /// spend seconds in `readdir`/`statat`.
+    pub fn list_with_revision_blocking(
         &self,
         node: NodeId,
     ) -> Result<(DirectoryRevision, Vec<DirectoryEntry>), ServerError> {
@@ -1959,14 +1969,34 @@ impl ExportSession {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ServerError::TooManyNodes)?;
-        let global = self
-            .export
-            .shared
-            .node_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ServerError::TooManyNodes)?;
+        let global = match self.export.shared.node_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                if !self.evict_unreferenced_global_node()? {
+                    return Err(ServerError::TooManyNodes);
+                }
+                self.export
+                    .shared
+                    .node_permits
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| ServerError::TooManyNodes)?
+            }
+        };
         Ok((session, global))
+    }
+
+    fn evict_unreferenced_global_node(&self) -> Result<bool, ServerError> {
+        let mut nodes = lock_mutex(&self.export.shared.nodes)?;
+        let candidate = nodes.by_node.iter().find_map(|(node, known)| {
+            (*node != ROOT_NODE && known.session_references == 0).then_some((*node, known.identity))
+        });
+        let Some((node, identity)) = candidate else {
+            return Ok(false);
+        };
+        nodes.by_node.remove(&node);
+        nodes.by_identity.remove(&identity);
+        Ok(true)
     }
 
     fn remember(&self, identity: FileIdentity, path: PathBuf) -> Result<NodeId, ServerError> {
@@ -2070,19 +2100,14 @@ impl ExportSession {
             return Ok(());
         }
         let mut nodes = lock_mutex(&self.export.shared.nodes)?;
-        let remove_identity = match nodes.by_node.get_mut(&node) {
+        match nodes.by_node.get_mut(&node) {
             Some(known) if known.session_references > 0 => {
                 known.session_references -= 1;
-                (known.session_references == 0).then_some(known.identity)
             }
             Some(_) => return Err(ServerError::StateUnavailable),
             // Deleted nodes are removed from the registry immediately, so a
             // later kernel forget for one is already satisfied.
             None => return Ok(()),
-        };
-        if let Some(identity) = remove_identity {
-            nodes.by_node.remove(&node);
-            nodes.by_identity.remove(&identity);
         }
         Ok(())
     }
@@ -4516,6 +4541,15 @@ mod tests {
         let session = export.session();
         let old = session.list(ROOT_NODE).await.unwrap()[0].node;
         session.forget_nodes(&[old, old]).unwrap();
+        assert!(
+            export
+                .shared
+                .nodes
+                .lock()
+                .unwrap()
+                .by_node
+                .contains_key(&old)
+        );
         std::fs::rename(
             export_root.join("old"),
             directory.path().join("old-still-alive"),
@@ -4530,6 +4564,15 @@ mod tests {
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&Name::from("new")));
+        assert!(
+            !export
+                .shared
+                .nodes
+                .lock()
+                .unwrap()
+                .by_node
+                .contains_key(&old)
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

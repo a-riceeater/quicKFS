@@ -6,7 +6,9 @@ Confirm the daemon is running and that the client address matches `--bind`:
 
 ```sh
 RUST_LOG=debug cargo run -p quickfs-server-daemon -- serve ...
-cargo run -p quickfs-client-cli -- --server 127.0.0.1:4433 ... ping
+cargo run -p quickfs-client-cli -- \
+  --server 127.0.0.1:4433 --server-name localhost \
+  --username alice ping
 ```
 
 QUIC uses UDP. Ensure UDP port 4433 is allowed by host and network firewalls. A successful TCP connection test does not verify QUIC reachability.
@@ -78,7 +80,9 @@ Verify the username and add it if necessary:
 
 ```sh
 quickfs-server-daemon user add --state-dir .quickfs alice
-quickfs-client-cli --username alice ping
+quickfs-client-cli \
+  --server <ADDRESS> --server-name <NAME> \
+  --username alice ping
 ```
 
 After five failed attempts on one connection, that connection rejects further attempts. Reconnects remain subject to the per-source rolling rate limit. Passwords are case-sensitive and are never intentionally logged. Do not include passwords, pairing codes, private state, or trust databases in issue reports.
@@ -139,7 +143,9 @@ Another process may already own UDP port 4433. Stop the other server or select a
 
 ```sh
 quickfs-server-daemon serve --bind 127.0.0.1:4443 ...
-quickfs-client-cli --server 127.0.0.1:4443 ... ping
+quickfs-client-cli \
+  --server 127.0.0.1:4443 --server-name <NAME> \
+  --username alice ping
 ```
 
 ## macFUSE will not mount
@@ -156,10 +162,10 @@ If Cargo reports that `fuse.pc` is missing, first confirm that the macFUSE insta
 
 Use an existing empty directory as the mountpoint and keep the foreground process running. If authentication fails, verify the mount uses the same `--server`, `--server-name`, and `--state-dir` as the successful CLI command. The pin/CA policy is checked before the password is requested and again before it is sent.
 
-Unmount before terminating the process:
+Press Control+C in the mount terminal for a graceful unmount, or unmount from another terminal:
 
 ```sh
-diskutil unmount "$HOME/Volumes/quickfs"
+umount "$HOME/Volumes/quickfs"
 ```
 
 The mount performs bounded single-flight reconnect and accepts only the same persisted server epoch. Revision-matched handles are reopened and their locks replayed; an ambiguous mutation is never retried. Previously cached reads can continue after a disconnect, but cache misses and all mutations fail closed. A mount cannot cold-start while the server is offline. If reconnect reports an epoch/revision conflict, restore the intended server state or unmount/remount rather than bypassing the stale-state check. Use `quickfs-client-cli` to isolate trust/authentication or remote filesystem problems without creating a mount.

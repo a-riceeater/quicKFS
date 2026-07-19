@@ -191,10 +191,14 @@ Confirm direct protocol access:
 
 ```sh
 target/debug/quickfs-client-cli \
+  --server 127.0.0.1:4433 \
+  --server-name localhost \
   --state-dir .quickfs-client \
   --username alice list /
 
 target/debug/quickfs-client-cli \
+  --server 127.0.0.1:4433 \
+  --server-name localhost \
   --state-dir .quickfs-client \
   --username alice read /hello.txt --offset 0 --length 4096
 ```
@@ -212,10 +216,10 @@ target/debug/quickfs-mount ./mountpoint \
   --username alice
 ```
 
-The mount runs in the foreground. Unmount it from another terminal with:
+The mount runs in the foreground. Press Control+C in that terminal for a graceful unmount, or unmount it from another terminal with:
 
 ```sh
-diskutil unmount ./mountpoint
+umount ./mountpoint
 ```
 
 For remote deployment, enterprise certificates, managed pins, cache tuning, server limits, and every command option, use the [setup guide](docs/setup.md) and [usage reference](docs/usage.md).
