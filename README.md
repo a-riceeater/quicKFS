@@ -8,16 +8,32 @@ The transport is a purpose-built versioned protocol over QUIC/TLS. It supports r
 
 ## Why quicKFS?
 
-Traditional remote filesystems can be a poor fit for unstable or high-round-trip-time links, especially when an application repeatedly seeks through large media files. Copying an entire project locally avoids some latency but creates a separate synchronization problem. quicKFS explores a different design:
+Traditional remote filesystems can be a poor fit for unstable or high-round-trip-time links, especially when an application repeatedly seeks through large media files. A workflow that needs several dependent network round trips to discover a file, fetch its metadata, open it, and read a small range multiplies the link latency at every step. Packet loss on a shared ordered transport can add another delay even when the lost bytes belong to an unrelated operation. Copying an entire project locally avoids those costs, but creates a separate synchronization and conflict problem.
 
-- expose remote data through normal filesystem APIs;
-- make reads and writes explicitly ranged, concurrent, and bounded;
-- use QUIC streams so unrelated operations do not share one transport-level ordering bottleneck;
-- reconnect and recover unchanged open files without silently mixing revisions;
-- retain previously authenticated immutable data for disconnected reads;
-- fail writes closed when the server cannot authoritatively resolve permissions, locks, revisions, and namespace conflicts.
+quicKFS is designed to reduce that **latency amplification**, not merely to replace TCP with UDP:
 
-The result is intended to behave like a network filesystem, not a bidirectional sync product. Cold-start offline mounts, queued offline writes, automatic merging, and conflict reconciliation are deliberately not implemented.
+| quicKFS design choice | Why it helps on a high-latency or lossy link |
+| --- | --- |
+| Metadata-bearing directory snapshots | One bounded directory request returns names, node IDs, types, sizes, modes, timestamps, revisions, link counts, and allocation data together. Finder-style lookup and listing do not need a network `getattr` request for every entry. |
+| Useful state in operation responses | Open/create replies include the handle, size, and revision; writes return the resulting size and revision; metadata mutations return updated metadata. The client does not need a follow-up round trip just to learn the state produced by its previous request. |
+| Large, explicit byte ranges | Applications can request only the portion of a large media file they need. Requests are split at the negotiated wire limit, while missing cache blocks and independent reads are fetched concurrently instead of serially. |
+| One independent QUIC stream per operation | A delayed or retransmitted file range does not impose transport-level head-of-line blocking on unrelated streams, so metadata and other reads can continue making progress. QUIC still applies connection congestion and flow control; this is isolation, not immunity to a bad link. |
+| Revision-aware caching | Metadata, directory snapshots, and byte ranges are reused under an exact file revision. Repeated seeks and Finder metadata probes can become local cache hits without pretending stale bytes are current. |
+| Server-side work | Range copy, reflink/copy-range acceleration, sparse seek, and filesystem metadata operations execute beside the backing storage rather than downloading data merely to upload it again. |
+| Explicit reconnect invariants | A reconnect must reach the same server epoch, and an open file is recovered only at its exact prior revision. Safe reads may retry; ambiguous writes never run twice automatically. |
+| FUSE-aware protocol shape | The macFUSE adapter and wire protocol are developed together, so common kernel request patterns can be translated into one semantic remote operation rather than a generic sequence of path-based calls. |
+
+This can make quicKFS a better fit than a conventional share for random-access creative workloads over a WAN, VPN, Wi-Fi, or other variable path. For example, listing a project directory transfers entry metadata once, opening a clip returns the revision needed for later range validation, and dozens of timeline reads can be in flight independently. The goal is fewer **dependent** round trips on the critical path, not simply fewer packets.
+
+### How that comparison applies to SMB and other systems
+
+quicKFS is not universally better than SMB. Modern SMB 2/3 is a mature protocol with [compound requests](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/fa6687f5-99d4-4c9b-ba2e-a770310225e0), [metadata-rich directory information classes](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/29dfcc9b-3aec-406b-abb5-0b4fe96712e2), request credits, leases, [durable-handle reconnect](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/75364667-3a93-4e2c-b771-592d8d5e876d), encryption, [Multichannel/RDMA](https://learn.microsoft.com/en-us/windows-server/storage/storage-spaces/manage-smb-multichannel), and [SMB over QUIC](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-over-quic) on supported Windows deployments. A good SMB implementation can pipeline or combine work and will usually be the stronger choice on a reliable LAN or in an Active Directory environment because it has years of interoperability, ACL, policy, failover, monitoring, and vendor support.
+
+The difference is focus and end-to-end control—not that SMB is incapable of batching or using QUIC. SMB must implement broad Windows and cross-platform semantics through general-purpose clients, and its WAN behavior depends on the client, dialect, credits, leases, transport, server, and mount settings in use. quicKFS owns both the macFUSE translation and its narrower wire contract, always returns the revision/coherency information required by its client, and maps each operation to an independent QUIC stream by default. [QUIC avoids head-of-line blocking between independent streams](https://www.rfc-editor.org/rfc/rfc9000.html#section-13). SMB over QUIC can provide the same underlying transport class, but retains SMB's protocol shape and currently targets supported Windows client/server combinations; quicKFS instead targets a Linux export and native macOS mount without requiring an SMB/Active Directory deployment.
+
+[NFSv4.1](https://www.rfc-editor.org/rfc/rfc8881.html) likewise has compound operations, sessions, delegations, and parallel-storage support, and is a much more mature Unix filesystem protocol. quicKFS's narrower advantage is the combination of an application-aware macFUSE adapter, authenticated QUIC transport, revision-keyed ranges, and fail-closed reconnect/cache behavior. Compared with SSHFS/SFTP-style mounts, quicKFS adds filesystem-specific revisions, metadata snapshots, persistent read caching, server-side copy, lock replay, and independent QUIC request streams. Compared with rsync, cloud-drive, or object-storage synchronization, it exposes one authoritative live namespace and does not require whole files or a second mutable project tree to be synchronized later.
+
+The tradeoff is maturity and scope: quicKFS does not yet provide SMB's enterprise integration, broad client ecosystem, per-user share roots/ACL model, clustered failover, or production audit history. It is intended to behave like a latency-conscious network filesystem, not a bidirectional sync product. Cold-start offline mounts, queued offline writes, automatic merging, and conflict reconciliation are deliberately not implemented.
 
 ## What it supports
 
