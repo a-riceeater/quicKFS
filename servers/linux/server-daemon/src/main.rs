@@ -178,11 +178,14 @@ struct Serve {
     max_known_nodes_per_connection: usize,
     #[arg(long, default_value_t = 65_536)]
     max_total_known_nodes: usize,
+    /// Aggregate metadata/xattr workers used across directory requests.
+    #[arg(long, default_value_t = 64)]
+    max_directory_entry_tasks: usize,
     #[arg(long, default_value_t = 30_000)]
     request_timeout_ms: u64,
     #[arg(long, default_value_t = 128)]
     max_concurrent_requests: usize,
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    #[arg(long, default_value_t = 128 * 1024 * 1024)]
     max_in_flight_read_bytes: usize,
     /// Aggregate memory reserved for write request bodies across all clients.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
@@ -433,6 +436,7 @@ where
                 max_open_handles: c.max_open_handles,
                 max_known_nodes: c.max_known_nodes_per_connection,
                 max_total_known_nodes: c.max_total_known_nodes,
+                max_directory_entry_tasks: c.max_directory_entry_tasks,
                 request_timeout_ms: c.request_timeout_ms,
             },
             c.allow_writes,
@@ -504,8 +508,16 @@ where
                                 connection_write_permits,
                                 peer_ip,
                             });
+                            tracing::debug!(%peer_ip, "QUIC connection established");
                             let mut request_tasks = tokio::task::JoinSet::new();
-                            while let Ok((send, recv)) = connection.accept_bi().await {
+                            loop {
+                                let (send, recv) = match connection.accept_bi().await {
+                                    Ok(streams) => streams,
+                                    Err(error) => {
+                                        tracing::debug!(%peer_ip, %error, "QUIC connection ended");
+                                        break;
+                                    }
+                                };
                                 let permit = match tokio::time::timeout(
                                     request_timeout,
                                     permits.clone().acquire_owned(),
@@ -576,6 +588,9 @@ fn validate_configuration(c: &Serve) -> Result<()> {
     if c.request_timeout_ms == 0 {
         bail!("request timeout must be greater than zero milliseconds");
     }
+    if c.max_directory_entry_tasks == 0 {
+        bail!("maximum directory entry tasks must be greater than zero");
+    }
     if c.max_concurrent_requests == 0 {
         bail!("maximum concurrent requests must be greater than zero");
     }
@@ -606,6 +621,7 @@ fn validate_configuration(c: &Serve) -> Result<()> {
     if c.max_open_handles > Semaphore::MAX_PERMITS
         || c.max_known_nodes_per_connection > Semaphore::MAX_PERMITS
         || c.max_total_known_nodes > Semaphore::MAX_PERMITS
+        || c.max_directory_entry_tasks > Semaphore::MAX_PERMITS
         || c.max_concurrent_requests > Semaphore::MAX_PERMITS
         || c.max_concurrent_connections > Semaphore::MAX_PERMITS
         || c.max_concurrent_auth > Semaphore::MAX_PERMITS
@@ -872,19 +888,24 @@ async fn handle(
             .await
             .map(Response::Metadata)
             .unwrap_or_else(|error| Response::Error(error.protocol())),
-        Request::ListDirectory { node } => {
-            let export = Arc::clone(&export);
-            match tokio::task::spawn_blocking(move || export.list_with_revision_blocking(node))
+        Request::ListDirectory { node } => export
+            .list_with_revision(node)
+            .await
+            .map(|(revision, entries)| Response::DirectoryListing { revision, entries })
+            .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::ListDirectoryView { node, options } => {
+            let started = Instant::now();
+            let result = export
+                .directory_view(node, options)
                 .await
-            {
-                Ok(result) => result
-                    .map(|(revision, entries)| Response::DirectoryListing { revision, entries })
-                    .unwrap_or_else(|error| Response::Error(error.protocol())),
-                Err(error) => {
-                    tracing::error!(%error, "directory listing worker failed");
-                    internal_error()
-                }
-            }
+                .map(|view| fit_directory_view_response(id, view))
+                .unwrap_or_else(|error| Response::Error(error.protocol()));
+            tracing::debug!(
+                node = %node.0,
+                elapsed_ms = started.elapsed().as_millis(),
+                "prepared enriched directory view"
+            );
+            result
         }
         Request::OpenFile { node, options } => export
             .open(node, options)
@@ -1006,7 +1027,7 @@ async fn handle(
             } else {
                 match u32::try_from(length) {
                     Ok(permit_count) => {
-                        match read_permits.clone().try_acquire_many_owned(permit_count) {
+                        match read_permits.clone().acquire_many_owned(permit_count).await {
                             Ok(permit) => match export.read(handle, offset, length).await {
                                 Ok((revision, data)) => {
                                     let length = u64::try_from(data.len()).unwrap_or(u64::MAX);
@@ -1137,7 +1158,7 @@ async fn handle(
             } else {
                 match u32::try_from(length) {
                     Ok(permit_count) => {
-                        match read_permits.clone().try_acquire_many_owned(permit_count) {
+                        match read_permits.clone().acquire_many_owned(permit_count).await {
                             Ok(permit) => match export.get_xattr(node, &name, offset, length).await
                             {
                                 Ok((total_size, data)) => {
@@ -1351,6 +1372,45 @@ fn internal_error() -> Response {
         message: "internal server error".into(),
     })
 }
+
+fn fit_directory_view_response(id: RequestId, mut view: DirectoryView) -> Response {
+    let fits = |candidate: &DirectoryView| {
+        encode(&Envelope {
+            version: PROTOCOL_VERSION,
+            request_id: id,
+            message: Response::DirectoryView(candidate.clone()),
+        })
+        .is_ok()
+    };
+    if fits(&view) {
+        return Response::DirectoryView(view);
+    }
+
+    if let Some(xattrs) = &mut view.xattrs {
+        xattrs.inline_values.clear();
+    }
+    for entry in &mut view.entries {
+        if let Some(xattrs) = &mut entry.xattrs {
+            xattrs.inline_values.clear();
+        }
+    }
+    if fits(&view) {
+        return Response::DirectoryView(view);
+    }
+
+    view.xattrs = None;
+    for entry in &mut view.entries {
+        entry.xattrs = None;
+    }
+    if fits(&view) {
+        Response::DirectoryView(view)
+    } else {
+        Response::Error(ProtocolError {
+            code: ErrorCode::TooLarge,
+            message: "directory view exceeds the control-frame limit".into(),
+        })
+    }
+}
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -1542,6 +1602,7 @@ mod tests {
             max_open_handles: 8,
             max_known_nodes_per_connection: 128,
             max_total_known_nodes: 512,
+            max_directory_entry_tasks: 8,
             request_timeout_ms: timeout,
             max_concurrent_requests: 32,
             max_in_flight_read_bytes: 16 * 1024 * 1024,
@@ -1718,7 +1779,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn writable_v5_pipeline_supports_random_io_sync_rename_and_connection_locks() {
+    async fn writable_v6_pipeline_supports_random_io_sync_rename_and_connection_locks() {
         let server = TestServer::start_writable(5_000).await;
         let first = NetworkFilesystem::authenticate(
             server.pinned_client().await,
@@ -1911,7 +1972,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn v5_extended_filesystem_operations_cross_the_authenticated_transport() {
+    async fn v6_extended_filesystem_operations_cross_the_authenticated_transport() {
         let server = TestServer::start_writable(5_000).await;
         let filesystem = NetworkFilesystem::authenticate(
             server.pinned_client().await,
@@ -1982,6 +2043,26 @@ mod tests {
                 .await
                 .unwrap()
                 .contains(&tag)
+        );
+        let view = filesystem
+            .list_directory_view(ROOT_NODE, DirectoryViewOptions::NATIVE)
+            .await
+            .unwrap();
+        let left_view = view
+            .entries
+            .iter()
+            .find(|entry| entry.entry.node == left.metadata.node)
+            .unwrap();
+        let xattrs = left_view.xattrs.as_ref().unwrap();
+        assert!(xattrs.names.contains(&tag));
+        assert_eq!(
+            xattrs
+                .inline_values
+                .iter()
+                .find(|value| value.name == tag)
+                .unwrap()
+                .value,
+            b"test-tag"
         );
 
         let resource_fork = Name::from("com.apple.ResourceFork");

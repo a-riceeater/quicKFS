@@ -38,7 +38,7 @@ pub enum ClientError {
     AmbiguousMutation,
 }
 pub type Result<T> = std::result::Result<T, ClientError>;
-pub const MAX_CLIENT_READ_SIZE: u64 = 8 * 1024 * 1024;
+pub const MAX_CLIENT_READ_SIZE: u64 = 16 * 1024 * 1024;
 pub const MAX_CLIENT_WRITE_SIZE: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -94,6 +94,28 @@ pub trait RemoteFilesystem: Send + Sync {
         Ok(DirectorySnapshot {
             revision: 0,
             entries: self.list_directory(node).await?,
+        })
+    }
+    async fn list_directory_view(
+        &self,
+        node: NodeId,
+        _options: DirectoryViewOptions,
+    ) -> Result<DirectoryView> {
+        let (snapshot, directory) =
+            tokio::try_join!(self.list_directory_snapshot(node), self.get_metadata(node))?;
+        Ok(DirectoryView {
+            revision: snapshot.revision,
+            parent: directory.clone(),
+            directory,
+            xattrs: None,
+            entries: snapshot
+                .entries
+                .into_iter()
+                .map(|entry| DirectoryViewEntry {
+                    entry,
+                    xattrs: None,
+                })
+                .collect(),
         })
     }
     async fn open_file(&self, node: NodeId) -> Result<(FileHandle, u64, u64)>;
@@ -433,6 +455,20 @@ impl RemoteFilesystem for NetworkFilesystem {
             Response::DirectoryListing { revision, entries } => {
                 Ok(DirectorySnapshot { revision, entries })
             }
+            response => Err(response_error(response)),
+        }
+    }
+    async fn list_directory_view(
+        &self,
+        node: NodeId,
+        options: DirectoryViewOptions,
+    ) -> Result<DirectoryView> {
+        match self
+            .request(Request::ListDirectoryView { node, options })
+            .await?
+            .0
+        {
+            Response::DirectoryView(view) => Ok(view),
             response => Err(response_error(response)),
         }
     }

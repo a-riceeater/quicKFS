@@ -17,8 +17,9 @@ mod macos {
     use clap::{Parser, ValueEnum};
     use quickfs_cache::{CacheNamespace, NonBlockingPersistentCache};
     use quickfs_client_core::{
-        AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, ReconnectPolicy,
-        RemoteFilesystem, ResilientFilesystem, ServerTrust, load_trusted_server_pin,
+        AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, MAX_CLIENT_READ_SIZE,
+        ReconnectPolicy, RemoteFilesystem, ResilientFilesystem, ServerTrust,
+        load_trusted_server_pin,
     };
     use quickfs_filesystem_macfuse::{Adapter, MacFuseBackend, MountConfig, mount};
     use quickfs_transport_quic::load_certificates;
@@ -81,7 +82,7 @@ mod macos {
         )]
         cache_max_bytes: u64,
         /// Read-ahead block size for overlapping and unaligned random reads.
-        #[arg(long, default_value_t = 1_024)]
+        #[arg(long, default_value_t = 16_384)]
         cache_block_kib: u64,
         #[arg(long, default_value_t = 10_000)]
         timeout_ms: u64,
@@ -199,7 +200,9 @@ mod macos {
         let cache_block_size = cli
             .cache_block_kib
             .checked_mul(1024)
-            .context("cache block size is too large")?;
+            .context("cache block size is too large")?
+            .min(capabilities.max_read_size)
+            .min(MAX_CLIENT_READ_SIZE);
         let filesystem = CachedFilesystem::new(
             resilient,
             cache,

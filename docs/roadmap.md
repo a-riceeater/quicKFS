@@ -1,6 +1,6 @@
 # Roadmap
 
-Implemented foundations include authenticated protocol-v5 reads/writes, per-account write grants, persistent node identity, reconnect/lock replay, disk-backed offline reads, broad macFUSE callbacks, xattrs/resource forks, hardlinks/special nodes, server-side copies, data/hole seek, and mounted-volume integration tests.
+Implemented foundations include authenticated protocol-v6 reads/writes, one-request enriched native directory views, per-account write grants, persistent node identity, reconnect/lock replay, disk-backed offline reads, broad macFUSE callbacks, xattrs/resource forks, hardlinks/special nodes, server-side copies, data/hole seek, and mounted-volume integration tests.
 
 Remaining priorities:
 

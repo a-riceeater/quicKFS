@@ -10,13 +10,13 @@ The transport is a purpose-built versioned protocol over QUIC/TLS. It supports r
 
 quicKFS is built to make remote files feel responsive and dependable even when the network is far away, variable, or temporarily unavailable. Its protocol treats latency, concurrency, reconnect, caching, and filesystem consistency as one end-to-end design problem rather than separate layers.
 
-The central goal is a short critical path from an application request to useful data. quicKFS returns related metadata together, reads only the byte ranges an application asks for, keeps independent work concurrent, and carries the revision information needed to reuse cached data safely. This is especially valuable for large creative projects where an editor may inspect many files, seek repeatedly through a clip, and issue metadata and media reads at the same time.
+The central goal is a short critical path from an application request to useful data. quicKFS returns related metadata together, transfers explicit bounded byte ranges with configurable read-ahead, keeps independent work concurrent, and carries the revision information needed to reuse cached data safely. This is especially valuable for large creative projects where an editor may inspect many files, seek repeatedly through a clip, and issue metadata and media reads at the same time.
 
 | quicKFS design choice | Why it helps on a high-latency or lossy link |
 | --- | --- |
-| Metadata-bearing directory snapshots | One bounded directory request returns names, node IDs, types, sizes, modes, timestamps, revisions, link counts, and allocation data together. Finder-style lookup and listing do not need a network `getattr` request for every entry. |
+| Enriched native directory views | One bounded directory request returns the directory/parent metadata, every child's name and metadata, complete xattr-name sets, and bounded small xattr values. Finder-style `lookup`, `getattr`, `listxattr`, negative xattr probes, and common small xattr reads then stay local. |
 | Useful state in operation responses | Open/create replies include the handle, size, and revision; writes return the resulting size and revision; metadata mutations return updated metadata. The client does not need a follow-up round trip just to learn the state produced by its previous request. |
-| Large, explicit byte ranges | Applications can request only the portion of a large media file they need. Requests are split at the negotiated wire limit, while missing cache blocks and independent reads are fetched concurrently instead of serially. |
+| Large, explicit byte ranges | Applications can request only the portion of a large media file they need. A default 16 MiB read matches the largest macFUSE request; overlapping cache misses are single-flighted and independent reads remain concurrent. |
 | One independent QUIC stream per operation | A delayed or retransmitted file range does not impose transport-level head-of-line blocking on unrelated streams, so metadata and other reads can continue making progress. QUIC still applies connection congestion and flow control; this is isolation, not immunity to a bad link. |
 | Revision-aware caching | Metadata, directory snapshots, and byte ranges are reused under an exact file revision. Repeated seeks and Finder metadata probes can become local cache hits without pretending stale bytes are current. |
 | Server-side work | Range copy, reflink/copy-range acceleration, sparse seek, and filesystem metadata operations execute beside the backing storage rather than downloading data merely to upload it again. |
@@ -24,7 +24,7 @@ The central goal is a short critical path from an application request to useful 
 | FUSE-aware protocol shape | The macFUSE adapter and wire protocol are developed together, so common kernel request patterns can be translated into one semantic remote operation rather than a generic sequence of path-based calls. |
 | Platform-independent core | Filesystem semantics live behind `RemoteFilesystem`, separate from macFUSE and QUIC plumbing. New native adapters can reuse the authenticated, reconnecting, cached client instead of rebuilding the protocol for each operating system. |
 
-Together, these choices reduce **dependent** network round trips on the critical path. Listing a project directory transfers its entry metadata once, opening a clip returns the revision needed for later range validation, repeated metadata probes can be served from cache, and dozens of timeline reads can remain in flight independently. Server-side copies and sparse operations keep work close to the storage, while authenticated reconnect lets an unchanged working set recover without forcing applications to start over.
+Together, these choices reduce **dependent** network round trips on the critical path. Publishing a directory uses one enriched request rather than a directory request followed by a request per entry/xattr, opening a clip returns the revision needed for later range validation, repeated metadata probes can be served from cache, and dozens of timeline reads can remain in flight independently. Server-side copies and sparse operations keep work close to the storage, while authenticated reconnect lets an unchanged working set recover without forcing applications to start over.
 
 The same design is intended to grow beyond the current Linux-server/macOS-client pairing. Future Linux FUSE, Windows WinFsp, and other native adapters can share the protocol, authentication, revision model, cache, and reconnect implementation while translating each platform's filesystem API at the edge. The goal is one quicKFS network filesystem that feels native wherever a project is opened.
 
@@ -38,7 +38,7 @@ The same design is intended to grow beyond the current Linux-server/macOS-client
 | Application metadata | Extended attributes, Finder tags, quarantine metadata, custom xattrs, and persisted `com.apple.ResourceFork` sidecars. |
 | Media-oriented access | Concurrent random byte ranges, requests larger than one wire chunk, `SEEK_DATA`/`SEEK_HOLE`, server-side range copy, safe `FIONREAD`, poll readiness, and logical `bmap`. |
 | Coordination | Cross-client POSIX byte-range locks, directory sync, stable node IDs, revision checking, and reconnect-time handle/lock recovery. |
-| Lifecycle | Metadata-bearing directory snapshots, `readdirplus` callback support, and inode `forget`/`batch_forget` eviction. |
+| Lifecycle | Enriched directory views, `readdirplus` callback support, inode `forget`/`batch_forget` eviction, and server-independent local unmount. |
 | Linux server features | FIFO, socket, character-device, and block-device creation through `mknod`, subject to normal host privileges. |
 
 The protocol also represents filenames and xattr names as arbitrary bytes. Linux preserves non-UTF-8 names end to end; modern macOS can reject invalid UTF-8 path components before macFUSE delivers them to the adapter.
@@ -58,7 +58,7 @@ cached RemoteFilesystem
 resilient authenticated client
           │
           ▼
-QUIC/TLS 1.3  ── quickfs/5 ── independent request streams
+QUIC/TLS 1.3  ── quickfs/6 ── independent request streams
           │
           ▼
 Linux server daemon
@@ -71,7 +71,7 @@ The platform adapter depends on the `RemoteFilesystem` interface rather than tra
 
 The main components are:
 
-- `crates/protocol`: version 5 requests, responses, capabilities, metadata, and limits;
+- `crates/protocol`: version 6 requests, responses, capabilities, metadata, and limits;
 - `crates/transport-quic`: Quinn endpoints, TLS trust policies, framing, timeouts, and peer identity;
 - `crates/client-core`: network, resilient, cached, and delayed/test filesystem implementations;
 - `crates/cache`: private persistent metadata, directory, symlink, statfs, and revision-keyed range cache;
@@ -82,13 +82,15 @@ The main components are:
 
 See [Architecture](ARCHITECTURE.md) for the crate and trust boundaries.
 
-## How protocol version 5 works
+## How protocol version 6 works
 
 ### Transport and framing
 
-QUIC/TLS negotiates the version-specific ALPN identifier `quickfs/5`. Each filesystem operation normally uses an independent bidirectional QUIC stream on one authenticated connection, allowing concurrent reads and unrelated metadata requests to progress independently.
+QUIC/TLS negotiates the version-specific ALPN identifier `quickfs/6`. Each filesystem operation normally uses an independent bidirectional QUIC stream on one authenticated connection, allowing concurrent reads and unrelated metadata requests to progress independently. The client sends a 10-second keepalive, both peers allow five minutes of idle time, and the connection/stream flow-control windows accommodate several concurrent maximum-size reads. Protocol versions are intentionally incompatible, so upgrade the server and clients together.
 
-Control messages are Postcard-encoded and length-prefixed with a 1 MiB frame limit. Bulk read, write, and xattr data follows its control frame as an explicitly sized raw body rather than being embedded in serialization. The default negotiated read/write request limit is 8 MiB; the macFUSE adapter splits larger kernel requests while preserving one expected revision.
+Control messages are Postcard-encoded and length-prefixed with a 1 MiB frame limit. Bulk read, write, and xattr data follows its control frame as an explicitly sized raw body rather than being embedded in serialization. The default negotiated read limit is 16 MiB, matching the maximum macFUSE read; writes remain limited to 8 MiB. Larger direct adapter operations are split while preserving one expected revision.
+
+`ListDirectoryView` is the native-mount projection. In one request it returns the current and parent directory metadata, metadata for every child, complete xattr names where supported, and values up to 4 KiB under a 256 KiB response-wide inline budget. Large values such as resource forks remain explicit ranged xattr reads. The server performs child stat/xattr work concurrently under `--max-directory-entry-tasks` and verifies the directory revision before replying; the adapter single-flights concurrent cold loads and answers subsequent Finder callbacks from that response.
 
 Peers exchange capability information after authentication. Optional operations such as special nodes, server-side copy, data/hole seek, exchange, volume metadata, and persistent restart behavior are used only when the server advertises them.
 
@@ -110,7 +112,7 @@ If transport fails during a read-only operation, the resilient client can reconn
 
 Reconnect is bounded, single-flight, and authenticated with the original trust policy. A replacement connection must report the same persisted server epoch. Revision-matched handles are reopened and a surviving client's active advisory locks are replayed. Locks are not immortal server records: closing the handle or losing the owning client releases them.
 
-The persistent cache is namespaced by authenticated certificate fingerprint, server epoch, and username. Entries are revision-keyed, integrity-checked, owner-private, atomically written, and LRU-evicted under a configured byte budget. After an online mount disconnects, already cached metadata and byte ranges can remain readable.
+The persistent cache is namespaced by authenticated certificate fingerprint, server epoch, and username. Entries are revision-keyed, integrity-checked, owner-private, atomically written, and LRU-evicted under a configured byte budget. A bounded 256 MiB process-local range tier keeps hot blocks out of the disk/hash path, and concurrent cold readers share one disk verification or remote fetch for an aligned block. After an online mount disconnects, already cached metadata and byte ranges can remain readable.
 
 The cache never authorizes a cold-start offline mount and never queues writes. Without the server, a client cannot confirm current identity, epoch, account status, permissions, locks, quotas, or competing namespace changes. See [Caching and offline semantics](docs/caching.md) for the consistency rationale.
 
@@ -216,7 +218,7 @@ target/debug/quickfs-mount ./mountpoint \
   --username alice
 ```
 
-The mount runs in the foreground. Press Control+C in that terminal for a graceful unmount, or unmount it from another terminal with:
+The mount runs in the foreground. Press Control+C in that terminal to unmount. macFUSE gets three seconds for a graceful unmount before forced local detach begins. An independent process watchdog exits after eight seconds if a macOS unmount syscall itself wedges—for example because the server disappeared—so closing the mount never waits indefinitely for the network. You can also unmount it from another terminal with:
 
 ```sh
 umount ./mountpoint
@@ -228,7 +230,7 @@ For remote deployment, enterprise certificates, managed pins, cache tuning, serv
 
 Ordinary Finder and application operations—including random I/O, create/delete, xattrs/resource forks, hardlinks, locks, sparse seek, volume rename, and backup time—work through the native mount. Some optional operations depend on what the installed macFUSE/macOS ABI advertises:
 
-- the tested macFUSE 5.3 kernel backend does not dispatch native `copy_file_range` or `readdirplus`, although ordinary copies work through ranged I/O and remote directory snapshots already include metadata;
+- the tested macFUSE 5.3 kernel backend does not dispatch native `copy_file_range` or `readdirplus`, although ordinary copies work through ranged I/O and the ordinary `readdir` path already consumes enriched remote directory views;
 - macFUSE dropped the distinct `exchangedata(2)` capability on macOS 11, while atomic rename swapping remains available;
 - invalid UTF-8 path components may be rejected by macOS before reaching the adapter;
 - special nodes require a Linux backing daemon and its normal host privileges.
@@ -239,7 +241,7 @@ See [Filesystem semantics](docs/filesystem-semantics.md) for the precise behavio
 
 - [Setup guide](docs/setup.md)
 - [Usage and command reference](docs/usage.md)
-- [Protocol version 5](docs/protocol.md)
+- [Protocol version 6](docs/protocol.md)
 - [Authentication and server trust](docs/authentication.md)
 - [Filesystem semantics](docs/filesystem-semantics.md)
 - [Caching and offline behavior](docs/caching.md)

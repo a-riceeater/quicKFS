@@ -15,13 +15,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{
     Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore,
 };
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 #[cfg(not(unix))]
@@ -227,6 +228,22 @@ struct NodeSnapshot {
     paths: Vec<PathBuf>,
 }
 
+#[cfg(unix)]
+struct PreparedDirectoryScan {
+    directory: Arc<StdFile>,
+    relative: PathBuf,
+    before: std::fs::Metadata,
+    names: Vec<Vec<u8>>,
+}
+
+#[cfg(unix)]
+struct ScannedDirectoryEntry {
+    identity: FileIdentity,
+    relative: PathBuf,
+    entry: DirectoryEntry,
+    xattrs: Option<XattrSnapshot>,
+}
+
 #[derive(Clone)]
 struct LockRecord {
     identity: FileIdentity,
@@ -247,6 +264,7 @@ struct ExportShared {
     persistence: Option<PersistentExportState>,
     handle_permits: Arc<Semaphore>,
     node_permits: Arc<Semaphore>,
+    directory_entry_permits: Arc<Semaphore>,
     nodes: Mutex<NodeRegistry>,
     locks: Mutex<Vec<LockRecord>>,
     lock_notify: Notify,
@@ -393,6 +411,7 @@ impl Export {
                 node_permits: Arc::new(Semaphore::new(
                     limits.max_total_known_nodes.saturating_sub(1),
                 )),
+                directory_entry_permits: Arc::new(Semaphore::new(limits.max_directory_entry_tasks)),
                 nodes: Mutex::new(NodeRegistry {
                     by_node: HashMap::from([(ROOT_NODE, root_node)]),
                     by_identity: HashMap::from([(root_identity, ROOT_NODE)]),
@@ -581,7 +600,209 @@ impl ExportSession {
         &self,
         node: NodeId,
     ) -> Result<(DirectoryRevision, Vec<DirectoryEntry>), ServerError> {
+        #[cfg(unix)]
+        {
+            let options = DirectoryViewOptions::METADATA_ONLY;
+            let (revision, _, entries) = self
+                .scan_directory(node, options, Arc::new(AtomicUsize::new(0)))
+                .await?;
+            Ok((
+                revision,
+                entries.into_iter().map(|entry| entry.entry).collect(),
+            ))
+        }
+        #[cfg(not(unix))]
         self.list_with_revision_blocking(node)
+    }
+
+    /// Build one revision-consistent native directory projection. Entry
+    /// metadata and xattrs are discovered beside the export concurrently, so
+    /// the client receives one response instead of issuing one request per
+    /// Finder callback.
+    pub async fn directory_view(
+        &self,
+        node: NodeId,
+        options: DirectoryViewOptions,
+    ) -> Result<DirectoryView, ServerError> {
+        validate_directory_view_options(options)?;
+        #[cfg(unix)]
+        {
+            let remaining_inline =
+                Arc::new(AtomicUsize::new(options.inline_xattr_total_size as usize));
+            let (view_revision, prepared, entries) = self
+                .scan_directory(node, options, Arc::clone(&remaining_inline))
+                .await?;
+            let resource_forks = self
+                .export
+                .shared
+                .persistence
+                .as_ref()
+                .map(|state| state.resource_forks.clone());
+            let mut directory = to_metadata(node, &prepared.before);
+            directory.backup_unix_ms = read_fd_backup_time(&prepared.directory).ok().flatten();
+            enrich_resource_fork_revision_at(resource_forks.as_deref(), node, &mut directory);
+
+            let xattrs = if options.include_xattrs {
+                let opened = Arc::clone(&prepared.directory);
+                let remaining = Arc::clone(&remaining_inline);
+                let resource_forks = resource_forks.clone();
+                Some(
+                    blocking(move || {
+                        xattr_snapshot_for_open_file(
+                            &opened,
+                            node,
+                            resource_forks.as_deref(),
+                            options.inline_xattr_size as usize,
+                            &remaining,
+                        )
+                    })
+                    .await?,
+                )
+            } else {
+                None
+            };
+
+            let parent = if prepared.relative.as_os_str().is_empty() {
+                directory.clone()
+            } else {
+                let parent_path = prepared
+                    .relative
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_path_buf();
+                let root = self.export.shared.root_file.try_clone()?;
+                let node_key = self.export.shared.node_key;
+                let resource_forks = resource_forks.clone();
+                let scanned_parent_path = parent_path.clone();
+                let (identity, mut metadata) = blocking(move || {
+                    let stat = secure_lstat(&root, &scanned_parent_path)?;
+                    let identity = identity_from_stat(&stat);
+                    let parent_node = stable_node_id(node_key, identity);
+                    let mut metadata = to_metadata_from_stat(parent_node, &stat)?;
+                    enrich_resource_fork_revision_at(
+                        resource_forks.as_deref(),
+                        parent_node,
+                        &mut metadata,
+                    );
+                    Ok((identity, metadata))
+                })
+                .await?;
+                let parent_node = self.remember(identity, parent_path)?;
+                metadata.node = parent_node;
+                metadata
+            };
+
+            let opened = Arc::clone(&prepared.directory);
+            let final_revision = blocking(move || Ok(revision(&opened.metadata()?))).await?;
+            if final_revision != view_revision {
+                return Err(ServerError::Conflict);
+            }
+
+            Ok(DirectoryView {
+                revision: view_revision,
+                directory,
+                parent,
+                xattrs,
+                entries: entries
+                    .into_iter()
+                    .map(|entry| DirectoryViewEntry {
+                        entry: entry.entry,
+                        xattrs: entry.xattrs,
+                    })
+                    .collect(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let (revision, entries) = self.list_with_revision_blocking(node)?;
+            let directory = self.metadata(node).await?;
+            Ok(DirectoryView {
+                revision,
+                parent: directory.clone(),
+                directory,
+                xattrs: None,
+                entries: entries
+                    .into_iter()
+                    .map(|entry| DirectoryViewEntry {
+                        entry,
+                        xattrs: None,
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    async fn scan_directory(
+        &self,
+        node: NodeId,
+        options: DirectoryViewOptions,
+        remaining_inline: Arc<AtomicUsize>,
+    ) -> Result<
+        (
+            DirectoryRevision,
+            PreparedDirectoryScan,
+            Vec<ScannedDirectoryEntry>,
+        ),
+        ServerError,
+    > {
+        let snapshot = self.node_snapshot(node)?;
+        let root = self.export.shared.root_file.try_clone()?;
+        let prepared = blocking(move || prepare_directory_scan(&root, &snapshot)).await?;
+        let node_key = self.export.shared.node_key;
+        let resource_forks = self
+            .export
+            .shared
+            .persistence
+            .as_ref()
+            .map(|state| state.resource_forks.clone());
+        let mut tasks = JoinSet::new();
+        for name in &prepared.names {
+            let permit = self
+                .export
+                .shared
+                .directory_entry_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| ServerError::StateUnavailable)?;
+            let directory = Arc::clone(&prepared.directory);
+            let relative = prepared.relative.clone();
+            let name = name.clone();
+            let resource_forks = resource_forks.clone();
+            let remaining_inline = Arc::clone(&remaining_inline);
+            tasks.spawn_blocking(move || {
+                let _permit = permit;
+                scan_directory_entry(
+                    &directory,
+                    &relative,
+                    name,
+                    node_key,
+                    resource_forks.as_deref(),
+                    options,
+                    &remaining_inline,
+                )
+            });
+        }
+
+        let mut entries = Vec::with_capacity(prepared.names.len());
+        while let Some(result) = tasks.join_next().await {
+            entries.push(result.map_err(|_| ServerError::TaskFailed)??);
+        }
+        let directory = Arc::clone(&prepared.directory);
+        let after = blocking(move || Ok(directory.metadata()?)).await?;
+        let after_revision = revision(&after);
+        if revision(&prepared.before) != after_revision {
+            return Err(ServerError::Conflict);
+        }
+
+        for scanned in &mut entries {
+            let remembered = self.remember(scanned.identity, scanned.relative.clone())?;
+            scanned.entry.node = remembered;
+            scanned.entry.metadata.node = remembered;
+        }
+        entries.sort_by(|left, right| left.entry.name.cmp(&right.entry.name));
+        Ok((after_revision, prepared, entries))
     }
 
     /// Perform the descriptor-relative directory walk. Network servers should
@@ -2276,23 +2497,15 @@ impl ExportSession {
     }
 
     fn enrich_resource_fork_revision(&self, node: NodeId, metadata: &mut Metadata) {
-        let Some(path) = self.resource_fork_path(node) else {
-            return;
-        };
-        let Ok(sidecar) = std::fs::metadata(path) else {
-            return;
-        };
-        let mut hasher = Sha256::new();
-        hasher.update(b"quickfs resource fork revision v1");
-        hasher.update(metadata.revision.to_le_bytes());
-        hasher.update(sidecar.len().to_le_bytes());
-        if let Ok(modified) = sidecar.modified()
-            && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
-        {
-            hasher.update(duration.as_nanos().to_le_bytes());
-        }
-        let digest = hasher.finalize();
-        metadata.revision = u64::from_le_bytes(digest[..8].try_into().unwrap_or([0; 8]));
+        enrich_resource_fork_revision_at(
+            self.export
+                .shared
+                .persistence
+                .as_ref()
+                .map(|state| state.resource_forks.as_path()),
+            node,
+            metadata,
+        );
     }
 
     #[cfg(unix)]
@@ -2558,6 +2771,282 @@ fn prepare_resource_fork_directory(state_file: &Path) -> Result<PathBuf, ServerE
     Ok(path)
 }
 
+fn validate_directory_view_options(options: DirectoryViewOptions) -> Result<(), ServerError> {
+    if options.inline_xattr_size > MAX_DIRECTORY_INLINE_XATTR_SIZE
+        || options.inline_xattr_total_size > MAX_DIRECTORY_INLINE_XATTR_TOTAL_SIZE
+        || (!options.include_xattrs
+            && (options.inline_xattr_size != 0 || options.inline_xattr_total_size != 0))
+    {
+        return Err(ServerError::InvalidRequest(
+            "directory xattr projection exceeds the protocol budget".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_directory_scan(
+    root: &StdFile,
+    snapshot: &NodeSnapshot,
+) -> Result<PreparedDirectoryScan, ServerError> {
+    let (directory, relative, before) = open_node_snapshot(
+        root,
+        snapshot,
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Some(NodeKind::Directory),
+    )?;
+    let stream = rustix::fs::Dir::read_from(&directory).map_err(std::io::Error::from)?;
+    let mut names = Vec::new();
+    let mut estimated_frame_size = 512usize;
+    for entry in stream {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        estimated_frame_size = estimated_frame_size
+            .checked_add(bytes.len().saturating_add(192))
+            .ok_or(ServerError::DirectoryTooLarge)?;
+        if estimated_frame_size > MAX_FRAME_SIZE {
+            return Err(ServerError::DirectoryTooLarge);
+        }
+        names.push(bytes.to_vec());
+    }
+    Ok(PreparedDirectoryScan {
+        directory: Arc::new(directory),
+        relative,
+        before,
+        names,
+    })
+}
+
+#[cfg(unix)]
+fn scan_directory_entry(
+    directory: &StdFile,
+    parent: &Path,
+    name: Vec<u8>,
+    node_key: [u8; 32],
+    resource_forks: Option<&Path>,
+    options: DirectoryViewOptions,
+    remaining_inline: &AtomicUsize,
+) -> Result<ScannedDirectoryEntry, ServerError> {
+    let host_name = OsStr::from_bytes(&name);
+    let stat = rustix::fs::statat(directory, host_name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(std::io::Error::from)?;
+    let identity = identity_from_stat(&stat);
+    let node = stable_node_id(node_key, identity);
+    let kind = node_kind_from_mode(stat.st_mode)?;
+    let mut metadata = to_metadata_from_stat(node, &stat)?;
+    let base_revision = metadata.revision;
+    let xattrs = if options.include_xattrs && kind != NodeKind::Symlink {
+        match open_directory_entry_for_xattrs(directory, host_name, kind) {
+            Ok(file) => {
+                metadata.backup_unix_ms = read_fd_backup_time(&file).ok().flatten();
+                let snapshot = xattr_snapshot_for_open_file(
+                    &file,
+                    node,
+                    resource_forks,
+                    options.inline_xattr_size as usize,
+                    remaining_inline,
+                )
+                .ok();
+                if revision(&file.metadata()?) != base_revision {
+                    return Err(ServerError::Conflict);
+                }
+                snapshot
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    enrich_resource_fork_revision_at(resource_forks, node, &mut metadata);
+    Ok(ScannedDirectoryEntry {
+        identity,
+        relative: parent.join(host_name),
+        entry: DirectoryEntry {
+            node,
+            name: Name::new(name),
+            kind,
+            metadata,
+        },
+        xattrs,
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_entry_for_xattrs(
+    directory: &StdFile,
+    name: &OsStr,
+    kind: NodeKind,
+) -> Result<StdFile, ServerError> {
+    let flags = if kind == NodeKind::Directory {
+        OFlags::RDONLY | OFlags::DIRECTORY
+    } else {
+        OFlags::RDONLY | OFlags::NONBLOCK
+    };
+    rustix::fs::openat(
+        directory,
+        name,
+        flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(StdFile::from)
+    .map_err(|error| std::io::Error::from(error).into())
+}
+
+#[cfg(unix)]
+fn xattr_snapshot_for_open_file(
+    file: &StdFile,
+    node: NodeId,
+    resource_forks: Option<&Path>,
+    inline_maximum: usize,
+    remaining_inline: &AtomicUsize,
+) -> Result<XattrSnapshot, ServerError> {
+    let mut names = list_fd_xattrs(file)?;
+    let resource_fork = resource_forks.map(|root| root.join(format!("{}.fork", node.0)));
+    if resource_fork.as_ref().is_some_and(|path| path.is_file())
+        && !names.iter().any(is_resource_fork)
+    {
+        names.push(Name::from("com.apple.ResourceFork"));
+        names.sort();
+    }
+    let mut inline_values = Vec::new();
+    if inline_maximum > 0 {
+        for name in &names {
+            let value = if is_resource_fork(name) {
+                resource_fork.as_ref().and_then(|path| {
+                    read_resource_fork_range(path, 0, inline_maximum as u64)
+                        .ok()
+                        .and_then(|(total, value)| {
+                            (total as usize <= inline_maximum).then_some(value)
+                        })
+                })
+            } else {
+                logical_xattr_name(name).ok().and_then(|host_name| {
+                    read_fd_xattr_bounded(file, &host_name, inline_maximum)
+                        .ok()
+                        .flatten()
+                })
+            };
+            if let Some(value) = value
+                && claim_inline_budget(remaining_inline, value.len())
+            {
+                inline_values.push(InlineXattr {
+                    name: name.clone(),
+                    value,
+                });
+            }
+        }
+    }
+    Ok(XattrSnapshot {
+        names,
+        inline_values,
+    })
+}
+
+#[cfg(unix)]
+fn read_fd_xattr_bounded(
+    file: &StdFile,
+    name: &OsStr,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, ServerError> {
+    if maximum == 0 {
+        return Ok(None);
+    }
+    let mut capacity = 256usize.min(maximum).max(1);
+    loop {
+        let mut buffer = vec![0_u8; capacity];
+        match rustix::fs::fgetxattr(file, name, &mut buffer) {
+            Ok(length) => {
+                buffer.truncate(length);
+                return Ok(Some(buffer));
+            }
+            Err(rustix::io::Errno::RANGE) if capacity < maximum => {
+                capacity = capacity.saturating_mul(2).min(maximum);
+            }
+            Err(rustix::io::Errno::RANGE) => return Ok(None),
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        }
+    }
+}
+
+fn claim_inline_budget(remaining: &AtomicUsize, amount: usize) -> bool {
+    remaining
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+            available.checked_sub(amount)
+        })
+        .is_ok()
+}
+
+fn enrich_resource_fork_revision_at(
+    resource_forks: Option<&Path>,
+    node: NodeId,
+    metadata: &mut Metadata,
+) {
+    let Some(path) = resource_forks.map(|root| root.join(format!("{}.fork", node.0))) else {
+        return;
+    };
+    let Ok(sidecar) = std::fs::metadata(path) else {
+        return;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"quickfs resource fork revision v1");
+    hasher.update(metadata.revision.to_le_bytes());
+    hasher.update(sidecar.len().to_le_bytes());
+    if let Ok(modified) = sidecar.modified()
+        && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+    {
+        hasher.update(duration.as_nanos().to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    metadata.revision = u64::from_le_bytes(digest[..8].try_into().unwrap_or([0; 8]));
+}
+
+#[cfg(unix)]
+fn open_node_snapshot(
+    root: &StdFile,
+    snapshot: &NodeSnapshot,
+    flags: OFlags,
+    expected: Option<NodeKind>,
+) -> Result<(StdFile, PathBuf, std::fs::Metadata), ServerError> {
+    let mut first_error = None;
+    for path in &snapshot.paths {
+        let (file, opened_path, metadata) = match open_relative(root, path, flags) {
+            Ok(opened) => opened,
+            Err(ServerError::NotFound | ServerError::NotDirectory) => continue,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        if identity(&metadata) != snapshot.identity {
+            continue;
+        }
+        if let Some(expected) = expected
+            && node_kind(&metadata) != expected
+        {
+            return Err(match expected {
+                NodeKind::Directory => ServerError::NotDirectory,
+                NodeKind::File => ServerError::IsDirectory,
+                NodeKind::Symlink => {
+                    ServerError::InvalidRequest("node is not a symbolic link".into())
+                }
+                NodeKind::NamedPipe
+                | NodeKind::CharacterDevice
+                | NodeKind::BlockDevice
+                | NodeKind::Socket => {
+                    ServerError::InvalidRequest("node has a different special-file type".into())
+                }
+            });
+        }
+        return Ok((file, opened_path, metadata));
+    }
+    Err(first_error.unwrap_or(ServerError::NotFound))
+}
+
 fn validate_limits(limits: &Limits) -> Result<(), ServerError> {
     if limits.max_read_size == 0 || limits.max_write_size == 0 {
         return Err(ServerError::InvalidRequest(
@@ -2580,6 +3069,13 @@ fn validate_limits(limits: &Limits) -> Result<(), ServerError> {
     {
         return Err(ServerError::InvalidRequest(
             "total known-node capacity must cover one connection and fit the runtime limit".into(),
+        ));
+    }
+    if limits.max_directory_entry_tasks == 0
+        || limits.max_directory_entry_tasks > Semaphore::MAX_PERMITS
+    {
+        return Err(ServerError::InvalidRequest(
+            "maximum directory entry tasks must fit the runtime semaphore limit".into(),
         ));
     }
     Ok(())
@@ -3616,6 +4112,11 @@ fn open_relative(
 
 #[cfg(unix)]
 fn secure_lstat(root: &StdFile, path: &Path) -> Result<rustix::fs::Stat, ServerError> {
+    if path.as_os_str().is_empty() {
+        return rustix::fs::fstat(root)
+            .map_err(std::io::Error::from)
+            .map_err(ServerError::from);
+    }
     let (parent, name) = open_parent(root, path)?;
     Ok(
         rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
@@ -4376,6 +4877,84 @@ mod tests {
             session.get_xattr(created.node, &fork, 0, 1).await,
             Err(ServerError::NoAttribute)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enriched_directory_view_batches_metadata_and_bounded_xattrs() {
+        let directory = tempfile::tempdir().unwrap();
+        let export = Export::new_writable(directory.path(), Limits::default())
+            .await
+            .unwrap();
+        let session = export.session_with_writes(true);
+        let folder = session
+            .create_directory(ROOT_NODE, "folder", 0o750)
+            .await
+            .unwrap();
+        let (file, handle, _, _) = session
+            .create_file(ROOT_NODE, "clip.mov", 0o640, writable_options())
+            .await
+            .unwrap();
+        session.close(handle).unwrap();
+        let small_name = Name::from("user.DOSATTRIB");
+        let large_name = Name::from("com.apple.metadata:_kMDItemUserTags");
+        session
+            .set_xattr(
+                file.node,
+                &small_name,
+                b"0x20".to_vec(),
+                XattrSetMode::Upsert,
+                0,
+            )
+            .await
+            .unwrap();
+        session
+            .set_xattr(
+                file.node,
+                &large_name,
+                vec![0x5a; MAX_DIRECTORY_INLINE_XATTR_SIZE as usize + 1],
+                XattrSetMode::Upsert,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let view = session
+            .directory_view(ROOT_NODE, DirectoryViewOptions::NATIVE)
+            .await
+            .unwrap();
+        assert_eq!(view.directory.node, ROOT_NODE);
+        assert_eq!(view.parent.node, ROOT_NODE);
+        let file = view
+            .entries
+            .iter()
+            .find(|entry| entry.entry.node == file.node)
+            .unwrap();
+        let xattrs = file.xattrs.as_ref().unwrap();
+        assert!(xattrs.names.contains(&small_name));
+        assert!(xattrs.names.contains(&large_name));
+        assert_eq!(
+            xattrs
+                .inline_values
+                .iter()
+                .find(|value| value.name == small_name)
+                .unwrap()
+                .value,
+            b"0x20"
+        );
+        assert!(
+            xattrs
+                .inline_values
+                .iter()
+                .all(|value| value.name != large_name)
+        );
+
+        let nested = session
+            .directory_view(folder.node, DirectoryViewOptions::NATIVE)
+            .await
+            .unwrap();
+        assert_eq!(nested.directory.node, folder.node);
+        assert_eq!(nested.parent.node, ROOT_NODE);
     }
 
     #[cfg(unix)]

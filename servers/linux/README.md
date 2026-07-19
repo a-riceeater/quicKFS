@@ -16,6 +16,8 @@ RUST_LOG=info quickfs-server-daemon serve \
   --state-dir /var/lib/quickfs
 ```
 
+Protocol v6 clients require a v6 daemon (`quickfs/6` ALPN); upgrade and restart the server and clients together. Native directory views discover child metadata/xattrs concurrently beside the export. `--max-directory-entry-tasks` bounds that work globally and defaults to `64`.
+
 Create a one-time client pairing:
 
 ```sh

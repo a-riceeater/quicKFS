@@ -19,7 +19,12 @@ use std::{
     future::Future,
     io,
     os::unix::ffi::OsStrExt,
-    path::Path,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,6 +32,9 @@ const ATTRIBUTE_TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 4_096;
 const MAX_BACKGROUND_REQUESTS: u16 = 64;
 const CONGESTION_THRESHOLD: u16 = 48;
+const GRACEFUL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(3);
+const FORCE_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
+const UNMOUNT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(8);
 const DARWIN_IOCTL_INOUT: u32 = 0xc000_0000;
 
 const fn darwin_iowr(group: u8, number: u8, size: u32) -> u32 {
@@ -115,6 +123,7 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
     let mut session = fuser::Session::new(adapter, mountpoint, &fuser_config)?;
     eprintln!("quicKFS mount is ready at {}", mountpoint.display());
     let mut unmounter = session.unmount_callable();
+    let signal_mountpoint = mountpoint.to_path_buf();
     let (mut interrupt, mut terminate) = {
         let _runtime_guard = runtime.enter();
         (
@@ -122,31 +131,80 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
         )
     };
+    let unmount_complete = Arc::new(AtomicBool::new(false));
+    let signal_unmount_complete = Arc::clone(&unmount_complete);
     let signal_task = runtime.spawn(async move {
         tokio::select! {
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
         }
         eprintln!("Unmounting quicKFS...");
-        match tokio::task::spawn_blocking(move || unmounter.unmount()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("graceful unmount failed: {error}; forcing mount process exit");
+        let watchdog_mountpoint = signal_mountpoint.clone();
+        let watchdog_unmount_complete = Arc::clone(&signal_unmount_complete);
+        if let Err(error) = std::thread::Builder::new()
+            .name("quickfs-unmount-watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(UNMOUNT_WATCHDOG_TIMEOUT);
+                if watchdog_unmount_complete.load(Ordering::Acquire) {
+                    return;
+                }
+                eprintln!(
+                    "unmount did not finish within {} seconds; closing the mount process to detach {}",
+                    UNMOUNT_WATCHDOG_TIMEOUT.as_secs(),
+                    watchdog_mountpoint.display()
+                );
                 std::process::exit(130);
-            }
-            Err(error) => {
-                eprintln!("unmount worker failed: {error}; forcing mount process exit");
+            })
+        {
+            eprintln!("failed to start unmount watchdog: {error}; closing the mount process");
+            std::process::exit(130);
+        }
+        let graceful = tokio::task::spawn_blocking(move || unmounter.unmount());
+        let graceful = tokio::time::timeout(GRACEFUL_UNMOUNT_TIMEOUT, graceful).await;
+        if !matches!(graceful, Ok(Ok(Ok(())))) {
+            eprintln!("graceful unmount did not complete; forcing a local detach");
+            if let Err(error) = force_local_unmount(signal_mountpoint).await {
+                eprintln!("forced unmount failed: {error}; closing the mount process");
                 std::process::exit(130);
             }
         }
     });
     let result = session.run();
+    unmount_complete.store(true, Ordering::Release);
     signal_task.abort();
     match &result {
         Ok(()) => eprintln!("quicKFS mount session ended"),
         Err(error) => eprintln!("quicKFS mount session failed: {error}"),
     }
     result
+}
+
+async fn force_local_unmount(mountpoint: PathBuf) -> io::Result<()> {
+    let worker = tokio::task::spawn_blocking(move || {
+        let status = Command::new("/sbin/umount")
+            .arg("-f")
+            .arg(&mountpoint)
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        let status = Command::new("/usr/sbin/diskutil")
+            .arg("unmount")
+            .arg("force")
+            .arg(&mountpoint)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "local unmount commands exited with {status}"
+            )))
+        }
+    });
+    tokio::time::timeout(FORCE_UNMOUNT_TIMEOUT, worker)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "forced unmount timed out"))?
+        .map_err(io::Error::other)?
 }
 
 fn backend_mount_option(backend: MacFuseBackend) -> Option<MountOption> {

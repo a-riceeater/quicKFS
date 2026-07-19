@@ -12,9 +12,10 @@ use quickfs_cache::{
     RevisionKey,
 };
 use quickfs_protocol::{
-    AttributeChanges, DirectoryEntry, ErrorCode, FileAccess, FileHandle, FileLock, FileOpenOptions,
-    FilesystemCapabilities, FilesystemStats, Metadata, Name, NodeId, RenameMode, SafeIoctl,
-    SeekWhence, SpecialNodeKind, XattrSetMode,
+    AttributeChanges, DirectoryEntry, DirectoryView, DirectoryViewEntry, DirectoryViewOptions,
+    ErrorCode, FileAccess, FileHandle, FileLock, FileOpenOptions, FilesystemCapabilities,
+    FilesystemStats, Metadata, Name, NodeId, RenameMode, SafeIoctl, SeekWhence, SpecialNodeKind,
+    XattrSetMode,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -39,7 +40,7 @@ pub struct CachePolicy {
 impl Default for CachePolicy {
     fn default() -> Self {
         Self {
-            block_size: 1024 * 1024,
+            block_size: crate::MAX_CLIENT_READ_SIZE,
         }
     }
 }
@@ -62,6 +63,7 @@ pub struct CachedFilesystem {
     handles: RwLock<HashMap<FileHandle, CachedHandle>>,
     capabilities: RwLock<Option<FilesystemCapabilities>>,
     refreshing_directories: Arc<Mutex<HashSet<NodeId>>>,
+    range_fetches: Mutex<HashMap<RangeKey, Arc<Mutex<()>>>>,
 }
 
 impl CachedFilesystem {
@@ -83,6 +85,7 @@ impl CachedFilesystem {
             handles: RwLock::new(HashMap::new()),
             capabilities: RwLock::new(None),
             refreshing_directories: Arc::new(Mutex::new(HashSet::new())),
+            range_fetches: Mutex::new(HashMap::new()),
         })
     }
 
@@ -242,6 +245,59 @@ impl CachedFilesystem {
         Ok(blocks)
     }
 
+    async fn fetch_block(
+        &self,
+        inner_handle: FileHandle,
+        state: &CachedHandle,
+        block: RangeKey,
+    ) -> Result<Vec<u8>> {
+        let gate = {
+            let mut fetches = self.range_fetches.lock().await;
+            fetches
+                .entry(block)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let guard = gate.lock().await;
+        let result = async {
+            if let Some(data) = RangeCache::get(self.cache.as_ref(), block).await {
+                return Ok(data);
+            }
+            let read = self
+                .inner
+                .read_range_versioned(inner_handle, block.offset, block.length)
+                .await?;
+            if read.revision != state.revision {
+                return Err(ClientError::StaleRevision);
+            }
+            let actual =
+                u64::try_from(read.data.len()).map_err(|_| ClientError::UnexpectedResponse)?;
+            if actual > block.length {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            if actual > 0 {
+                let actual_key = RangeKey {
+                    length: actual,
+                    ..block
+                };
+                RangeCache::store_readthrough(self.cache.as_ref(), actual_key, read.data.clone())
+                    .await;
+            }
+            Ok(read.data)
+        }
+        .await;
+        drop(guard);
+        let mut fetches = self.range_fetches.lock().await;
+        if fetches
+            .get(&block)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &gate))
+            && Arc::strong_count(&gate) == 2
+        {
+            fetches.remove(&block);
+        }
+        result
+    }
+
     async fn update_handle(&self, logical: FileHandle, result: WriteResult) {
         if let Some(state) = self.handles.write().await.get_mut(&logical) {
             state.revision = result.revision;
@@ -329,6 +385,49 @@ impl RemoteFilesystem for CachedFilesystem {
                 Ok(snapshot)
             }
             Err(error) if is_offline(&error) => self.offline_directory(node).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_directory_view(
+        &self,
+        node: NodeId,
+        options: DirectoryViewOptions,
+    ) -> Result<DirectoryView> {
+        match self.inner.list_directory_view(node, options).await {
+            Ok(view) => {
+                let entries = view
+                    .entries
+                    .iter()
+                    .map(|entry| entry.entry.clone())
+                    .collect::<Vec<_>>();
+                let key = RevisionKey {
+                    node,
+                    revision: view.revision,
+                };
+                DirectoryCache::store_readthrough_snapshot(self.cache.as_ref(), key, entries).await;
+                self.cache_metadata(view.directory.clone()).await;
+                self.cache_metadata(view.parent.clone()).await;
+                Ok(view)
+            }
+            Err(error) if is_offline(&error) => {
+                let snapshot = self.offline_directory(node).await?;
+                let directory = self.cached_metadata(node).await?;
+                Ok(DirectoryView {
+                    revision: snapshot.revision,
+                    parent: directory.clone(),
+                    directory,
+                    xattrs: None,
+                    entries: snapshot
+                        .entries
+                        .into_iter()
+                        .map(|entry| DirectoryViewEntry {
+                            entry,
+                            xattrs: None,
+                        })
+                        .collect(),
+                })
+            }
             Err(error) => Err(error),
         }
     }
@@ -591,42 +690,38 @@ impl RemoteFilesystem for CachedFilesystem {
                 "read range overflows".into(),
             ));
         }
-        if let Some(data) = self.cached_range(&state, offset, length).await {
-            return Ok(RangeRead {
-                revision: state.revision,
-                data,
-            });
-        }
         let Some(inner_handle) = state.inner else {
-            return Err(ClientError::OfflineCacheMiss);
+            return self
+                .cached_range(&state, offset, length)
+                .await
+                .map(|data| RangeRead {
+                    revision: state.revision,
+                    data,
+                })
+                .ok_or(ClientError::OfflineCacheMiss);
         };
 
         let blocks = self.blocks_for(&state, offset, length)?;
-        let assembled = MemoryCache::default();
-        let mut missing = Vec::new();
-        for block in blocks {
-            if let Some(data) = RangeCache::get(self.cache.as_ref(), block).await {
-                RangeCache::insert(&assembled, block, data).await;
-            } else {
-                missing.push(block);
-            }
+        if blocks.is_empty() {
+            return Ok(RangeRead {
+                revision: state.revision,
+                data: Vec::new(),
+            });
         }
-        let reads = missing.iter().map(|block| {
-            let filesystem = self.inner.clone();
-            let block = *block;
-            async move {
-                filesystem
-                    .read_range_versioned(inner_handle, block.offset, block.length)
-                    .await
-                    .map(|read| (block, read))
-            }
-        });
+        let assembled = MemoryCache::default();
+        // Every block, including a cache lookup, passes through the per-block
+        // gate. Concurrent kernel read-ahead callbacks therefore share one
+        // persistent-cache verification or one network request instead of all
+        // hashing the same large block before they reach the fetch gate.
+        let reads = blocks
+            .iter()
+            .map(|block| async { (*block, self.fetch_block(inner_handle, &state, *block).await) });
         let mut offline_error = false;
-        for result in join_all(reads).await {
+        for (block, result) in join_all(reads).await {
             match result {
-                Ok((block, read)) if read.revision == state.revision => {
-                    let actual = u64::try_from(read.data.len())
-                        .map_err(|_| ClientError::UnexpectedResponse)?;
+                Ok(data) => {
+                    let actual =
+                        u64::try_from(data.len()).map_err(|_| ClientError::UnexpectedResponse)?;
                     if actual > block.length {
                         return Err(ClientError::UnexpectedResponse);
                     }
@@ -635,12 +730,9 @@ impl RemoteFilesystem for CachedFilesystem {
                             length: actual,
                             ..block
                         };
-                        RangeCache::insert(&assembled, actual_key, read.data.clone()).await;
-                        RangeCache::store_readthrough(self.cache.as_ref(), actual_key, read.data)
-                            .await;
+                        RangeCache::insert(&assembled, actual_key, data).await;
                     }
                 }
-                Ok(_) => return Err(ClientError::StaleRevision),
                 Err(error) if is_offline(&error) => offline_error = true,
                 Err(error) => return Err(error),
             }
@@ -915,6 +1007,7 @@ mod tests {
         metadata_reads: AtomicUsize,
         directory_reads: AtomicUsize,
         directory_delay_ms: AtomicU64,
+        read_delay_ms: AtomicU64,
         data: Vec<u8>,
     }
 
@@ -1038,6 +1131,10 @@ mod tests {
         ) -> Result<RangeRead> {
             self.check_online()?;
             self.reads.fetch_add(1, Ordering::SeqCst);
+            let delay_ms = self.read_delay_ms.load(Ordering::SeqCst);
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
             let start = usize::try_from(offset).unwrap();
             let end = usize::try_from(offset.saturating_add(length))
                 .unwrap()
@@ -1076,11 +1173,14 @@ mod tests {
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
             directory_delay_ms: AtomicU64::new(0),
+            read_delay_ms: AtomicU64::new(0),
             data: data.clone(),
         });
         let cache = Arc::new(MemoryCache::default());
-        let filesystem =
-            CachedFilesystem::new(inner.clone(), cache.clone(), CachePolicy::default()).unwrap();
+        let policy = CachePolicy {
+            block_size: 1024 * 1024,
+        };
+        let filesystem = CachedFilesystem::new(inner.clone(), cache.clone(), policy).unwrap();
 
         filesystem.get_metadata(ROOT_NODE).await.unwrap();
         filesystem.get_metadata(FILE_NODE).await.unwrap();
@@ -1101,7 +1201,7 @@ mod tests {
         assert_eq!(inner.reads.load(Ordering::SeqCst), 1);
 
         inner.offline.store(true, Ordering::SeqCst);
-        let offline = CachedFilesystem::new(inner.clone(), cache, CachePolicy::default()).unwrap();
+        let offline = CachedFilesystem::new(inner.clone(), cache, policy).unwrap();
         assert_eq!(offline.stat_filesystem().await.unwrap(), filesystem_stats());
         assert_eq!(offline.read_link(LINK_NODE).await.unwrap(), LINK_TARGET);
         assert_eq!(offline.list_directory(ROOT_NODE).await.unwrap().len(), 1);
@@ -1127,6 +1227,7 @@ mod tests {
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
             directory_delay_ms: AtomicU64::new(0),
+            read_delay_ms: AtomicU64::new(0),
             data: Vec::new(),
         });
         let filesystem = CachedFilesystem::new(
@@ -1159,5 +1260,35 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(inner.directory_reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_overlapping_reads_share_one_remote_block_fetch() {
+        let data = vec![0x5a; 2 * 1024 * 1024];
+        let inner = Arc::new(ToggleFilesystem {
+            offline: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
+            metadata_reads: AtomicUsize::new(0),
+            directory_reads: AtomicUsize::new(0),
+            directory_delay_ms: AtomicU64::new(0),
+            read_delay_ms: AtomicU64::new(50),
+            data,
+        });
+        let filesystem = CachedFilesystem::new(
+            inner.clone(),
+            Arc::new(MemoryCache::default()),
+            CachePolicy {
+                block_size: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
+        let (first, second) = tokio::join!(
+            filesystem.read_range(handle, 64, 4096),
+            filesystem.read_range(handle, 128, 4096)
+        );
+        assert_eq!(first.unwrap(), vec![0x5a; 4096]);
+        assert_eq!(second.unwrap(), vec![0x5a; 4096]);
+        assert_eq!(inner.reads.load(Ordering::SeqCst), 1);
     }
 }

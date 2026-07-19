@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-pub const DEFAULT_MAX_READ_SIZE: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_READ_SIZE: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_WRITE_SIZE: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -16,6 +16,8 @@ pub struct Limits {
     pub max_open_handles: usize,
     pub max_known_nodes: usize,
     pub max_total_known_nodes: usize,
+    /// Aggregate number of child metadata/xattr tasks used by directory views.
+    pub max_directory_entry_tasks: usize,
     pub request_timeout_ms: u64,
 }
 impl Default for Limits {
@@ -26,6 +28,7 @@ impl Default for Limits {
             max_open_handles: 1024,
             max_known_nodes: 8_192,
             max_total_known_nodes: 65_536,
+            max_directory_entry_tasks: 64,
             request_timeout_ms: 30_000,
         }
     }

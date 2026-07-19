@@ -4,7 +4,7 @@ use quickfs_protocol::{
     ALPN_PROTOCOL, CodecError, Envelope, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response,
     decode, encode,
 };
-use quinn::{Connection, Endpoint};
+use quinn::{Connection, Endpoint, TransportConfig, VarInt};
 pub use quinn::{RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -24,6 +24,12 @@ use zeroize::Zeroizing;
 pub const MAX_CERTIFICATE_BUNDLE_SIZE: u64 = 4 * 1024 * 1024;
 pub const MAX_PRIVATE_KEY_SIZE: u64 = 64 * 1024;
 const MAX_CERTIFICATES_PER_BUNDLE: usize = 4096;
+const FILESYSTEM_IDLE_TIMEOUT_MILLIS: u32 = 5 * 60 * 1_000;
+const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const STREAM_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
+const CONNECTION_RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
+const CONNECTION_SEND_WINDOW: u64 = 128 * 1024 * 1024;
+const SERVER_CONCURRENT_BIDI_STREAMS: u32 = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -139,10 +145,11 @@ impl QuicClient {
         timeout: Duration,
     ) -> Result<Self, TransportError> {
         crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
-        let config = quinn::ClientConfig::new(Arc::new(
+        let mut config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|error| TransportError::Tls(error.to_string()))?,
         ));
+        config.transport_config(filesystem_transport_config(true, false));
         let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))?;
         endpoint.set_default_client_config(config);
         let connecting = endpoint
@@ -357,8 +364,30 @@ pub fn server_endpoint(
     let crypto = server_crypto_config(certificates, key)?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
-    let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(filesystem_transport_config(false, true));
     Ok(Endpoint::server(config, bind)?)
+}
+
+fn filesystem_transport_config(
+    client_keep_alive: bool,
+    accept_filesystem_streams: bool,
+) -> Arc<TransportConfig> {
+    let mut config = TransportConfig::default();
+    config
+        .max_idle_timeout(Some(quinn::IdleTimeout::from(VarInt::from_u32(
+            FILESYSTEM_IDLE_TIMEOUT_MILLIS,
+        ))))
+        .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW))
+        .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
+        .send_window(CONNECTION_SEND_WINDOW);
+    if client_keep_alive {
+        config.keep_alive_interval(Some(CLIENT_KEEP_ALIVE_INTERVAL));
+    }
+    if accept_filesystem_streams {
+        config.max_concurrent_bidi_streams(VarInt::from_u32(SERVER_CONCURRENT_BIDI_STREAMS));
+    }
+    Arc::new(config)
 }
 
 /// Validate that a PEM-derived certificate chain and private key form a

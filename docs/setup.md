@@ -183,9 +183,11 @@ target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
   --username alice
 ```
 
-Enter the account password at the hidden prompt. The mount verifies the server before that prompt, reconnects and verifies it again before transmitting the password, then retains one shared Tokio runtime around an authenticated reconnecting filesystem and persistent read cache. Open `$HOME/Volumes/quickfs` in Finder. The volume is writable only when both the daemon and account gates above are enabled; otherwise it mounts read-only.
+Enter the account password at the hidden prompt. The mount verifies the server before that prompt, reconnects and verifies it again before transmitting the password, then retains one shared Tokio runtime around an authenticated reconnecting filesystem and persistent read cache. Protocol v6 loads a Finder directory with one enriched request carrying directory/parent metadata, all child metadata, complete xattr names, and bounded small xattr values. Open `$HOME/Volumes/quickfs` in Finder. The volume is writable only when both the daemon and account gates above are enabled; otherwise it mounts read-only.
 
-Keep the terminal process running. When finished, press Control+C there for a graceful unmount, or unmount from another terminal and allow `quickfs-mount` to exit:
+The v6 client negotiates the version-specific `quickfs/6` ALPN and cannot mount a v5 daemon. Upgrade/restart the server daemon and rebuild the CLI/mount from the same revision before testing the new directory pipeline. Certificate pins and user accounts remain valid when the server keeps the same state directory and TLS identity.
+
+Keep the terminal process running. When finished, press Control+C there to unmount. A graceful macFUSE unmount gets three seconds; if it stalls (including after server loss), `quickfs-mount` attempts a forced local detach. An independent watchdog exits the mount process after eight seconds if the macOS unmount call itself wedges, which releases the mount even with no live server. You can also unmount from another terminal and allow `quickfs-mount` to exit:
 
 ```sh
 umount "$HOME/Volumes/quickfs"

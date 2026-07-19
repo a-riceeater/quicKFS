@@ -80,15 +80,16 @@ quickfs-server-daemon serve [OPTIONS] --export-root <PATH>
 | `--bind <ADDRESS>` | `QUICKFS_BIND` | `0.0.0.0:4433` | UDP address on which QUIC listens. |
 | `--export-root <PATH>` | `QUICKFS_EXPORT_ROOT` | Required | Directory exposed as remote `/`. |
 | `--state-dir <PATH>` | `QUICKFS_STATE_DIR` | `.quickfs` | Identity, accounts, and pairing state. |
-| `--max-read-size <BYTES>` | — | `8388608` | Largest permitted ranged read. |
+| `--max-read-size <BYTES>` | — | `16777216` | Largest permitted ranged read. |
 | `--allow-writes` | `QUICKFS_ALLOW_WRITES` | Off | Enable the export-wide write gate; an account write grant is also required. |
 | `--max-write-size <BYTES>` | — | `8388608` | Largest raw write/xattr payload. |
 | `--max-open-handles <COUNT>` | — | `1024` | Maximum tracked open files. |
 | `--max-known-nodes-per-connection <COUNT>` | — | `8192` | Maximum node IDs retained by one connection, including the root. |
 | `--max-total-known-nodes <COUNT>` | — | `65536` | Global budget for retained non-root node IDs across connections. |
+| `--max-directory-entry-tasks <COUNT>` | — | `64` | Global worker bound for concurrent child metadata/xattr discovery. |
 | `--request-timeout-ms <MS>` | — | `30000` | Full request timeout, including frame I/O and filesystem work. |
 | `--max-concurrent-requests <COUNT>` | — | `128` | Global request concurrency bound. |
-| `--max-in-flight-read-bytes <BYTES>` | — | `67108864` | Global memory budget reserved by concurrent raw reads. |
+| `--max-in-flight-read-bytes <BYTES>` | — | `134217728` | Global memory budget reserved by concurrent raw reads. |
 | `--max-in-flight-write-bytes <BYTES>` | — | `67108864` | Global raw-write memory budget. |
 | `--max-in-flight-write-bytes-per-connection <BYTES>` | — | `16777216` | Per-connection raw-write memory budget. |
 | `--max-concurrent-connections <COUNT>` | — | `256` | Global accepted-connection bound. |
@@ -234,7 +235,7 @@ target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
   --username alice
 ```
 
-The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, and keeps one shared Tokio runtime around an authenticated reconnecting `RemoteFilesystem`. Finder and media applications can use ordinary read/write namespace operations, xattrs/resource forks, hardlinks, locks, random byte ranges, sparse seek, volume rename, and backup time. Server-side copy, `readdirplus`, and `exchangedata` callbacks are capability-gated because current macFUSE/macOS combinations do not necessarily expose those optional messages; see [filesystem semantics](filesystem-semantics.md). Press Control+C in the mount terminal for a graceful unmount, or unmount from another terminal:
+The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, and keeps one shared Tokio runtime around an authenticated reconnecting `RemoteFilesystem`. Protocol v6 publishes each directory from one enriched request containing directory/parent metadata, all child metadata, complete xattr names, and bounded small xattr values; Finder's follow-up probes are served locally. Finder and media applications can use ordinary read/write namespace operations, xattrs/resource forks, hardlinks, locks, random byte ranges, sparse seek, volume rename, and backup time. Server-side copy, `readdirplus`, and `exchangedata` callbacks are capability-gated because current macFUSE/macOS combinations do not necessarily expose those optional messages; see [filesystem semantics](filesystem-semantics.md). Press Control+C in the mount terminal to unmount. Graceful macFUSE unmount gets three seconds before forced local detach starts; an independent watchdog terminates the mount process at eight seconds if a macOS unmount syscall wedges, so server availability is not part of unmount:
 
 ```sh
 umount "$HOME/Volumes/quickfs"
@@ -248,7 +249,7 @@ umount "$HOME/Volumes/quickfs"
 | `--username <NAME>` | `QUICKFS_USERNAME` | Required | Account used to authenticate the retained session. |
 | `--cache-dir <PATH>` | `QUICKFS_CACHE_DIR` | Client state directory | Private persistent offline-read cache. |
 | `--cache-max-bytes <BYTES>` | `QUICKFS_CACHE_MAX_BYTES` | `21474836480` | Hard payload budget for the persistent cache. |
-| `--cache-block-kib <KiB>` | — | `1024` | Read-through block size. |
+| `--cache-block-kib <KiB>` | — | `16384` | Read-ahead block size, clamped to the negotiated server/client read limit. |
 | `--timeout-ms <MS>` | — | `10000` | Connection and transport-operation timeout. |
 | `--callback-timeout-ms <MS>` | — | `45000` | Maximum time a macFUSE callback waits for its remote operation. |
 | `--reconnect-attempts <COUNT>` | — | `3` | Bounded authenticated reconnect attempts. |

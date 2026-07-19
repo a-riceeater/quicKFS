@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub const PROTOCOL_VERSION: u16 = 5;
-pub const ALPN_PROTOCOL: &[u8] = b"quickfs/5";
+pub const PROTOCOL_VERSION: u16 = 6;
+pub const ALPN_PROTOCOL: &[u8] = b"quickfs/6";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const MAX_DIRECTORY_INLINE_XATTR_SIZE: u32 = 4 * 1024;
+pub const MAX_DIRECTORY_INLINE_XATTR_TOTAL_SIZE: u32 = 256 * 1024;
 pub const ROOT_NODE: NodeId = NodeId(Uuid::from_u128(0));
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -321,6 +323,12 @@ pub enum Request {
     ListDirectory {
         node: NodeId,
     },
+    /// Return the complete information needed to publish one native directory
+    /// view without a metadata/xattr request per child.
+    ListDirectoryView {
+        node: NodeId,
+        options: DirectoryViewOptions,
+    },
     OpenFile {
         node: NodeId,
         options: FileOpenOptions,
@@ -501,6 +509,7 @@ pub enum Response {
         revision: DirectoryRevision,
         entries: Vec<DirectoryEntry>,
     },
+    DirectoryView(DirectoryView),
     FileOpened {
         handle: FileHandle,
         revision: FileRevision,
@@ -606,6 +615,67 @@ pub struct DirectoryEntry {
     pub kind: NodeKind,
     pub metadata: Metadata,
 }
+
+/// Controls the bounded optional data attached to an enriched directory
+/// response. Xattr names are either complete or omitted for a node; values
+/// larger than `inline_xattr_size` remain available through `GetXattr`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryViewOptions {
+    pub include_xattrs: bool,
+    pub inline_xattr_size: u32,
+    pub inline_xattr_total_size: u32,
+}
+
+impl DirectoryViewOptions {
+    pub const NATIVE: Self = Self {
+        include_xattrs: true,
+        inline_xattr_size: MAX_DIRECTORY_INLINE_XATTR_SIZE,
+        inline_xattr_total_size: MAX_DIRECTORY_INLINE_XATTR_TOTAL_SIZE,
+    };
+
+    pub const METADATA_ONLY: Self = Self {
+        include_xattrs: false,
+        inline_xattr_size: 0,
+        inline_xattr_total_size: 0,
+    };
+}
+
+impl Default for DirectoryViewOptions {
+    fn default() -> Self {
+        Self::METADATA_ONLY
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InlineXattr {
+    pub name: Name,
+    pub value: Vec<u8>,
+}
+
+/// A complete xattr name snapshot plus the small values the server could fit
+/// within the request's explicit budgets.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XattrSnapshot {
+    pub names: Vec<Name>,
+    pub inline_values: Vec<InlineXattr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryViewEntry {
+    pub entry: DirectoryEntry,
+    /// `None` means xattrs were not requested or are unsupported for this node.
+    /// `Some` always contains the complete name set.
+    pub xattrs: Option<XattrSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryView {
+    pub revision: DirectoryRevision,
+    pub directory: Metadata,
+    pub parent: Metadata,
+    pub xattrs: Option<XattrSnapshot>,
+    pub entries: Vec<DirectoryViewEntry>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
     File,
@@ -689,6 +759,23 @@ mod tests {
         let m = Envelope::new(Request::Ping { nonce: 42 });
         let b = encode(&m).unwrap();
         assert_eq!(decode_request(&b).unwrap(), m);
+    }
+
+    #[test]
+    fn enriched_directory_request_round_trips_with_bounded_options() {
+        let request = Envelope::new(Request::ListDirectoryView {
+            node: ROOT_NODE,
+            options: DirectoryViewOptions::NATIVE,
+        });
+        assert_eq!(decode_request(&encode(&request).unwrap()).unwrap(), request);
+        assert_eq!(
+            DirectoryViewOptions::NATIVE.inline_xattr_size,
+            MAX_DIRECTORY_INLINE_XATTR_SIZE
+        );
+        assert_eq!(
+            DirectoryViewOptions::NATIVE.inline_xattr_total_size,
+            MAX_DIRECTORY_INLINE_XATTR_TOTAL_SIZE
+        );
     }
     #[test]
     fn rejects_version() {

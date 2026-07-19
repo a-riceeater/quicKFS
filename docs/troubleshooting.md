@@ -131,9 +131,33 @@ ls -ld /srv/project-share
 ls -l /srv/project-share/example.txt
 ```
 
+## Finder or `ls` takes many seconds to show a directory
+
+Protocol v6 uses one `ListDirectoryView` request for a native directory. That response includes the directory/parent metadata, all child metadata, complete xattr names, and bounded small xattr values. macFUSE then serves Finder's `lookup`, `getattr`, `listxattr`, negative xattr probes, and common small xattr reads locally. There should not be a second wave of one network xattr request per child.
+
+First verify the server daemon and mount were rebuilt from the same v6 revision. A v6 binary negotiates `quickfs/6`; it does not silently fall back to the old v5 pipeline. Restarting only the client is insufficient because the enriched response and parallel scan are implemented by the server.
+
+Compare a direct list with the mount using the exact same endpoint, server name, state directory, and account:
+
+```sh
+time target/debug/quickfs-client-cli \
+  --server 192.0.2.10:4433 \
+  --server-name files.example.net \
+  --state-dir .quickfs-client \
+  --username alice list /
+
+time ls -la "$HOME/Volumes/quickfs"
+```
+
+If both are slow on the first access, the backing filesystem is spending time in directory enumeration/child metadata I/O. v6 schedules that work concurrently beside the storage; `--max-directory-entry-tasks` defaults to `64` and is a bounded tuning knob for the server. Raising it can hurt a saturated rotational array, so measure before changing it. If the direct v6 list is fast but the cold mount is slow, confirm the mount is actually talking to the upgraded daemon and capture its foreground diagnostics; increasing `--callback-timeout-ms` only hides the symptom.
+
+Repeated access within the adapter's directory TTL and overlapping reads should be local cache hits. Concurrent cold callbacks for the same directory and concurrent overlapping reads are single-flighted rather than duplicated. The client sends a transport keepalive every 10 seconds and permits five idle minutes, so a pause after roughly 30 seconds of inactivity indicates an old client binary or a different network timeout rather than expected v6 behavior.
+
 ## A ranged read fails
 
-The default maximum request is 8 MiB (`8388608` bytes). Use a smaller `--length` or deliberately adjust the server's `--max-read-size`.
+The default maximum read request is 16 MiB (`16777216` bytes); writes remain 8 MiB. Use a smaller `--length` or deliberately adjust the server's `--max-read-size`.
+
+The persistent cache has a bounded 256 MiB process-local hot range tier. Concurrent reads of one aligned block share its persistent lookup or remote fetch, and subsequent small slices should not reread or SHA-256-check the whole block. If repeated reads remain CPU-bound, confirm `quickfs-mount` was rebuilt from the same source revision and that Cargo selected the optimized `sha2` assembly feature.
 
 Offsets and lengths are unsigned byte counts. Reads beyond EOF return fewer bytes rather than padding the response.
 
@@ -162,10 +186,16 @@ If Cargo reports that `fuse.pc` is missing, first confirm that the macFUSE insta
 
 Use an existing empty directory as the mountpoint and keep the foreground process running. If authentication fails, verify the mount uses the same `--server`, `--server-name`, and `--state-dir` as the successful CLI command. The pin/CA policy is checked before the password is requested and again before it is sent.
 
-Press Control+C in the mount terminal for a graceful unmount, or unmount from another terminal:
+Press Control+C in the mount terminal to unmount, or unmount from another terminal:
 
 ```sh
 umount "$HOME/Volumes/quickfs"
+```
+
+Unmount is local and does not require a live server. If macFUSE's graceful unmount does not finish within three seconds, `quickfs-mount` runs a forced local detach. A separate eight-second watchdog exits the process even if the operating-system unmount call wedges; closing the macFUSE process releases the volume. If an older/stale mount process predates that fix, force it manually on macOS:
+
+```sh
+diskutil unmount force "$HOME/Volumes/quickfs"
 ```
 
 The mount performs bounded single-flight reconnect and accepts only the same persisted server epoch. Revision-matched handles are reopened and their locks replayed; an ambiguous mutation is never retried. Previously cached reads can continue after a disconnect, but cache misses and all mutations fail closed. A mount cannot cold-start while the server is offline. If reconnect reports an epoch/revision conflict, restore the intended server state or unmount/remount rather than bypassing the stale-state check. Use `quickfs-client-cli` to isolate trust/authentication or remote filesystem problems without creating a mount.

@@ -7,7 +7,7 @@ use quickfs_protocol::{DirectoryEntry, FilesystemStats, Metadata, NodeId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -24,6 +24,7 @@ const MAX_MANIFEST_ENTRIES: usize = 100_000;
 const MAX_NAMESPACE_COMPONENT_LENGTH: usize = 1_024;
 const MANIFEST_FILE: &str = "manifest.json";
 const LOCK_FILE: &str = ".cache.lock";
+const DEFAULT_HOT_RANGE_BYTES: usize = 256 * 1024 * 1024;
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -315,9 +316,113 @@ pub struct PersistentCache {
 pub struct NonBlockingPersistentCache {
     inner: Arc<PersistentCache>,
     writer: mpsc::Sender<PersistentWrite>,
+    memory: Arc<MemoryCache>,
+    hot_ranges: Arc<HotRangeCache>,
+}
+
+struct HotRangeCache {
+    maximum_bytes: usize,
+    state: Mutex<HotRangeState>,
+}
+
+#[derive(Default)]
+struct HotRangeState {
+    entries: HashMap<RangeKey, Vec<u8>>,
+    least_recently_used: VecDeque<RangeKey>,
+    bytes: usize,
 }
 
 type PersistentWrite = Box<dyn FnOnce(&PersistentCache) + Send + 'static>;
+
+impl HotRangeCache {
+    fn new(maximum_bytes: usize) -> Self {
+        Self {
+            maximum_bytes,
+            state: Mutex::new(HotRangeState::default()),
+        }
+    }
+
+    fn get(&self, key: RangeKey) -> Option<Vec<u8>> {
+        let request_end = key.offset.checked_add(key.length)?;
+        if key.length == 0 {
+            return Some(Vec::new());
+        }
+        let output_capacity = usize::try_from(key.length).ok()?;
+        let mut state = self.state.lock().ok()?;
+        let mut output = Vec::with_capacity(output_capacity);
+        let mut used = Vec::new();
+        let mut position = key.offset;
+        while position < request_end {
+            let (candidate, candidate_end) = state
+                .entries
+                .keys()
+                .filter_map(|candidate| {
+                    let end = candidate.offset.checked_add(candidate.length)?;
+                    (candidate.file == key.file && candidate.offset <= position && end > position)
+                        .then_some((*candidate, end))
+                })
+                .max_by_key(|(_, end)| *end)?;
+            let data = state.entries.get(&candidate)?;
+            let copy_end = candidate_end.min(request_end);
+            let start = usize::try_from(position.checked_sub(candidate.offset)?).ok()?;
+            let end = usize::try_from(copy_end.checked_sub(candidate.offset)?).ok()?;
+            output.extend_from_slice(data.get(start..end)?);
+            used.push(candidate);
+            position = copy_end;
+        }
+        for used_key in used.into_iter().collect::<HashSet<_>>() {
+            state
+                .least_recently_used
+                .retain(|candidate| *candidate != used_key);
+            state.least_recently_used.push_back(used_key);
+        }
+        Some(output)
+    }
+
+    fn insert(&self, key: RangeKey, value: Vec<u8>) {
+        if !valid_range_payload(key, &value) || value.is_empty() || value.len() > self.maximum_bytes
+        {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(previous) = state.entries.remove(&key) {
+            state.bytes = state.bytes.saturating_sub(previous.len());
+        }
+        state
+            .least_recently_used
+            .retain(|candidate| *candidate != key);
+        state.bytes = state.bytes.saturating_add(value.len());
+        state.entries.insert(key, value);
+        state.least_recently_used.push_back(key);
+        while state.bytes > self.maximum_bytes {
+            let Some(evicted) = state.least_recently_used.pop_front() else {
+                break;
+            };
+            if let Some(value) = state.entries.remove(&evicted) {
+                state.bytes = state.bytes.saturating_sub(value.len());
+            }
+        }
+    }
+
+    fn invalidate(&self, node: NodeId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let removed_bytes = state
+            .entries
+            .iter()
+            .filter(|(key, _)| key.file.node == node)
+            .map(|(_, value)| value.len())
+            .sum::<usize>();
+        state.entries.retain(|key, _| key.file.node != node);
+        state.bytes = state.bytes.saturating_sub(removed_bytes);
+        state
+            .least_recently_used
+            .retain(|key| key.file.node != node);
+    }
+}
 
 impl NonBlockingPersistentCache {
     pub fn open(
@@ -339,7 +444,15 @@ impl NonBlockingPersistentCache {
                     write(&worker_cache);
                 }
             })?;
-        Ok(Self { inner, writer })
+        let hot_range_bytes =
+            usize::try_from(maximum_payload_bytes.min(DEFAULT_HOT_RANGE_BYTES as u64))
+                .map_err(|_| CacheError::InvalidSizeLimit)?;
+        Ok(Self {
+            inner,
+            writer,
+            memory: Arc::new(MemoryCache::default()),
+            hot_ranges: Arc::new(HotRangeCache::new(hot_range_bytes)),
+        })
     }
 
     pub fn namespace(&self) -> &CacheNamespace {
@@ -520,6 +633,48 @@ impl PersistentCache {
         };
         touch_entries(&mut state, &assembled.used_keys);
         Ok(Some(assembled.data))
+    }
+
+    fn get_covering_range_value(
+        &self,
+        key: RangeKey,
+    ) -> Result<Option<(RangeKey, Vec<u8>)>, CacheError> {
+        let request_end = key
+            .offset
+            .checked_add(key.length)
+            .ok_or(CacheError::InvalidRange)?;
+        if key.length == 0 {
+            return Ok(Some((key, Vec::new())));
+        }
+        if key.length > self.maximum_payload_bytes {
+            return Ok(None);
+        }
+        let mut state = self.lock_state()?;
+        let candidate = state
+            .entries
+            .iter()
+            .filter_map(|(entry_key, entry)| {
+                let EntryKey::Range(range) = entry_key else {
+                    return None;
+                };
+                let range_end = range.offset.checked_add(range.length)?;
+                (range.file == key.file && range.offset <= key.offset && range_end >= request_end)
+                    .then_some((*range, entry_key.clone(), entry.clone()))
+            })
+            .min_by_key(|(range, _, _)| range.length);
+        let Some((range, entry_key, entry)) = candidate else {
+            return Ok(None);
+        };
+        let data = match self.read_disk_entry(&entry) {
+            Ok(data) if valid_range_payload(range, &data) => data,
+            Ok(_) | Err(CacheError::CorruptEntry) => {
+                self.remove_keys_locked(&mut state, std::slice::from_ref(&entry_key))?;
+                return Err(CacheError::CorruptEntry);
+            }
+            Err(error) => return Err(error),
+        };
+        touch_entries(&mut state, std::slice::from_ref(&entry_key));
+        Ok(Some((range, data)))
     }
 
     pub fn insert_range_value(&self, key: RangeKey, value: &[u8]) -> Result<(), CacheError> {
@@ -900,14 +1055,23 @@ impl FilesystemStateCache for PersistentCache {
 #[async_trait]
 impl MetadataCache for NonBlockingPersistentCache {
     async fn get(&self, node: NodeId) -> Option<Metadata> {
+        if let Some(value) = MetadataCache::get(self.memory.as_ref(), node).await {
+            return Some(value);
+        }
         let cache = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || cache.get_metadata_value(node).ok().flatten())
-            .await
-            .ok()
-            .flatten()
+        let value =
+            tokio::task::spawn_blocking(move || cache.get_metadata_value(node).ok().flatten())
+                .await
+                .ok()
+                .flatten();
+        if let Some(value) = &value {
+            MetadataCache::insert(self.memory.as_ref(), value.clone()).await;
+        }
+        value
     }
 
     async fn insert(&self, value: Metadata) {
+        MetadataCache::insert(self.memory.as_ref(), value.clone()).await;
         self.enqueue_and_wait(move |cache| {
             let _ = cache.insert_metadata_value(value);
         })
@@ -915,12 +1079,14 @@ impl MetadataCache for NonBlockingPersistentCache {
     }
 
     async fn store_readthrough(&self, value: Metadata) {
+        MetadataCache::insert(self.memory.as_ref(), value.clone()).await;
         self.enqueue(move |cache| {
             let _ = cache.insert_metadata_value(value);
         });
     }
 
     async fn invalidate(&self, node: NodeId) {
+        MetadataCache::invalidate(self.memory.as_ref(), node).await;
         self.enqueue_and_wait(move |cache| {
             let _ = cache.invalidate_metadata(node);
         })
@@ -931,14 +1097,24 @@ impl MetadataCache for NonBlockingPersistentCache {
 #[async_trait]
 impl DirectoryCache for NonBlockingPersistentCache {
     async fn get(&self, key: RevisionKey) -> Option<Vec<DirectoryEntry>> {
+        if let Some(value) = DirectoryCache::get(self.memory.as_ref(), key).await {
+            return Some(value);
+        }
         let cache = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || cache.get_directory_value(key).ok().flatten())
-            .await
-            .ok()
-            .flatten()
+        let value =
+            tokio::task::spawn_blocking(move || cache.get_directory_value(key).ok().flatten())
+                .await
+                .ok()
+                .flatten();
+        if let Some(value) = &value {
+            DirectoryCache::store_readthrough_snapshot(self.memory.as_ref(), key, value.clone())
+                .await;
+        }
+        value
     }
 
     async fn insert(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
+        DirectoryCache::insert(self.memory.as_ref(), key, value.clone()).await;
         self.enqueue_and_wait(move |cache| {
             let _ = cache.insert_directory_value(key, &value);
         })
@@ -946,12 +1122,14 @@ impl DirectoryCache for NonBlockingPersistentCache {
     }
 
     async fn store_readthrough_snapshot(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
+        DirectoryCache::store_readthrough_snapshot(self.memory.as_ref(), key, value.clone()).await;
         self.enqueue(move |cache| {
             let _ = cache.insert_directory_snapshot_value(key, &value);
         });
     }
 
     async fn invalidate(&self, node: NodeId) {
+        DirectoryCache::invalidate(self.memory.as_ref(), node).await;
         self.enqueue_and_wait(move |cache| {
             let _ = cache.invalidate_directories(node);
         })
@@ -962,14 +1140,30 @@ impl DirectoryCache for NonBlockingPersistentCache {
 #[async_trait]
 impl RangeCache for NonBlockingPersistentCache {
     async fn get(&self, key: RangeKey) -> Option<Vec<u8>> {
+        if let Some(value) = self.hot_ranges.get(key) {
+            return Some(value);
+        }
         let cache = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || cache.get_range_value(key).ok().flatten())
+        let loaded =
+            tokio::task::spawn_blocking(move || match cache.get_covering_range_value(key) {
+                Ok(Some(value)) => Some(value),
+                Ok(None) => cache
+                    .get_range_value(key)
+                    .ok()
+                    .flatten()
+                    .map(|value| (key, value)),
+                Err(_) => None,
+            })
             .await
             .ok()
-            .flatten()
+            .flatten();
+        let (loaded_key, value) = loaded?;
+        self.hot_ranges.insert(loaded_key, value);
+        self.hot_ranges.get(key)
     }
 
     async fn insert(&self, key: RangeKey, value: Vec<u8>) {
+        self.hot_ranges.insert(key, value.clone());
         self.enqueue_and_wait(move |cache| {
             let _ = cache.insert_range_value(key, &value);
         })
@@ -977,12 +1171,14 @@ impl RangeCache for NonBlockingPersistentCache {
     }
 
     async fn store_readthrough(&self, key: RangeKey, value: Vec<u8>) {
+        self.hot_ranges.insert(key, value.clone());
         self.enqueue(move |cache| {
             let _ = cache.insert_range_value(key, &value);
         });
     }
 
     async fn invalidate(&self, node: NodeId) {
+        self.hot_ranges.invalidate(node);
         self.enqueue_and_wait(move |cache| {
             let _ = cache.invalidate_ranges(node);
         })
@@ -993,14 +1189,23 @@ impl RangeCache for NonBlockingPersistentCache {
 #[async_trait]
 impl FilesystemStateCache for NonBlockingPersistentCache {
     async fn get_filesystem_stats(&self) -> Option<FilesystemStats> {
+        if let Some(value) = self.memory.get_filesystem_stats().await {
+            return Some(value);
+        }
         let cache = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || cache.get_filesystem_stats_value().ok().flatten())
-            .await
-            .ok()
-            .flatten()
+        let value =
+            tokio::task::spawn_blocking(move || cache.get_filesystem_stats_value().ok().flatten())
+                .await
+                .ok()
+                .flatten();
+        if let Some(value) = value {
+            self.memory.insert_filesystem_stats(value).await;
+        }
+        value
     }
 
     async fn insert_filesystem_stats(&self, value: FilesystemStats) {
+        self.memory.insert_filesystem_stats(value).await;
         self.enqueue_and_wait(move |cache| {
             let _ = cache.insert_filesystem_stats_value(value);
         })
@@ -1008,6 +1213,7 @@ impl FilesystemStateCache for NonBlockingPersistentCache {
     }
 
     async fn store_readthrough_filesystem_stats(&self, value: FilesystemStats) {
+        self.memory.insert_filesystem_stats(value).await;
         self.enqueue(move |cache| {
             let _ = cache.insert_filesystem_stats_value(value);
         });
@@ -1428,6 +1634,50 @@ mod tests {
         );
         assert!(RangeCache::get(&cache, range(8, 2, 4)).await.is_none());
         assert!(RangeCache::get(&cache, range(7, 3, 6)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn nonblocking_persistent_cache_keeps_large_blocks_in_a_bounded_hot_tier() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = NonBlockingPersistentCache::open(
+            temporary.path().join("cache"),
+            namespace(10, "alice"),
+            1_024,
+        )
+        .unwrap();
+        let block = range(7, 0, 16);
+        RangeCache::insert(&cache, block, b"0123456789abcdef".to_vec()).await;
+
+        cache.hot_ranges.state.lock().unwrap().entries.clear();
+        cache
+            .hot_ranges
+            .state
+            .lock()
+            .unwrap()
+            .least_recently_used
+            .clear();
+        cache.hot_ranges.state.lock().unwrap().bytes = 0;
+
+        assert_eq!(
+            RangeCache::get(&cache, range(7, 2, 2)).await.unwrap(),
+            b"23"
+        );
+        cache.inner.invalidate_ranges(block.file.node).unwrap();
+        assert_eq!(
+            RangeCache::get(&cache, range(7, 10, 3)).await.unwrap(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn hot_range_tier_evicts_least_recently_used_blocks_to_its_byte_budget() {
+        let cache = HotRangeCache::new(8);
+        cache.insert(range(3, 0, 6), b"abcdef".to_vec());
+        cache.insert(range(3, 6, 6), b"ghijkl".to_vec());
+
+        assert!(cache.get(range(3, 0, 1)).is_none());
+        assert_eq!(cache.get(range(3, 7, 2)).unwrap(), b"hi");
+        assert!(cache.state.lock().unwrap().bytes <= 8);
     }
 
     #[test]

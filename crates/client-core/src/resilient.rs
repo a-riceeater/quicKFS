@@ -7,9 +7,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use quickfs_protocol::{
-    AttributeChanges, DirectoryEntry, FileHandle, FileLock, FileOpenOptions,
-    FilesystemCapabilities, FilesystemStats, LockKind, Metadata, Name, NodeId, RenameMode,
-    SafeIoctl, SeekWhence, SpecialNodeKind, XattrSetMode,
+    AttributeChanges, DirectoryEntry, DirectoryView, DirectoryViewOptions, FileHandle, FileLock,
+    FileOpenOptions, FilesystemCapabilities, FilesystemStats, LockKind, Metadata, Name, NodeId,
+    RenameMode, SafeIoctl, SeekWhence, SpecialNodeKind, XattrSetMode,
 };
 use std::{
     collections::HashMap,
@@ -441,6 +441,17 @@ impl RemoteFilesystem for ResilientFilesystem {
         self.safe_call(
             move |filesystem| async move { filesystem.list_directory_snapshot(node).await },
         )
+        .await
+    }
+
+    async fn list_directory_view(
+        &self,
+        node: NodeId,
+        options: DirectoryViewOptions,
+    ) -> Result<DirectoryView> {
+        self.safe_call(move |filesystem| async move {
+            filesystem.list_directory_view(node, options).await
+        })
         .await
     }
 
