@@ -108,6 +108,23 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
         MountOption::FSName(config.filesystem_name.clone()),
         MountOption::Subtype("quickfs".into()),
         MountOption::CUSTOM(format!("volname={volume_name}")),
+        // Store extended attributes in AppleDouble (`._name`) sidecars that
+        // macFUSE manages, instead of forwarding every xattr natively. This is
+        // required for `cp`/Finder to copy files carrying `com.apple.quarantine`
+        // (anything downloaded from the internet). macOS propagates quarantine
+        // through the Quarantine framework's `qtn_file_apply_to_fd`, which macFUSE
+        // rejects with EINVAL in-kernel on a native-xattr volume without ever
+        // dispatching a setxattr the filesystem could satisfy; `cp` then aborts
+        // with "fcopyfile failed: Invalid argument". Under `auto_xattr` macFUSE
+        // absorbs the quarantine into the sidecar and the copy succeeds.
+        //
+        // The trade-off is that `auto_xattr` makes macFUSE look up a `._name`
+        // sidecar per file, ~doubling the inodes the kernel references during a
+        // crawl. That is why the server's per-connection node ceiling is sized
+        // generously (see docs/protocol.md and the daemon's
+        // --max-known-nodes-per-connection flag): an undersized ceiling would
+        // surface here as directory listings failing with "too many known nodes".
+        MountOption::CUSTOM("auto_xattr".into()),
     ]);
     if !capabilities.supports_special_nodes {
         fuser_config.mount_options.push(MountOption::NoDev);

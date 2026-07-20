@@ -174,9 +174,18 @@ struct Serve {
     max_write_size: u64,
     #[arg(long, default_value_t = 1024)]
     max_open_handles: usize,
-    #[arg(long, default_value_t = 8_192)]
+    // The per-connection ceiling on distinct inodes one client may reference at
+    // once (its live working set), not a limit on files in the export. macOS
+    // keeps a large kernel vnode cache, so a Finder/Spotlight/`find` crawl over
+    // a big media library legitimately holds tens of thousands of live inodes on
+    // a single mount, and `auto_xattr` roughly doubles that by tracking `._`
+    // AppleDouble sidecars. 8192 (the historical default) was sized for small
+    // exports and starved such workloads with "too many known nodes". The
+    // semaphore backing this is counter-based, so a higher ceiling costs nothing
+    // until nodes are actually tracked (~400-500 bytes each). See docs/protocol.md.
+    #[arg(long, default_value_t = 131_072)]
     max_known_nodes_per_connection: usize,
-    #[arg(long, default_value_t = 65_536)]
+    #[arg(long, default_value_t = 524_288)]
     max_total_known_nodes: usize,
     /// Aggregate metadata/xattr workers used across directory requests.
     #[arg(long, default_value_t = 64)]

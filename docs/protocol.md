@@ -22,6 +22,31 @@ The Linux server performs child stat/xattr work concurrently beside the export u
 
 The macFUSE adapter single-flights concurrent cold requests for the same directory, populates inode, metadata, complete xattr-name, xattr-size, and inline-value caches from the response, and then answers Finder's `readdir`, `lookup`, `getattr`, `listxattr`, negative xattr probes, and common small `getxattr` calls locally. Child metadata and the directory view share a 30-second lifetime; expiring children earlier would recreate the per-child metadata fan-out this request replaces. `ListDirectory` remains the lighter diagnostic/path-resolution request used by the CLI.
 
+## Node identity and per-connection limits
+
+A *node* is the server's opaque, stable UUID for one file or directory (§ above). The server keeps a **node registry** mapping each node to its backing file identity (device + inode) and known path(s). A node becomes *known* to a connection the moment the client references it — a `Lookup`, a `GetMetadata`, or, most significantly, an enriched `ListDirectoryView`, which registers **one node per child entry** in a single request.
+
+Two bounds cap how many nodes may be known at once. Both are semaphore counters, so a high ceiling costs nothing until nodes are actually tracked:
+
+- **`--max-known-nodes-per-connection`** — the ceiling on the *live working set* of one mounted client: how many distinct inodes it may reference simultaneously. This is the limit a client actually hits.
+- **`--max-total-known-nodes`** — the ceiling across all connections. Must be at least one connection's worth.
+
+This is **not** a limit on how many files an export may contain (that is unbounded) — it bounds the *live* set a single client holds at one instant. Its purpose is memory/DoS protection: without it, a buggy or hostile client could look up nodes without ever forgetting them and grow the registry until the daemon exhausts memory.
+
+**Lifecycle.** Referencing a node takes one per-connection permit and one global permit. When the macOS kernel evicts an inode from its vnode cache it issues `Forget`; the adapter batches these into `ForgetNodes`, and the server releases the per-connection permit immediately. When a connection drops, its session releases every permit it held. Global registry entries whose reference count reaches zero are *retained as a cache* — so a reconnect keeps stable node IDs — and are evicted lazily (least-recently-found) only when the global pool is under pressure. So a client's working set falls right after a `Forget` or disconnect, while total daemon memory is a bounded cache that trends toward its high-water mark and is reclaimed on demand. Each tracked node costs roughly 400–500 bytes across the registry and per-connection maps.
+
+**Why the default is 131072 / 524288.** macOS keeps a large kernel vnode cache (`kern.maxvnodes` is typically 100k–300k), so a Finder browse, Spotlight index, or recursive `find` over a large media library legitimately holds tens of thousands of live inodes on a single mount. The macFUSE mount also runs with `auto_xattr` (extended attributes stored in AppleDouble `._name` sidecars, required so `cp`/Finder can copy quarantined downloads — see [filesystem-semantics.md](filesystem-semantics.md)), which makes the kernel look up a `._name` node per file and roughly **doubles** the working set during a crawl. The historical `8192 / 65536` defaults were sized for small exports and starved these workloads: the client surfaces exhaustion as `opendir`/`readdir` failing with *"too many known nodes"* (delivered as `ErrorCode::TooLarge`, which the mount maps to `EFBIG` / "File too large").
+
+**Suggested limits by environment.** The rule of thumb is ~0.5 KB per node — so `131072` per connection is ~64 MiB worst case (only if fully saturated; real usage tracks the live set and is usually far lower).
+
+| Environment | `--max-known-nodes-per-connection` | `--max-total-known-nodes` | Notes |
+| --- | --- | --- | --- |
+| Small/personal export, light browsing | `65536` | `131072` | Lower RAM ceiling; fine if you never crawl huge trees. |
+| **Media library, Finder + Spotlight, `auto_xattr` (default)** | **`131072`** | **`524288`** | Headroom for large crawls with sidecar doubling; ≈64 MiB / ≈256 MiB worst case. |
+| Multi-user server, many concurrent mounts | `131072` | `per-conn × expected concurrent clients` | Size total to real concurrency and watch daemon RSS. |
+
+Both are plain daemon flags, so a running server can be retuned by restarting it with new values — no client change and no protocol change. A separate limit governs the *single-directory* case: because one enriched directory view must fit the 1 MiB control frame, a directory with more than roughly ten thousand entries cannot be projected in one response even with xattrs stripped, independent of the node ceiling.
+
 ## Raw I/O and server-side work
 
 `ReadRange` and `GetXattr` return a control response followed by exactly the advertised raw byte count. `WriteRange` and `SetXattr` send a bounded raw body after their request frame. The default read range is 16 MiB and the default write range is 8 MiB. In-flight read byte permits queue under the overall request timeout instead of failing a valid burst merely because another read is active.

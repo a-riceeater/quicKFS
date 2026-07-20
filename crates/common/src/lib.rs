@@ -26,8 +26,14 @@ impl Default for Limits {
             max_read_size: DEFAULT_MAX_READ_SIZE,
             max_write_size: DEFAULT_MAX_WRITE_SIZE,
             max_open_handles: 1024,
-            max_known_nodes: 8_192,
-            max_total_known_nodes: 65_536,
+            // Per-connection live working set of referenced inodes, not a file
+            // count. Sized for macOS media-library crawls (large kernel vnode
+            // caches, `auto_xattr` `._` sidecars). Counter-based semaphore, so a
+            // high ceiling only costs memory as nodes are actually tracked
+            // (~400-500 bytes each). See docs/protocol.md and the daemon flags
+            // --max-known-nodes-per-connection / --max-total-known-nodes.
+            max_known_nodes: 131_072,
+            max_total_known_nodes: 524_288,
             max_directory_entry_tasks: 64,
             request_timeout_ms: 30_000,
         }
