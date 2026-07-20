@@ -198,6 +198,12 @@ impl CachedFilesystem {
         NodeCacheInvalidation::invalidate_node_state(self.cache.as_ref(), node).await;
     }
 
+    /// In-memory-only node invalidation for the streaming write hot path. See
+    /// `NodeCacheInvalidation::invalidate_node_memory`.
+    async fn invalidate_node_memory(&self, node: NodeId) {
+        NodeCacheInvalidation::invalidate_node_memory(self.cache.as_ref(), node).await;
+    }
+
     async fn offline_directory(&self, node: NodeId) -> Result<DirectorySnapshot> {
         let metadata = self.cached_metadata(node).await?;
         let key = RevisionKey {
@@ -568,7 +574,7 @@ impl RemoteFilesystem for CachedFilesystem {
     ) -> Result<CreatedFile> {
         let created = self.inner.create_file(parent, name, mode, options).await?;
         self.invalidate_node(parent).await;
-        MetadataCache::insert(self.cache.as_ref(), created.metadata.clone()).await;
+        MetadataCache::store_readthrough(self.cache.as_ref(), created.metadata.clone()).await;
         let opened = self
             .remember_handle(
                 created.metadata.node,
@@ -587,7 +593,7 @@ impl RemoteFilesystem for CachedFilesystem {
     async fn create_directory(&self, parent: NodeId, name: Name, mode: u32) -> Result<Metadata> {
         let metadata = self.inner.create_directory(parent, name, mode).await?;
         self.invalidate_node(parent).await;
-        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        MetadataCache::store_readthrough(self.cache.as_ref(), metadata.clone()).await;
         self.directory_parents
             .write()
             .await
@@ -604,9 +610,9 @@ impl RemoteFilesystem for CachedFilesystem {
         let cached_target = target.clone();
         let metadata = self.inner.create_symlink(parent, name, target).await?;
         self.invalidate_node(parent).await;
-        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        MetadataCache::store_readthrough(self.cache.as_ref(), metadata.clone()).await;
         if u64::try_from(cached_target.len()).ok() == Some(metadata.size) {
-            RangeCache::insert(
+            RangeCache::store_readthrough(
                 self.cache.as_ref(),
                 RangeKey {
                     file: RevisionKey {
@@ -635,7 +641,7 @@ impl RemoteFilesystem for CachedFilesystem {
             .await?;
         self.invalidate_node(node).await;
         self.invalidate_node(new_parent).await;
-        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        MetadataCache::store_readthrough(self.cache.as_ref(), metadata.clone()).await;
         Ok(metadata)
     }
 
@@ -653,7 +659,7 @@ impl RemoteFilesystem for CachedFilesystem {
             .create_special_node(parent, name, kind, mode, device_major, device_minor)
             .await?;
         self.invalidate_node(parent).await;
-        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        MetadataCache::store_readthrough(self.cache.as_ref(), metadata.clone()).await;
         Ok(metadata)
     }
 
@@ -788,7 +794,7 @@ impl RemoteFilesystem for CachedFilesystem {
         let mapped = state.as_ref().map(require_online_handle).transpose()?;
         let metadata = self.inner.set_attributes(node, mapped, changes).await?;
         self.invalidate_node(node).await;
-        MetadataCache::insert(self.cache.as_ref(), metadata.clone()).await;
+        MetadataCache::store_readthrough(self.cache.as_ref(), metadata.clone()).await;
         if let Some(logical) = handle
             && let Some(state) = self.handles.write().await.get_mut(&logical)
         {
@@ -902,29 +908,15 @@ impl RemoteFilesystem for CachedFilesystem {
         let _mutation = state.mutation.lock().await;
         let inner_handle = require_online_handle(&state)?;
         let result = self.inner.write_range(inner_handle, offset, data).await?;
-        self.invalidate_node(state.node).await;
+        // Invalidate only the volatile in-memory projections. A media copy is
+        // delivered by the kernel as thousands of small FUSE writes; doing any
+        // durable per-chunk cache work (a range insert or a manifest
+        // invalidation) floods the single cache-writer thread and its backlog
+        // later stalls unrelated durable operations. Written ranges are also
+        // revision-orphaned by the next chunk, so persisting them is pure churn;
+        // a later read repopulates the cache through the read fill path.
+        self.invalidate_node_memory(state.node).await;
         self.update_handle(handle, result).await;
-        if result.written > 0 {
-            let written =
-                usize::try_from(result.written).map_err(|_| ClientError::UnexpectedResponse)?;
-            let payload = data
-                .get(..written)
-                .ok_or(ClientError::UnexpectedResponse)?
-                .to_vec();
-            RangeCache::insert(
-                self.cache.as_ref(),
-                RangeKey {
-                    file: RevisionKey {
-                        node: state.node,
-                        revision: result.revision,
-                    },
-                    offset,
-                    length: result.written,
-                },
-                payload,
-            )
-            .await;
-        }
         Ok(result)
     }
 

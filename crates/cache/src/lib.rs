@@ -178,6 +178,18 @@ pub trait FilesystemStateCache: Send + Sync {
 #[async_trait]
 pub trait NodeCacheInvalidation: Send + Sync {
     async fn invalidate_node_state(&self, node: NodeId);
+
+    /// Invalidate only the volatile in-memory projections of a node, never the
+    /// durable manifest. Correctness for online reads depends only on the
+    /// in-memory caches; durable range/directory entries are revision-keyed, so
+    /// a stale on-disk entry is never served for a newer revision and is
+    /// eventually reclaimed by LRU or refreshed on the next read. The streaming
+    /// write path uses this so a 40 MiB copy does not enqueue thousands of
+    /// per-chunk manifest transactions on the single cache-writer thread, whose
+    /// backlog would otherwise stall later durable operations.
+    async fn invalidate_node_memory(&self, node: NodeId) {
+        self.invalidate_node_state(node).await;
+    }
 }
 
 #[derive(Default)]
@@ -1325,12 +1337,24 @@ impl FilesystemStateCache for NonBlockingPersistentCache {
 #[async_trait]
 impl NodeCacheInvalidation for NonBlockingPersistentCache {
     async fn invalidate_node_state(&self, node: NodeId) {
+        // The in-memory and hot-range caches are invalidated synchronously, so
+        // online reads after a mutation never observe stale data. The durable
+        // manifest eviction only reclaims space and preserves offline coherence
+        // for revision-keyed entries, so enqueue it fire-and-forget: awaiting a
+        // manifest fsync here made every low-volume mutation pay one durable
+        // sync (~30 ms each on APFS). Enqueued work still runs in order on the
+        // writer thread. High-frequency callers (streaming writes) must use
+        // `invalidate_node_memory` instead to avoid flooding that queue.
         NodeCacheInvalidation::invalidate_node_state(self.memory.as_ref(), node).await;
         self.hot_ranges.invalidate(node);
-        self.enqueue_and_wait(move |cache| {
+        self.enqueue(move |cache| {
             let _ = cache.invalidate_node(node);
-        })
-        .await;
+        });
+    }
+
+    async fn invalidate_node_memory(&self, node: NodeId) {
+        NodeCacheInvalidation::invalidate_node_state(self.memory.as_ref(), node).await;
+        self.hot_ranges.invalidate(node);
     }
 }
 

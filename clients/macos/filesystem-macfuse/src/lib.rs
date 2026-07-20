@@ -154,6 +154,25 @@ struct FileHandleRecord {
     size: u64,
 }
 
+/// Coalesced not-yet-transmitted bytes for one write handle. macFUSE delivers a
+/// streaming copy as thousands of small (~16 KiB) `write` callbacks; buffering
+/// contiguous runs into one large `write_range` collapses the request count so
+/// throughput is no longer bounded by per-request latency on a high-latency
+/// link. The buffer is flushed before any operation that must observe the
+/// server's view of the file (read, seek, flush/fsync, close, truncate,
+/// preallocation, or a server-side copy), so read-after-write stays coherent.
+struct PendingWrite {
+    inode: u64,
+    start: u64,
+    buffer: Vec<u8>,
+}
+
+impl PendingWrite {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.buffer.len() as u64)
+    }
+}
+
 #[derive(Clone)]
 struct DirectoryHandleRecord {
     inode: u64,
@@ -189,6 +208,7 @@ struct AdapterState {
     capabilities: Mutex<Option<FilesystemCapabilities>>,
     inodes: Mutex<InodeTable>,
     handles: Mutex<HashMap<u64, FileHandleRecord>>,
+    pending_writes: Mutex<HashMap<u64, PendingWrite>>,
     handle_operations: Mutex<HashMap<u64, Arc<AsyncRwLock<()>>>>,
     directory_operations: Mutex<HashMap<NodeId, Arc<AsyncMutex<()>>>>,
     directory_handles: Mutex<HashMap<u64, DirectoryHandleRecord>>,
@@ -252,6 +272,7 @@ impl Adapter {
                     lookups: HashMap::from([(ROOT_INODE, u64::MAX)]),
                 }),
                 handles: Mutex::new(HashMap::new()),
+                pending_writes: Mutex::new(HashMap::new()),
                 handle_operations: Mutex::new(HashMap::new()),
                 directory_operations: Mutex::new(HashMap::new()),
                 directory_handles: Mutex::new(HashMap::new()),
@@ -367,16 +388,29 @@ impl Adapter {
 
     pub(crate) async fn getattr_async(&self, inode: u64) -> Result<Metadata, AdapterError> {
         let record = self.inode_record(inode)?;
-        if let Some(metadata) = self.cached_metadata(record.node)? {
-            return Ok(metadata);
+        let mut metadata = match self.cached_metadata(record.node)? {
+            Some(metadata) => metadata,
+            None => {
+                self.execute(async {
+                    let metadata = self.state.remote.get_metadata(record.node).await?;
+                    validate_metadata(record.node, &metadata)?;
+                    self.remember_metadata(metadata.clone())?;
+                    Ok(metadata)
+                })
+                .await?
+            }
+        };
+        // Coalesced writes have not reached the server yet, so the server's size
+        // lags. Report the buffered high-water mark so a `stat` right after a
+        // write sees the size the client already accepted. The cached/persisted
+        // metadata keeps the server's real size; only the returned value is
+        // adjusted, and it collapses back once the buffer is flushed.
+        if let Some(end) = self.pending_end_for_inode(inode)
+            && end > metadata.size
+        {
+            metadata.size = end;
         }
-        self.execute(async {
-            let metadata = self.state.remote.get_metadata(record.node).await?;
-            validate_metadata(record.node, &metadata)?;
-            self.remember_metadata(metadata.clone())?;
-            Ok(metadata)
-        })
-        .await
+        Ok(metadata)
     }
 
     pub(crate) async fn readdir_async(&self, inode: u64) -> Result<DirectoryListing, AdapterError> {
@@ -775,6 +809,14 @@ impl Adapter {
             Some(operation) => Some(operation.write().await),
             None => None,
         };
+        // A truncate (or any attribute change) must be applied on top of every
+        // byte already accepted from the client, so flush the coalescing buffer
+        // for this node before the server mutates it.
+        match handle {
+            Some(handle) => self.flush_pending(handle).await?,
+            None if changes.size.is_some() => self.flush_pending_for_inode(inode).await?,
+            None => {}
+        }
         let remote_handle = match handle {
             Some(handle) => {
                 let opened = self.file_handle(handle)?;
@@ -812,6 +854,15 @@ impl Adapter {
     ) -> Result<Vec<u8>, AdapterError> {
         validate_io_range(offset, length)?;
         let operation = self.file_operation(handle)?;
+        // Read-your-own-writes: only when this handle actually has buffered bytes
+        // do we take the exclusive guard to flush them; otherwise reads stay
+        // fully concurrent (the common media path). The check-then-flush gap only
+        // matters for a concurrent overlapping write, which POSIX leaves
+        // unordered anyway.
+        if self.has_pending(handle) {
+            let _flush_guard = operation.write().await;
+            self.flush_pending(handle).await?;
+        }
         let _operation_guard = operation.read().await;
         let opened = self.file_handle(handle)?;
         if !opened.access.can_read() {
@@ -877,11 +928,85 @@ impl Adapter {
         if !opened.access.can_write() {
             return Err(AdapterError::InvalidAccess);
         }
+        let threshold = capabilities.max_write_size.min(MAX_CLIENT_WRITE_SIZE);
+        if threshold == 0 {
+            return Err(AdapterError::InvalidCapabilities);
+        }
+        // Coalesce a contiguous run of small writes into the per-handle buffer.
+        // The FUSE reply reports every byte accepted; the bytes are transmitted
+        // when the buffer fills, a non-contiguous write arrives, or an operation
+        // that must see the server's view flushes it (`flush_pending`).
+        let mut to_flush: Option<(u64, Vec<u8>)> = None;
+        let appended = {
+            let mut pending = self
+                .state
+                .pending_writes
+                .lock()
+                .map_err(|_| AdapterError::StateUnavailable)?;
+            let can_append = pending.get(&handle).is_some_and(|existing| {
+                existing.end() == offset
+                    && (existing.buffer.len() as u64).saturating_add(length) <= threshold
+            });
+            if can_append {
+                pending
+                    .get_mut(&handle)
+                    .ok_or(AdapterError::UnknownHandle)?
+                    .buffer
+                    .extend_from_slice(data);
+                true
+            } else {
+                if let Some(removed) = pending.remove(&handle) {
+                    to_flush = Some((removed.start, removed.buffer));
+                }
+                false
+            }
+        };
+        if appended {
+            return Ok(length);
+        }
+        if let Some((start, buffer)) = to_flush {
+            self.write_through(handle, start, &buffer).await?;
+        }
+        if length < threshold {
+            self.state
+                .pending_writes
+                .lock()
+                .map_err(|_| AdapterError::StateUnavailable)?
+                .insert(
+                    handle,
+                    PendingWrite {
+                        inode: opened.inode,
+                        start: offset,
+                        buffer: data.to_vec(),
+                    },
+                );
+        } else {
+            self.write_through(handle, offset, data).await?;
+        }
+        Ok(length)
+    }
+
+    /// Transmit `data` at `offset` for `handle` immediately, chunked to the
+    /// negotiated write limit. The caller must already hold the handle's
+    /// exclusive operation guard. Used both to flush the coalescing buffer and
+    /// to send writes that are individually at or above the buffer threshold.
+    async fn write_through(
+        &self,
+        handle: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), AdapterError> {
+        let length = data.len() as u64;
+        if length == 0 {
+            return Ok(());
+        }
+        let opened = self.file_handle(handle)?;
+        let capabilities = self.capabilities_async().await?;
         let chunk_limit = capabilities.max_write_size.min(MAX_CLIENT_WRITE_SIZE);
         if chunk_limit == 0 {
             return Err(AdapterError::InvalidCapabilities);
         }
-        let (written, revision, size) = self
+        let (revision, size) = self
             .execute(async {
                 let mut written = 0_u64;
                 let mut position = offset;
@@ -909,13 +1034,78 @@ impl Adapter {
                     revision = result.revision;
                     size = result.size;
                 }
-                Ok((written, revision, size))
+                Ok((revision, size))
             })
             .await?;
         self.update_file_handle(handle, revision, size)?;
         let node = self.inode_record(opened.inode)?.node;
         self.invalidate_node_views(node)?;
-        Ok(written)
+        Ok(())
+    }
+
+    /// Flush any coalesced bytes for `handle` to the server. The caller must
+    /// hold the handle's exclusive operation guard so the flush is ordered with
+    /// concurrent writes; the buffer is removed atomically so racing flushers do
+    /// not double-transmit.
+    async fn flush_pending(&self, handle: u64) -> Result<(), AdapterError> {
+        let pending = self
+            .state
+            .pending_writes
+            .lock()
+            .map_err(|_| AdapterError::StateUnavailable)?
+            .remove(&handle);
+        if let Some(pending) = pending {
+            self.write_through(handle, pending.start, &pending.buffer)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether `handle` currently has any coalesced, not-yet-transmitted bytes.
+    fn has_pending(&self, handle: u64) -> bool {
+        self.state
+            .pending_writes
+            .lock()
+            .map(|pending| pending.contains_key(&handle))
+            .unwrap_or(false)
+    }
+
+    /// Flush coalesced bytes for every open write handle on `inode`. Used by
+    /// path-based operations (a handle-less truncate) that have no single handle
+    /// to flush. Best-effort ordering only: it does not hold each handle's guard,
+    /// which is acceptable because a path mutation racing a live buffered writer
+    /// on the same file is already unordered.
+    async fn flush_pending_for_inode(&self, inode: u64) -> Result<(), AdapterError> {
+        let handles: Vec<u64> = {
+            let pending = self
+                .state
+                .pending_writes
+                .lock()
+                .map_err(|_| AdapterError::StateUnavailable)?;
+            pending
+                .iter()
+                .filter(|(_, buffered)| buffered.inode == inode)
+                .map(|(handle, _)| *handle)
+                .collect()
+        };
+        for handle in handles {
+            self.flush_pending(handle).await?;
+        }
+        Ok(())
+    }
+
+    /// Largest byte offset covered by a still-buffered write for `inode`, if
+    /// any. `getattr` reports this so a `stat` immediately after a buffered
+    /// write observes the correct size before the bytes reach the server.
+    fn pending_end_for_inode(&self, inode: u64) -> Option<u64> {
+        self.state
+            .pending_writes
+            .lock()
+            .ok()?
+            .values()
+            .filter(|pending| pending.inode == inode)
+            .map(PendingWrite::end)
+            .max()
     }
 
     pub(crate) async fn flush_async(
@@ -925,6 +1115,7 @@ impl Adapter {
     ) -> Result<(), AdapterError> {
         let operation = self.file_operation(handle)?;
         let _operation_guard = operation.write().await;
+        self.flush_pending(handle).await?;
         let opened = self.file_handle(handle)?;
         self.execute(async {
             self.state
@@ -943,6 +1134,7 @@ impl Adapter {
     ) -> Result<(), AdapterError> {
         let operation = self.file_operation(handle)?;
         let _operation_guard = operation.write().await;
+        self.flush_pending(handle).await?;
         let opened = self.file_handle(handle)?;
         self.execute(async {
             self.state
@@ -989,6 +1181,8 @@ impl Adapter {
         if !opened.access.can_write() {
             return Err(AdapterError::InvalidAccess);
         }
+        self.flush_pending(handle).await?;
+        let opened = self.file_handle(handle)?;
         let result = self
             .execute(async {
                 Ok(self
@@ -1037,6 +1231,15 @@ impl Adapter {
         } else {
             Some(second.write().await)
         };
+        // The server copies from its own bytes, so both sides must be flushed:
+        // the source so the copied range is current, the destination so the
+        // copy lands after any writes the client already accepted.
+        self.flush_pending(input_handle).await?;
+        if input_handle != output_handle {
+            self.flush_pending(output_handle).await?;
+        }
+        let input = self.file_handle(input_handle)?;
+        let output = self.file_handle(output_handle)?;
         let result = self
             .execute(async {
                 let result = self
@@ -1072,6 +1275,12 @@ impl Adapter {
         if !capabilities.supports_seek_data_hole {
             return Err(AdapterError::Unsupported);
         }
+        // SEEK_DATA/SEEK_HOLE are answered from the server's data map, so any
+        // buffered writes must reach the server first or a hole/data boundary
+        // would be reported for bytes the client already accepted.
+        let operation = self.file_operation(handle)?;
+        let _operation_guard = operation.write().await;
+        self.flush_pending(handle).await?;
         let opened = self.file_handle(handle)?;
         self.execute(async {
             Ok(self
@@ -1449,6 +1658,11 @@ impl Adapter {
     ) -> Result<(), AdapterError> {
         let operation = self.file_operation(handle)?;
         let _operation_guard = operation.write().await;
+        // Transmit any coalesced bytes before closing. If this fails the handle
+        // is still closed below so the remote descriptor is not leaked, but the
+        // error is surfaced to the caller (close/last-flush is the sanctioned
+        // point for a deferred write error to appear).
+        let pending_result = self.flush_pending(handle).await;
         let opened = self.take_file_handle(handle)?;
         let flush_result = if flush {
             self.execute(async {
@@ -1462,6 +1676,7 @@ impl Adapter {
         } else {
             Ok(())
         };
+        let flush_result = pending_result.and(flush_result);
         let close_result = self
             .execute(async {
                 self.state.remote.close_file(opened.remote).await?;
@@ -2196,6 +2411,12 @@ impl Adapter {
             .map_err(|_| AdapterError::StateUnavailable)?;
         let record = handles.remove(&handle).ok_or(AdapterError::UnknownHandle)?;
         operations.remove(&handle);
+        // Defensive: a correctly-closed handle is already flushed in
+        // `release_async`. Drop any residue so a reused handle id never inherits
+        // stale buffered bytes.
+        if let Ok(mut pending) = self.state.pending_writes.lock() {
+            pending.remove(&handle);
+        }
         Ok(record)
     }
 

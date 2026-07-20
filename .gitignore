@@ -8,3 +8,4 @@
 /clients/macos/client-gui/node_modules/
 /clients/macos/client-gui/dist/
 /clients/macos/client-gui/src-tauri/gen/schemas/
+.claude

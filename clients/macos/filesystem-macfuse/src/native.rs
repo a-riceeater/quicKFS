@@ -112,6 +112,15 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
     if !capabilities.supports_special_nodes {
         fuser_config.mount_options.push(MountOption::NoDev);
     }
+    // macFUSE's kernel daemon timeout (default 60s) force-unmounts the volume
+    // if any callback outruns it. The adapter's own callback deadline is longer
+    // and replies with an error rather than dropping the reply, so give the
+    // kernel a strictly larger budget; otherwise a slow cold RAID scan or read
+    // is ejected mid-flight and the volume "disconnects".
+    let daemon_timeout = macfuse_daemon_timeout_secs(adapter.callback_timeout());
+    fuser_config.mount_options.push(MountOption::CUSTOM(format!(
+        "daemon_timeout={daemon_timeout}"
+    )));
     if let Some(option) = backend_mount_option(config.backend) {
         fuser_config.mount_options.push(option);
     }
@@ -205,6 +214,19 @@ async fn force_local_unmount(mountpoint: PathBuf) -> io::Result<()> {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "forced unmount timed out"))?
         .map_err(io::Error::other)?
+}
+
+/// macFUSE accepts a daemon timeout in whole seconds within roughly 0..=600.
+/// Give the kernel a margin above the adapter's callback deadline so the
+/// adapter always wins the race and replies with a real error code instead of
+/// being force-unmounted mid-callback.
+fn macfuse_daemon_timeout_secs(callback_timeout: Duration) -> u64 {
+    const MACFUSE_MAX_DAEMON_TIMEOUT: u64 = 600;
+    const MARGIN: u64 = 15;
+    callback_timeout
+        .as_secs()
+        .saturating_add(MARGIN)
+        .clamp(30, MACFUSE_MAX_DAEMON_TIMEOUT)
 }
 
 fn backend_mount_option(backend: MacFuseBackend) -> Option<MountOption> {
@@ -318,7 +340,14 @@ impl Filesystem for Adapter {
     }
 
     fn forget(&self, _request: &Request, inode: INodeNo, nlookup: u64) {
-        let _ = self.forget_inode(u64::from(inode), nlookup);
+        // forget has no reply. Evicting an inode scans the handle and directory
+        // maps, so run it off the single macFUSE receive-loop thread; otherwise
+        // Finder's bursty forget/batch_forget traffic during a crawl stalls the
+        // one reader and later requests never get dispatched.
+        let adapter = self.clone();
+        self.spawn_callback(async move {
+            let _ = adapter.forget_inode(u64::from(inode), nlookup);
+        });
     }
 
     fn batch_forget(&self, _request: &Request, nodes: &[ForgetOne]) {
@@ -326,7 +355,10 @@ impl Filesystem for Adapter {
             .iter()
             .map(|node| (u64::from(node.nodeid()), node.nlookup()))
             .collect::<Vec<_>>();
-        let _ = self.forget_inodes(&requests);
+        let adapter = self.clone();
+        self.spawn_callback(async move {
+            let _ = adapter.forget_inodes(&requests);
+        });
     }
 
     fn getattr(
