@@ -82,8 +82,22 @@ mod macos {
         )]
         cache_max_bytes: u64,
         /// Read-ahead block size for overlapping and unaligned random reads.
+        /// This is also the speculative sequential read-ahead fetch granularity;
+        /// a smaller block trades more requests for finer pipelining on a fat,
+        /// high-latency link.
         #[arg(long, default_value_t = 16_384)]
         cache_block_kib: u64,
+        /// Ceiling on in-flight speculative read-ahead bytes for the whole
+        /// mount. The adaptive prefetch window self-tunes below this to each
+        /// link's bandwidth-delay product; raise it on a fat high-latency link,
+        /// set 0 to disable speculative read-ahead. Kept under the server's
+        /// in-flight read budget by default.
+        #[arg(
+            long,
+            env = "QUICKFS_READ_AHEAD_MAX_BYTES",
+            default_value_t = 64 * 1024 * 1024_u64
+        )]
+        read_ahead_max_bytes: u64,
         /// Maximum idle wait for one transport phase. Cold RAID directory
         /// scans and 16 MiB reads can legitimately exceed ten seconds.
         #[arg(long, default_value_t = 60_000)]
@@ -210,6 +224,7 @@ mod macos {
             cache,
             CachePolicy {
                 block_size: cache_block_size,
+                read_ahead_max_bytes: cli.read_ahead_max_bytes,
             },
         )
         .context("failed to configure the filesystem cache")?;
