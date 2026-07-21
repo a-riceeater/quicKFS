@@ -133,10 +133,20 @@ about HTTP.
   batching aside, and speculative opens still cost one RTT each. A compound
   request (pipeline N ops in one frame) would cut RTTs on cold crawls over
   WAN.
-- **[P2] Frame compression.** Directory views and metadata are highly
-  compressible (repeated names, xattr keys). Optional per-frame compression
-  (e.g., zstd) would shrink the 1 MiB-bound directory frames and speed cold
-  crawls — interacts with §2 pagination (compress *then* fit).
+- **[DONE — protocol v8] [P2] Frame compression.** Directory views and metadata
+  are highly compressible (repeated names, xattr keys). **Resolved** with
+  optional per-frame zstd compression: the four-byte frame length prefix gained a
+  high-bit `FRAME_COMPRESSED_FLAG`; a body at/above a 1 KiB threshold is
+  compressed only when it shrinks (so tiny/incompressible frames are never
+  enlarged), and the receiver bounds decompression output to `MAX_FRAME_SIZE`
+  (bomb guard). It runs *after* postcard encoding and directory-view chunk
+  packing, so the frame limit and chunk budget still measure the uncompressed
+  size (compress *then* fit) and §2 paging is unchanged. Measured ≈7× on a
+  realistic media-library directory view. *Where landed:* `crates/protocol`
+  (`encode_frame`/`parse_frame_header`/`decode_frame` + constants),
+  `crates/transport-quic` `write_frame`/`read_frame`, daemon
+  `write_frame_parts`. Client-core is unchanged — compression is transparent
+  below it.
 - **[P2] Formal protocol specification.** `docs/protocol.md` exists but a
   versioned wire spec (frame layout, every `Request`/`Response` variant,
   error taxonomy, capability flags) would make the flag-day/negotiation work
