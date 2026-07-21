@@ -14,6 +14,11 @@ Priority tags: **[P0]** correctness / users hit it today · **[P1]** important,
 not yet painful · **[P2]** hardening / nice-to-have. "Where" points at the
 code that would change.
 
+Completion: an item that has shipped is prefixed **[DONE]** (with the landing
+detail, e.g. `[DONE — protocol v7]`) and its original priority tag is kept in
+the text so the history stays legible. Everything without **[DONE]** is still
+outstanding.
+
 ---
 
 ## 0. Transport reality check: it is *not* HTTP/2, and HTTP/3 is not the upgrade
@@ -93,7 +98,7 @@ about HTTP.
 
 ## 2. Protocol surface & framing
 
-- **[DONE — protocol v7] Directory pagination.** `MAX_FRAME_SIZE = 1 MiB` used
+- **[DONE — protocol v7] [P0] Directory pagination.** `MAX_FRAME_SIZE = 1 MiB` used
   to cap one response frame, so a single directory with more than ~10k entries
   could not be projected in one `DirectoryView` even after inline
   xattrs/snapshots were stripped (`fit_directory_view_response` → `TooLarge` →
@@ -346,8 +351,9 @@ above are prerequisites and should land first.
 
 ## Suggested sequencing
 
-1. **§1 connection wedge + demand-path ceiling** and **§2 directory
-   pagination** — the two things that bite real usage today.
+1. **§1 connection wedge + demand-path ceiling** and ~~**§2 directory
+   pagination**~~ **[DONE — protocol v7]** — the two things that bite real usage
+   today.
 2. **§2 server-push + version negotiation** — unblocks §3 cross-client
    coherence and §6 live revocation, and ends the flag-day upgrade pain.
 3. **§6 security review + §10 telemetry + §11 CI** — the release-readiness
