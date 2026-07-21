@@ -8,6 +8,39 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
+    // `QUICKFS_FUSE_DEBUG=1` streams every FUSE request the kernel dispatches
+    // (and each error reply) to stderr via the `log` records `fuser` already
+    // emits. This is the only visibility into a mount the kernel is talking
+    // to, so keep it available in release binaries for field diagnosis.
+    struct StderrLogger {
+        started: std::time::Instant,
+    }
+    impl log::Log for StderrLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.target().starts_with("fuser")
+        }
+        fn log(&self, record: &log::Record) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let elapsed = self.started.elapsed();
+            eprintln!(
+                "[{:>10.3} {} {}] {}",
+                elapsed.as_secs_f64() * 1000.0,
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+        fn flush(&self) {}
+    }
+    if std::env::var_os("QUICKFS_FUSE_DEBUG").is_some() {
+        let logger = Box::leak(Box::new(StderrLogger {
+            started: std::time::Instant::now(),
+        }));
+        let _ = log::set_logger(logger);
+        log::set_max_level(log::LevelFilter::Debug);
+    }
     macos::run()
 }
 

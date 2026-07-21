@@ -20,7 +20,7 @@ use std::{
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -31,6 +31,13 @@ use tokio::{
 use unicode_normalization::UnicodeNormalization;
 
 pub const ROOT_INODE: u64 = 1;
+
+/// How long one fetched `FilesystemStats` answers subsequent statfs
+/// callbacks. Keeps the volume-registration probes and macOS's periodic
+/// statfs pollers (Finder, storage management) at memory speed instead of
+/// one network round trip per call; statfs carries no coherence contract,
+/// and one second matches the attribute TTL the mount already reports.
+const FILESYSTEM_STATS_TTL: Duration = Duration::from_secs(1);
 
 /// fuser allocates a 16 MiB receive buffer on macOS. Individual protocol
 /// transfers remain bounded by the negotiated client/server limit and are
@@ -152,6 +159,11 @@ struct FileHandleRecord {
     access: FileAccess,
     revision: u64,
     size: u64,
+    /// Whether a POSIX byte-range lock was ever acquired through this
+    /// handle. Releasing locks is the only remote-observable effect a
+    /// flush/close of a read-only handle can have, so lock-free read-only
+    /// handles skip the remote flush and close in the background.
+    used_locks: bool,
 }
 
 /// Coalesced not-yet-transmitted bytes for one write handle. macFUSE delivers a
@@ -176,7 +188,7 @@ impl PendingWrite {
 #[derive(Clone)]
 struct DirectoryHandleRecord {
     inode: u64,
-    listing: DirectoryListing,
+    listing: Arc<DirectoryListing>,
     current: Metadata,
     parent: Metadata,
 }
@@ -189,7 +201,7 @@ struct CachedMetadata {
 
 #[derive(Clone)]
 struct CachedDirectory {
-    listing: DirectoryListing,
+    listing: Arc<DirectoryListing>,
     discovered_at: Instant,
 }
 
@@ -206,6 +218,8 @@ struct AdapterState {
     remote: Arc<dyn RemoteFilesystem>,
     callback_timeout: Duration,
     capabilities: Mutex<Option<FilesystemCapabilities>>,
+    filesystem_stats: Mutex<Option<(Instant, FilesystemStats)>>,
+    filesystem_stats_refreshing: AtomicBool,
     inodes: Mutex<InodeTable>,
     handles: Mutex<HashMap<u64, FileHandleRecord>>,
     pending_writes: Mutex<HashMap<u64, PendingWrite>>,
@@ -265,6 +279,8 @@ impl Adapter {
                 remote,
                 callback_timeout,
                 capabilities: Mutex::new(None),
+                filesystem_stats: Mutex::new(None),
+                filesystem_stats_refreshing: AtomicBool::new(false),
                 inodes: Mutex::new(InodeTable {
                     by_inode: HashMap::from([(ROOT_INODE, root)]),
                     by_node: HashMap::from([(ROOT_NODE, ROOT_INODE)]),
@@ -327,7 +343,7 @@ impl Adapter {
         self.block_on(self.getattr_async(inode))
     }
 
-    pub fn readdir(&self, inode: u64) -> Result<DirectoryListing, AdapterError> {
+    pub fn readdir(&self, inode: u64) -> Result<Arc<DirectoryListing>, AdapterError> {
         self.block_on(self.readdir_async(inode))
     }
 
@@ -413,7 +429,10 @@ impl Adapter {
         Ok(metadata)
     }
 
-    pub(crate) async fn readdir_async(&self, inode: u64) -> Result<DirectoryListing, AdapterError> {
+    pub(crate) async fn readdir_async(
+        &self,
+        inode: u64,
+    ) -> Result<Arc<DirectoryListing>, AdapterError> {
         if let Some(listing) = self.cached_directory(inode)? {
             return Ok(listing);
         }
@@ -474,7 +493,7 @@ impl Adapter {
         &self,
         handle: u64,
         inode: u64,
-    ) -> Result<DirectoryListing, AdapterError> {
+    ) -> Result<Arc<DirectoryListing>, AdapterError> {
         let record = self
             .state
             .directory_handles
@@ -493,7 +512,7 @@ impl Adapter {
         &self,
         handle: u64,
         inode: u64,
-    ) -> Result<(DirectoryListing, Metadata, Metadata), AdapterError> {
+    ) -> Result<(Arc<DirectoryListing>, Metadata, Metadata), AdapterError> {
         let record = self
             .state
             .directory_handles
@@ -524,7 +543,7 @@ impl Adapter {
         let candidates = record
             .listing
             .entries
-            .into_iter()
+            .iter()
             .map(|entry| (entry.inode, 0))
             .collect::<Vec<_>>();
         let adapter = self.clone();
@@ -1117,6 +1136,12 @@ impl Adapter {
         let _operation_guard = operation.write().await;
         self.flush_pending(handle).await?;
         let opened = self.file_handle(handle)?;
+        if !opened.access.can_write() && !opened.used_locks {
+            // A read-only handle with no locks has nothing a remote flush
+            // could observe: no coalesced bytes exist and there are no
+            // POSIX locks for the server to release.
+            return Ok(());
+        }
         self.execute(async {
             self.state
                 .remote
@@ -1435,12 +1460,87 @@ impl Adapter {
                 .await?;
             Ok(())
         })
-        .await
+        .await?;
+        if let Ok(mut handles) = self.state.handles.lock()
+            && let Some(record) = handles.get_mut(&handle)
+        {
+            record.used_locks = true;
+        }
+        Ok(())
     }
 
     pub(crate) async fn statfs_async(&self) -> Result<FilesystemStats, AdapterError> {
-        self.execute(async { Ok(self.state.remote.stat_filesystem().await?) })
-            .await
+        // Serve statfs from the adapter cache and refresh it in the
+        // background once it ages past the TTL, so a statfs callback never
+        // blocks on the network after the first fetch. macOS statfs-polls
+        // mounted volumes aggressively (volume registration, Finder, storage
+        // management); paying one round trip per poll floods a high-latency
+        // link and stalls CoreServices' volume-registration deadline.
+        // Staleness is bounded by the TTL plus one refresh round trip, and
+        // statfs carries no coherence contract.
+        let cached_statistics = match self.state.filesystem_stats.lock() {
+            Ok(cached) => *cached,
+            Err(_) => None,
+        };
+        if let Some((fetched_at, statistics)) = cached_statistics {
+            if fetched_at.elapsed() >= FILESYSTEM_STATS_TTL
+                && !self
+                    .state
+                    .filesystem_stats_refreshing
+                    .swap(true, Ordering::AcqRel)
+            {
+                let adapter = self.clone();
+                let refresh = self.runtime.spawn(async move {
+                    let refreshed = adapter
+                        .execute(async { Ok(adapter.state.remote.stat_filesystem().await?) })
+                        .await;
+                    if let Ok(statistics) = refreshed
+                        && let Ok(mut cached) = adapter.state.filesystem_stats.lock()
+                    {
+                        *cached = Some((Instant::now(), statistics));
+                    }
+                    // On error the stale entry stays; the next aged callback
+                    // retries the refresh.
+                    adapter
+                        .state
+                        .filesystem_stats_refreshing
+                        .store(false, Ordering::Release);
+                });
+                drop(refresh);
+            }
+            return Ok(statistics);
+        }
+        let statistics = self
+            .execute(async { Ok(self.state.remote.stat_filesystem().await?) })
+            .await?;
+        if let Ok(mut cached) = self.state.filesystem_stats.lock() {
+            *cached = Some((Instant::now(), statistics));
+        }
+        Ok(statistics)
+    }
+
+    /// Warm every cache a macOS volume-registration probe touches, so the
+    /// first kernel callbacks after `mount(2)` are answered from memory
+    /// instead of paying one network round trip each.
+    ///
+    /// CoreServices registers a freshly mounted volume by probing it
+    /// (statfs, root getattr, AppleDouble sidecar lookups) under a short
+    /// internal deadline. On a high-latency link those probes each cost a
+    /// full round trip and the registration races its deadline; when it
+    /// loses, `coreservicesd` permanently records a broken file-ID tree for
+    /// the volume and every LaunchServices/Finder interaction with it fails
+    /// with `EIO` for the life of the mount, while plain path-based syscalls
+    /// keep working. Serving the registration window from warm caches keeps
+    /// a WAN mount indistinguishable from a loopback mount here. Failures
+    /// are non-fatal: an unwarmed mount is exactly as functional as before,
+    /// it merely re-enters the race.
+    pub fn prewarm_for_mount(&self) -> Result<(), AdapterError> {
+        self.runtime.clone().block_on(async {
+            self.readdir_async(ROOT_INODE).await?;
+            self.getattr_async(ROOT_INODE).await?;
+            self.statfs_async().await?;
+            Ok(())
+        })
     }
 
     pub(crate) async fn xattr_size_async(
@@ -1658,6 +1758,28 @@ impl Adapter {
     ) -> Result<(), AdapterError> {
         let operation = self.file_operation(handle)?;
         let _operation_guard = operation.write().await;
+        if let Ok(opened) = self.file_handle(handle)
+            && !opened.access.can_write()
+            && !opened.used_locks
+        {
+            // No coalesced bytes and no locks: the reply does not depend on
+            // the server, so close the remote descriptor in the background
+            // instead of charging one round trip per sidecar/preview read
+            // to the caller. Errors only leak a server handle, which
+            // disconnect cleanup reclaims.
+            let opened = self.take_file_handle(handle)?;
+            let adapter = self.clone();
+            drop(self.runtime.spawn(async move {
+                let _ = adapter
+                    .execute(async {
+                        adapter.state.remote.close_file(opened.remote).await?;
+                        Ok(())
+                    })
+                    .await;
+            }));
+            let _ = self.forget_inode(opened.inode, 0);
+            return Ok(());
+        }
         // Transmit any coalesced bytes before closing. If this fails the handle
         // is still closed below so the remote descriptor is not leaked, but the
         // error is surfaced to the caller (close/last-flush is the sanctioned
@@ -1812,7 +1934,7 @@ impl Adapter {
             .and_then(|metadata| metadata.get(&node).map(|entry| entry.value.revision))
     }
 
-    fn cached_directory(&self, inode: u64) -> Result<Option<DirectoryListing>, AdapterError> {
+    fn cached_directory(&self, inode: u64) -> Result<Option<Arc<DirectoryListing>>, AdapterError> {
         let mut directories = self
             .state
             .discovered_directories
@@ -1844,7 +1966,7 @@ impl Adapter {
         inode: u64,
         record: InodeRecord,
         view: DirectoryView,
-    ) -> Result<DirectoryListing, AdapterError> {
+    ) -> Result<Arc<DirectoryListing>, AdapterError> {
         validate_metadata(record.node, &view.directory)?;
         if view.directory.kind != NodeKind::Directory {
             return Err(AdapterError::UnexpectedMetadata);
@@ -1886,7 +2008,7 @@ impl Adapter {
         inode: u64,
         parent_inode: u64,
         snapshot: DirectorySnapshot,
-    ) -> Result<DirectoryListing, AdapterError> {
+    ) -> Result<Arc<DirectoryListing>, AdapterError> {
         validate_case_insensitive_directory(&snapshot.entries)?;
         self.reconcile_directory_entries(
             inode,
@@ -1911,11 +2033,11 @@ impl Adapter {
                 metadata: entry.metadata,
             });
         }
-        let listing = DirectoryListing {
+        let listing = Arc::new(DirectoryListing {
             parent_inode,
             revision: snapshot.revision,
             entries,
-        };
+        });
         self.state
             .discovered_directories
             .lock()
@@ -1936,23 +2058,14 @@ impl Adapter {
         listing: &DirectoryListing,
         requested: &Name,
     ) -> Result<LookupResult, AdapterError> {
-        let entries = listing
-            .entries
-            .iter()
-            .map(|entry| RemoteDirectoryEntry {
-                node: entry.metadata.node,
-                name: entry.name.clone(),
-                kind: entry.kind,
-                metadata: entry.metadata.clone(),
-            })
-            .collect();
-        let entry = select_remote_entry(entries, requested)?;
-        let inode = self.remember_entry(entry.node, parent_inode, &entry.name)?;
+        let index = select_entry_index(&listing.entries, |entry| &entry.name, requested)?;
+        let entry = &listing.entries[index];
+        let inode = self.remember_entry(entry.metadata.node, parent_inode, &entry.name)?;
         self.add_lookup(inode, 1)?;
         self.remember_metadata(entry.metadata.clone())?;
         Ok(LookupResult {
             inode,
-            metadata: entry.metadata,
+            metadata: entry.metadata.clone(),
         })
     }
 
@@ -2353,6 +2466,7 @@ impl Adapter {
                 access,
                 revision: opened.revision,
                 size: opened.size,
+                used_locks: false,
             },
         );
         operations.insert(handle, Arc::new(AsyncRwLock::new(())));
@@ -2481,39 +2595,47 @@ fn normalized_case_name(name: &str) -> String {
     name.nfd().flat_map(char::to_lowercase).collect()
 }
 
-fn select_remote_entry(
-    mut entries: Vec<RemoteDirectoryEntry>,
+/// Select the single entry a macOS name may address: an exact byte match
+/// first, then the Unicode NFD/case-insensitive fallback for valid UTF-8,
+/// rejecting ambiguity. Works by reference so a lookup in a large cached
+/// directory does not clone the whole listing.
+fn select_entry_index<T>(
+    entries: &[T],
+    name_of: impl Fn(&T) -> &Name,
     requested: &Name,
-) -> Result<RemoteDirectoryEntry, AdapterError> {
-    let exact = entries
+) -> Result<usize, AdapterError> {
+    let mut exact = entries
         .iter()
         .enumerate()
-        .filter_map(|(index, entry)| (entry.name == *requested).then_some(index))
-        .collect::<Vec<_>>();
-    match exact.as_slice() {
-        [index] => return Ok(entries.swap_remove(*index)),
-        [] => {}
-        _ => return Err(AdapterError::AmbiguousName),
+        .filter(|(_, entry)| *name_of(entry) == *requested);
+    match (exact.next(), exact.next()) {
+        (Some((index, _)), None) => return Ok(index),
+        (Some(_), Some(_)) => return Err(AdapterError::AmbiguousName),
+        (None, _) => {}
     }
 
     let requested = std::str::from_utf8(requested.as_bytes())
         .map(normalized_case_name)
         .map_err(|_| AdapterError::NotFound)?;
-    let matching = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            std::str::from_utf8(entry.name.as_bytes())
-                .ok()
-                .is_some_and(|name| normalized_case_name(name) == requested)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    match matching.as_slice() {
-        [index] => Ok(entries.swap_remove(*index)),
-        [] => Err(AdapterError::NotFound),
-        _ => Err(AdapterError::AmbiguousName),
+    let mut matching = entries.iter().enumerate().filter(|(_, entry)| {
+        std::str::from_utf8(name_of(entry).as_bytes())
+            .ok()
+            .is_some_and(|name| normalized_case_name(name) == requested)
+    });
+    match (matching.next(), matching.next()) {
+        (Some((index, _)), None) => Ok(index),
+        (Some(_), Some(_)) => Err(AdapterError::AmbiguousName),
+        (None, _) => Err(AdapterError::NotFound),
     }
+}
+
+#[cfg(test)]
+fn select_remote_entry(
+    mut entries: Vec<RemoteDirectoryEntry>,
+    requested: &Name,
+) -> Result<RemoteDirectoryEntry, AdapterError> {
+    let index = select_entry_index(&entries, |entry| &entry.name, requested)?;
+    Ok(entries.swap_remove(index))
 }
 
 fn validate_case_insensitive_directory(
@@ -3258,6 +3380,14 @@ mod tests {
         assert_eq!(adapter.read(handle, 1, 11).unwrap(), b"ello from q");
         assert_eq!(*remote.read_lengths.lock().unwrap(), [4, 4, 3]);
         adapter.release(handle).unwrap();
+        // A lock-free read-only handle replies to release immediately and
+        // closes the remote descriptor in the background.
+        for _ in 0..500 {
+            if remote.close_count.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
         assert_eq!(remote.close_count.load(Ordering::Relaxed), 1);
     }
 

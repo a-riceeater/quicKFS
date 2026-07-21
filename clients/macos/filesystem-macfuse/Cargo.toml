@@ -20,6 +20,7 @@ quickfs-transport-quic={path="../../../crates/transport-quic"}
 [target.'cfg(target_os = "macos")'.dependencies]
 fuser={workspace=true,optional=true}
 libc="0.2"
+log="0.4"
 quickfs-macos-support={path="../../../crates/macos-support"}
 [features]
 default=[]

@@ -328,7 +328,16 @@ impl KernelConfig {
 
     /// Query kernel capabilities.
     pub fn capabilities(&self) -> InitFlags {
-        self.capabilities & !InitFlags::FUSE_INIT_EXT
+        // On macFUSE, bit 30 is FUSE_VOL_RENAME, not FUSE_INIT_EXT; masking
+        // it out here would hide a real macFUSE capability.
+        #[cfg(target_os = "macos")]
+        {
+            self.capabilities
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.capabilities & !InitFlags::FUSE_INIT_EXT
+        }
     }
 
     /// Kernel ABI version.

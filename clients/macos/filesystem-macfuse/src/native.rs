@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{Adapter, AdapterError, CreatedNode, DirectoryListing, ROOT_INODE};
+use super::{Adapter, AdapterError, CreatedNode, DirectoryListing};
 use fuser::{
     BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, ForgetOne, Generation, INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner,
@@ -27,6 +27,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::runtime::Runtime;
 
 const ATTRIBUTE_TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 4_096;
@@ -35,6 +36,17 @@ const CONGESTION_THRESHOLD: u16 = 48;
 const GRACEFUL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(3);
 const FORCE_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const UNMOUNT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long after mount(2) to wait before probing whether macOS registered
+/// the volume usably; the registration probes arrive within the first
+/// couple of seconds.
+const VOLUME_REGISTRATION_SETTLE: Duration = Duration::from_secs(5);
+/// Mount attempts before giving up on a usable volume registration and
+/// serving the mount with a warning. A broken registration is permanent for
+/// that mount, so each retry is a fresh mount(2).
+const VOLUME_REGISTRATION_ATTEMPTS: u32 = 4;
+/// Pause between registration retries so the previous volume's CoreServices
+/// teardown finishes before the replacement mount registers.
+const VOLUME_REGISTRATION_RETRY_DELAY: Duration = Duration::from_secs(10);
 const DARWIN_IOCTL_INOUT: u32 = 0xc000_0000;
 
 const fn darwin_iowr(group: u8, number: u8, size: u32) -> u32 {
@@ -85,15 +97,6 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
     } else {
         config.volume_name.clone()
     };
-    // Populate the root snapshot before publishing the mount. Finder can
-    // otherwise issue its first LOOKUP/READDIR against a cold RAID directory
-    // and decide the volume is unresponsive while that scan is still running.
-    adapter
-        .readdir(ROOT_INODE)
-        .map_err(|error| io::Error::other(format!("failed to prepare root directory: {error}")))?;
-    adapter
-        .getattr(ROOT_INODE)
-        .map_err(|error| io::Error::other(format!("failed to prepare root metadata: {error}")))?;
     let mut fuser_config = Config::default();
     fuser_config.mount_options.extend([
         if capabilities.writable {
@@ -106,7 +109,11 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
         MountOption::NoExec,
         MountOption::NoAtime,
         MountOption::FSName(config.filesystem_name.clone()),
-        MountOption::Subtype("quickfs".into()),
+        // No MountOption::Subtype here: `subtype=` is a Linux mtab concept.
+        // macFUSE's mount helper does not define it, and passing options the
+        // helper does not understand is exactly the class of divergence that
+        // broke LaunchServices/Finder on this volume (see the macFUSE INIT
+        // dialect note in vendor/fuser).
         MountOption::CUSTOM(format!("volname={volume_name}")),
         // Store extended attributes in AppleDouble (`._name`) sidecars that
         // macFUSE manages, instead of forwarding every xattr natively. This is
@@ -146,8 +153,66 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
     // Tokio runtime instead, so the one receive loop remains responsive.
     fuser_config.n_threads = Some(1);
     let runtime = adapter.runtime().clone();
-    let mut session = fuser::Session::new(adapter, mountpoint, &fuser_config)?;
-    eprintln!("quicKFS mount is ready at {}", mountpoint.display());
+
+    // Mount, verify that macOS registered the volume usably, and retry when
+    // it did not. CoreServices registers each new volume by probing it under
+    // a short internal deadline; when the registration races wrong (observed
+    // as a coin flip on a degraded host and near-certain on a high-latency
+    // link before the pre-mount cache warmup existed), coreservicesd keeps a
+    // broken file-ID tree for the volume and every Finder/LaunchServices
+    // interaction fails with EIO for the life of the mount, even though
+    // terminal I/O works. The state is per-mount and permanent, so the only
+    // recovery is to unmount and mount again. The health probe is the same
+    // call LaunchServices makes (FSPathMakeRef → ioErr on a broken volume).
+    for attempt in 1..=VOLUME_REGISTRATION_ATTEMPTS {
+        // Warm the root directory view, root metadata, and filesystem
+        // statistics so the registration probes are answered from memory
+        // rather than paying one network round trip each. This also keeps
+        // Finder's first LOOKUP/READDIR against a cold RAID directory from
+        // reading as an unresponsive volume.
+        adapter.prewarm_for_mount().map_err(|error| {
+            io::Error::other(format!("failed to prepare the root directory: {error}"))
+        })?;
+        let mut session = fuser::Session::new(adapter.clone(), mountpoint, &fuser_config)?;
+        eprintln!("quicKFS mount is ready at {}", mountpoint.display());
+        let health_unmounter = session.unmount_callable();
+        let registration_broken = Arc::new(AtomicBool::new(false));
+        let can_retry = attempt < VOLUME_REGISTRATION_ATTEMPTS;
+        spawn_registration_health_check(
+            mountpoint.to_path_buf(),
+            health_unmounter,
+            Arc::clone(&registration_broken),
+            can_retry,
+        );
+        let result = run_session_until_unmount(session, mountpoint, &runtime)?;
+        if registration_broken.load(Ordering::Acquire) && can_retry {
+            eprintln!(
+                "remounting {} (attempt {} of {}) after macOS registered the volume unusably",
+                mountpoint.display(),
+                attempt + 1,
+                VOLUME_REGISTRATION_ATTEMPTS,
+            );
+            std::thread::sleep(VOLUME_REGISTRATION_RETRY_DELAY);
+            continue;
+        }
+        match &result {
+            Ok(()) => eprintln!("quicKFS mount session ended"),
+            Err(error) => eprintln!("quicKFS mount session failed: {error}"),
+        }
+        return result;
+    }
+    unreachable!("the volume-registration retry loop always returns on its final attempt")
+}
+
+/// Run one mounted fuser session to completion with Ctrl-C/SIGTERM unmount
+/// handling. The outer `Result` reports setup errors (signal registration);
+/// the inner one is the session outcome itself.
+#[allow(clippy::type_complexity)]
+fn run_session_until_unmount(
+    mut session: fuser::Session<Adapter>,
+    mountpoint: &Path,
+    runtime: &Arc<Runtime>,
+) -> io::Result<io::Result<()>> {
     let mut unmounter = session.unmount_callable();
     let signal_mountpoint = mountpoint.to_path_buf();
     let (mut interrupt, mut terminate) = {
@@ -198,11 +263,83 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
     let result = session.run();
     unmount_complete.store(true, Ordering::Release);
     signal_task.abort();
-    match &result {
-        Ok(()) => eprintln!("quicKFS mount session ended"),
-        Err(error) => eprintln!("quicKFS mount session failed: {error}"),
+    Ok(result)
+}
+
+/// Whether macOS considers the mounted volume usable for Finder and
+/// LaunchServices. AppleScript's legacy `as alias` coercion exercises the
+/// same Carbon FSRef machinery LaunchServices uses for every document open
+/// (`FSPathMakeRef`), and `osascript` ships with macOS. On a volume whose
+/// coreservicesd registration is broken the coercion fails with error
+/// `-1700` (a failed coercion wrapping the underlying `ioErr`); anything
+/// else — success, an unexpected error, a timeout, or the volume already
+/// being unmounted — is treated as healthy so an ambiguous probe can never
+/// cause a remount loop.
+fn volume_registration_is_broken(mountpoint: &Path) -> bool {
+    let Some(path) = mountpoint.to_str() else {
+        return false;
+    };
+    let probe = Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "POSIX file (item 1 of argv) as alias",
+            "-e",
+            "end run",
+            "--",
+            path,
+        ])
+        .output();
+    match probe {
+        Ok(output) if output.status.success() => false,
+        Ok(output) => String::from_utf8_lossy(&output.stderr).contains("-1700"),
+        Err(_) => false,
     }
-    result
+}
+
+/// Probe whether macOS registered the freshly mounted volume usably, from a
+/// helper thread once the registration window has settled. A broken
+/// registration is permanent for the life of the mount: when retrying is
+/// still possible the volume is unmounted so the caller can mount again,
+/// otherwise the mount is kept serving (terminal I/O still works) with a
+/// loud warning.
+fn spawn_registration_health_check(
+    mountpoint: PathBuf,
+    mut unmounter: fuser::SessionUnmounter,
+    registration_broken: Arc<AtomicBool>,
+    can_retry: bool,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("quickfs-registration-health".into())
+        .spawn(move || {
+            std::thread::sleep(VOLUME_REGISTRATION_SETTLE);
+            if !volume_registration_is_broken(&mountpoint) {
+                return;
+            }
+            registration_broken.store(true, Ordering::Release);
+            if can_retry {
+                eprintln!(
+                    "macOS registered {} unusably for Finder (alias probe failed); remounting",
+                    mountpoint.display()
+                );
+                if let Err(error) = unmounter.unmount() {
+                    eprintln!("health-check unmount failed: {error}");
+                }
+            } else {
+                eprintln!(
+                    "warning: macOS registered {} unusably for Finder (alias probe failed) and \
+                     the retry budget is exhausted; terminal access keeps working, but opening \
+                     the volume in Finder will fail with an input/output error until it is \
+                     remounted. A reboot clears degraded CoreServices state that makes this \
+                     more likely.",
+                    mountpoint.display()
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("failed to start the volume-registration health check: {error}");
+    }
 }
 
 async fn force_local_unmount(mountpoint: PathBuf) -> io::Result<()> {
@@ -871,7 +1008,14 @@ impl Filesystem for Adapter {
         self.spawn_callback(async move {
             match adapter.directory_listing(u64::from(handle), u64::from(inode)) {
                 Ok(listing) => {
-                    fill_directory(&adapter, &mut reply, u64::from(inode), offset, &listing);
+                    fill_directory(
+                        &adapter,
+                        &mut reply,
+                        u64::from(inode),
+                        offset,
+                        listing.as_ref(),
+                    );
+
                     reply.ok();
                 }
                 Err(error) => {
@@ -896,7 +1040,13 @@ impl Filesystem for Adapter {
             match adapter.directory_listing_with_metadata(u64::from(handle), inode) {
                 Ok((listing, current, parent)) => {
                     fill_directory_plus(
-                        &adapter, &mut reply, inode, offset, &listing, &current, &parent,
+                        &adapter,
+                        &mut reply,
+                        inode,
+                        offset,
+                        listing.as_ref(),
+                        &current,
+                        &parent,
                     );
                     reply.ok();
                 }

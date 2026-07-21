@@ -2972,6 +2972,7 @@ dependencies = [
  "clap",
  "fuser",
  "libc",
+ "log",
  "quickfs-cache",
  "quickfs-client-core",
  "quickfs-macos-support",

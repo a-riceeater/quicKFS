@@ -981,6 +981,9 @@ mod op {
     impl Init<'_> {
         pub(crate) fn capabilities(&self) -> InitFlags {
             let flags = InitFlags::from_bits_retain(u64::from(self.arg.flags));
+            // macFUSE's dialect assigns bit 30 to FUSE_VOL_RENAME, not
+            // FUSE_INIT_EXT, and its fuse_init_in has no flags2 word.
+            #[cfg(not(target_os = "macos"))]
             if flags.contains(InitFlags::FUSE_INIT_EXT) {
                 return InitFlags::from_bits_retain(
                     u64::from(self.arg.flags) | (u64::from(self.arg.flags2) << 32),
@@ -996,9 +999,17 @@ mod op {
         }
 
         pub(crate) fn reply(&self, config: &crate::KernelConfig) -> ResponseData {
-            let flags = config.requested | InitFlags::FUSE_INIT_EXT;
-            // use requested features and reported as capable
-            let flags = flags & self.capabilities();
+            // On macFUSE, only ever advertise bits whose macFUSE meaning is
+            // known and implemented; see `InitFlags::MACFUSE_KNOWN`. There is
+            // no FUSE_INIT_EXT in macFUSE's dialect (bit 30 is VOL_RENAME).
+            #[cfg(target_os = "macos")]
+            let flags = config.requested & self.capabilities() & InitFlags::MACFUSE_KNOWN;
+            #[cfg(not(target_os = "macos"))]
+            let flags = {
+                let flags = config.requested | InitFlags::FUSE_INIT_EXT;
+                // use requested features and reported as capable
+                flags & self.capabilities()
+            };
 
             let mut init = fuse_init_out {
                 major: FUSE_KERNEL_VERSION,

@@ -14,6 +14,7 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::SystemTime;
 
+use log::debug;
 use log::error;
 use log::warn;
 
@@ -120,6 +121,7 @@ impl ReplyRaw {
     /// only once (the `ok` and `error` methods ensure this by consuming `self`)
     pub(crate) fn send_ll_mut(&mut self, response: &impl Response) {
         assert!(self.sender.is_some());
+        debug!("reply unique={} sent", self.unique.0);
         let sender = self.sender.take().unwrap();
         let res = response.with_iovec(self.unique, |iov| sender.send(iov));
         if let Err(err) = res {
@@ -132,6 +134,7 @@ impl ReplyRaw {
 
     /// Reply to a request with the given error code
     pub(crate) fn error(self, err: ll::Errno) {
+        debug!("reply unique={} errno={:?}", self.unique.0, err);
         self.send_ll(&ll::ResponseErrno(err));
     }
 }

@@ -118,4 +118,25 @@ impl InitFlags {
         let bits = self.bits();
         (bits as u32, (bits >> 32) as u32)
     }
+
+    /// The init capability bits that carry a known meaning for the macFUSE
+    /// kernel. macFUSE's capability word is a different dialect from Linux's:
+    /// it shares bits 0..=6 with historical Linux FUSE but assigns its own
+    /// meanings to the high bits. Verified against macFUSE's own libfuse
+    /// fork (`macfuse/library` `include/fuse_kernel.h`):
+    /// `FUSE_ACCESS_EXTENDED` (23), `FUSE_NODE_RWLOCK` (24),
+    /// `FUSE_RENAME_SWAP` (25), `FUSE_RENAME_EXCL` (26),
+    /// `FUSE_ALLOCATE` (27), `FUSE_EXCHANGE_DATA` (28),
+    /// `FUSE_CASE_INSENSITIVE` (29), `FUSE_VOL_RENAME` (30),
+    /// `FUSE_XTIMES` (31). Bits 7..=22 are Linux-only in this crate and must
+    /// never be advertised to macFUSE, where they are either unassigned or
+    /// mean something else entirely: the INIT reply is
+    /// `requested & offered & MACFUSE_KNOWN`, so a Linux-named bit a caller
+    /// requests can never leak into the reply with an unintended macFUSE
+    /// meaning. Note bits 25/26 are requested through their Linux names
+    /// (`FUSE_EXPLICIT_INVAL_DATA`/`FUSE_MAP_ALIGNMENT`) by callers that
+    /// implement macFUSE atomic rename (swap/excl); they are deliberately
+    /// inside the whitelist.
+    #[cfg(target_os = "macos")]
+    pub(crate) const MACFUSE_KNOWN: InitFlags = InitFlags::from_bits_retain(0xFF80_007F);
 }
