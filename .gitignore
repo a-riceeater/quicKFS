@@ -10,3 +10,6 @@
 /clients/macos/client-gui/src-tauri/gen/schemas/
 .claude
 .quickfs-cache
+/d.md
+./c.md
+./b.md
