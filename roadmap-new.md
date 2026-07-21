@@ -15,7 +15,7 @@ not yet painful · **[P2]** hardening / nice-to-have. "Where" points at the
 code that would change.
 
 Completion: an item that has shipped is prefixed **[DONE]** (with the landing
-detail, e.g. `[DONE — protocol v7]`) and its original priority tag is kept in
+detail, e.g. `[DONE — minor 6.3]`) and its original priority tag is kept in
 the text so the history stays legible. Everything without **[DONE]** is still
 outstanding.
 
@@ -98,7 +98,7 @@ about HTTP.
 
 ## 2. Protocol surface & framing
 
-- **[DONE — protocol v7] [P0] Directory pagination.** `MAX_FRAME_SIZE = 1 MiB` used
+- **[DONE — minor 6.1] [P0] Directory pagination.** `MAX_FRAME_SIZE = 1 MiB` used
   to cap one response frame, so a single directory with more than ~10k entries
   could not be projected in one `DirectoryView` even after inline
   xattrs/snapshots were stripped (`fit_directory_view_response` → `TooLarge` →
@@ -117,14 +117,23 @@ about HTTP.
   request/response — the server cannot push. This blocks **cross-client cache
   invalidation** (§4) and lease/notify features. Add a server-push channel
   (dedicated uni stream or datagram) with a client dispatcher.
-- **[P1] Protocol versioning is all-or-nothing.** `decode` rejects any frame
-  whose `version != PROTOCOL_VERSION` (hard equality). There is no negotiated
-  version *range* or capability handshake, so **every protocol bump is a
-  flag-day** requiring client and server to update in lockstep — painful for a
-  separately-deployed daemon (the RAID box runs old code after a client
-  rebuild). Add min/max version negotiation in `Hello`/`HelloAck` and a
-  compatibility window. *Where:* `protocol/src/lib.rs` version check,
-  `Request::Hello`/`Response::HelloAck`.
+- **[DONE — protocol 6.x] [P1] Protocol versioning is all-or-nothing.** Hard
+  `version == PROTOCOL_VERSION` equality plus a version-specific ALPN made **every
+  protocol bump a flag-day**. **Resolved** with a major.minor scheme: the wire
+  version is a major/minor pair packed into the existing `u16`, the ALPN is keyed
+  to the **major** only (`quickfs/6`) so all same-major peers connect, and the
+  request/response check accepts any same-major minor and rejects only a different
+  major. `Hello`/`HelloAck` carry each side's exact version (client sends `Hello`
+  before auth and learns the server's; server reads the client's off every
+  request, so no per-connection state), and a minor's optional capabilities are
+  gated on the negotiated minimum — a peer only emits a feature the partner
+  advertises, while always being able to decode it. So additive minors (frame
+  compression is the first, at 6.3) no longer force lockstep upgrades; only a
+  major bump does. *Where:* `protocol/src/lib.rs` (`make_version`/`version_major`/
+  `version_minor`, relaxed `decode_request`, `peer_supports_frame_compression`),
+  `transport-quic` `QuicClient` negotiated-compression flag, daemon handler +
+  `HelloAck`, client-core `negotiate`. *Still open:* per-major *capability
+  bitset* (vs monotonic minor gating) and cross-**major** windows if ever needed.
 - **[P1] Missing `ctime` / inode-change timestamp.** "The protocol does not yet
   carry a distinct inode-change timestamp" (`native.rs:1862`) — the adapter
   can't report an accurate `st_ctime`. Add it to `Metadata`.
@@ -133,20 +142,21 @@ about HTTP.
   batching aside, and speculative opens still cost one RTT each. A compound
   request (pipeline N ops in one frame) would cut RTTs on cold crawls over
   WAN.
-- **[DONE — protocol v8] [P2] Frame compression.** Directory views and metadata
+- **[DONE — minor 6.3] [P2] Frame compression.** Directory views and metadata
   are highly compressible (repeated names, xattr keys). **Resolved** with
-  optional per-frame zstd compression: the four-byte frame length prefix gained a
-  high-bit `FRAME_COMPRESSED_FLAG`; a body at/above a 1 KiB threshold is
-  compressed only when it shrinks (so tiny/incompressible frames are never
-  enlarged), and the receiver bounds decompression output to `MAX_FRAME_SIZE`
-  (bomb guard). It runs *after* postcard encoding and directory-view chunk
-  packing, so the frame limit and chunk budget still measure the uncompressed
-  size (compress *then* fit) and §2 paging is unchanged. Measured ≈7× on a
-  realistic media-library directory view. *Where landed:* `crates/protocol`
-  (`encode_frame`/`parse_frame_header`/`decode_frame` + constants),
-  `crates/transport-quic` `write_frame`/`read_frame`, daemon
-  `write_frame_parts`. Client-core is unchanged — compression is transparent
-  below it.
+  per-frame zstd compression, negotiated as the first optional minor capability:
+  the four-byte frame length prefix gained a high-bit `FRAME_COMPRESSED_FLAG`; a
+  body at/above a 1 KiB threshold is compressed only when the partner advertises
+  minor ≥ 6.3 (`peer_supports_frame_compression`) and it actually shrinks (so an
+  older peer never receives one, and tiny/incompressible frames are never
+  enlarged). Decoding is always supported (self-describing flag); the receiver
+  bounds decompression output to `MAX_FRAME_SIZE` (bomb guard). It runs *after*
+  postcard encoding and directory-view chunk packing, so the frame limit and
+  chunk budget still measure the uncompressed size (compress *then* fit) and §2
+  paging is unchanged. Measured ≈7× on a realistic media-library directory view.
+  *Where landed:* `crates/protocol` (`encode_frame`/`parse_frame_header`/
+  `decode_frame` + constants), `crates/transport-quic` `write_frame`/`read_frame`,
+  daemon `write_frame_parts` + per-request gate, client-core `negotiate`.
 - **[P2] Formal protocol specification.** `docs/protocol.md` exists but a
   versioned wire spec (frame layout, every `Request`/`Response` variant,
   error taxonomy, capability flags) would make the flag-day/negotiation work
@@ -362,10 +372,11 @@ above are prerequisites and should land first.
 ## Suggested sequencing
 
 1. **§1 connection wedge + demand-path ceiling** and ~~**§2 directory
-   pagination**~~ **[DONE — protocol v7]** — the two things that bite real usage
+   pagination**~~ **[DONE — minor 6.1]** — the two things that bite real usage
    today.
-2. **§2 server-push + version negotiation** — unblocks §3 cross-client
-   coherence and §6 live revocation, and ends the flag-day upgrade pain.
+2. **§2 server-push** and ~~**version negotiation**~~ **[DONE — protocol 6.x]** —
+   version negotiation now ends the flag-day upgrade pain; server-push still
+   unblocks §3 cross-client coherence and §6 live revocation.
 3. **§6 security review + §10 telemetry + §11 CI** — the release-readiness
    trio.
 4. Everything else as capacity allows; keep §5 offline as one coherent feature,
