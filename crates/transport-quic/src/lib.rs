@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
 use quickfs_protocol::{
-    ALPN_PROTOCOL, CodecError, Envelope, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response,
-    decode, encode,
+    ALPN_PROTOCOL, CodecError, Envelope, PROTOCOL_VERSION, Request, Response, decode_frame,
+    encode_frame, parse_frame_header,
 };
 use quinn::{Connection, Endpoint, TransportConfig, VarInt};
 pub use quinn::{RecvStream, SendStream};
@@ -529,21 +529,19 @@ pub async fn write_frame<T: Serialize>(
     send: &mut SendStream,
     value: &T,
 ) -> Result<(), TransportError> {
-    let data = Zeroizing::new(encode(value)?);
-    send.write_all(&(data.len() as u32).to_be_bytes()).await?;
-    send.write_all(&data).await?;
+    let (prefix, body) = encode_frame(value)?;
+    let body = Zeroizing::new(body);
+    send.write_all(&prefix.to_be_bytes()).await?;
+    send.write_all(&body).await?;
     Ok(())
 }
 pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, TransportError> {
-    let mut size = [0; 4];
-    recv.read_exact(&mut size).await?;
-    let size = u32::from_be_bytes(size) as usize;
-    if size > MAX_FRAME_SIZE {
-        return Err(CodecError::TooLarge(size).into());
-    }
-    let mut data = Zeroizing::new(vec![0; size]);
-    recv.read_exact(&mut data).await?;
-    Ok(decode(&data)?)
+    let mut prefix = [0; 4];
+    recv.read_exact(&mut prefix).await?;
+    let (compressed, size) = parse_frame_header(u32::from_be_bytes(prefix))?;
+    let mut body = Zeroizing::new(vec![0; size]);
+    recv.read_exact(&mut body).await?;
+    Ok(decode_frame(compressed, &body)?)
 }
 
 #[cfg(test)]

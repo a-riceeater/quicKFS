@@ -1426,9 +1426,9 @@ async fn write_directory_view(
         request_id: id,
         message: Response::DirectoryView(view),
     };
-    match encode(&single) {
-        Ok(frame) => {
-            write_length_prefixed(send, &frame).await?;
+    match encode_frame(&single) {
+        Ok((prefix, body)) => {
+            write_frame_parts(send, prefix, &body).await?;
             send.finish()?;
             return Ok(());
         }
@@ -1508,11 +1508,13 @@ async fn stream_directory_view(
     Ok(())
 }
 
-async fn write_length_prefixed(send: &mut SendStream, frame: &[u8]) -> Result<()> {
-    // `frame` originates from `encode`, which caps length at MAX_FRAME_SIZE, so
-    // the u32 length prefix cannot overflow.
-    send.write_all(&(frame.len() as u32).to_be_bytes()).await?;
-    send.write_all(frame).await?;
+/// Write a frame already split into its length prefix and body by
+/// [`encode_frame`]. The prefix encodes both the body length and the
+/// compression flag, so this stays byte-compatible with `write_frame` while
+/// avoiding a re-encode of the directory-view single-frame fast path.
+async fn write_frame_parts(send: &mut SendStream, prefix: u32, body: &[u8]) -> Result<()> {
+    send.write_all(&prefix.to_be_bytes()).await?;
+    send.write_all(body).await?;
     Ok(())
 }
 async fn shutdown_signal() {

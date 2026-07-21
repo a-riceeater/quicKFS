@@ -825,15 +825,14 @@ pub fn encode_frame<T: Serialize>(value: &T) -> Result<(u32, Vec<u8>), CodecErro
 }
 
 fn frame_body(mut payload: Vec<u8>) -> (u32, Vec<u8>) {
-    if payload.len() >= FRAME_COMPRESSION_THRESHOLD {
-        if let Ok(compressed) = zstd::bulk::compress(&payload, FRAME_COMPRESSION_LEVEL) {
-            if compressed.len() < payload.len() {
-                // The uncompressed payload may carry redactable material (e.g. a
-                // pairing proof); clear it since it is not the buffer returned.
-                payload.zeroize();
-                return (compressed.len() as u32 | FRAME_COMPRESSED_FLAG, compressed);
-            }
-        }
+    if payload.len() >= FRAME_COMPRESSION_THRESHOLD
+        && let Ok(compressed) = zstd::bulk::compress(&payload, FRAME_COMPRESSION_LEVEL)
+        && compressed.len() < payload.len()
+    {
+        // The uncompressed payload may carry redactable material (e.g. a pairing
+        // proof); clear it since it is not the buffer returned.
+        payload.zeroize();
+        return (compressed.len() as u32 | FRAME_COMPRESSED_FLAG, compressed);
     }
     // `payload.len()` is bounded by `MAX_FRAME_SIZE` (2^20), so it fits in the
     // low 31 bits and never sets `FRAME_COMPRESSED_FLAG`.
