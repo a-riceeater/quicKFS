@@ -1,5 +1,21 @@
 # quicKFS handoff — high-latency read performance
 
+## ✅ UPDATE (2026-07-20 evening): read-ahead shipped, then throttled the cache writer — fixed
+
+The adaptive read-ahead below landed in `be60fc63` and works (cold 25 MB sequential: 0.6–1.0 → 7.2 MB/s on the RAID WAN link). But in real Finder use it exposed a persistent-cache scaling defect: **every durable store rewrote the entire manifest (state clone + full JSON serialize + 2× fsync) under the global state mutex**. With the browsed RAID tree at ~33k cache entries the manifest was 10.4 MB, so the single cache-writer thread fell hours behind, pinned a core at >100% even at idle, and starved every cache read of the state lock. Symptoms: Finder copy remote→remote failing with error 100070, Preview stalling on a cold 7 MB JPG, daemon RSS growth — while `dd` limped through and uploads (which bypass durable per-chunk cache work) looked fine.
+
+Fixes (crates/cache + one client-core change, commit after this note):
+1. **Group commit** — the writer drains up to 256 queued jobs per batch, defers manifest writes and obsolete-file removals, flushes once per batch; waited ops complete after the flush (durability semantics unchanged).
+2. **Stores do their heavy work outside the state lock** — payload SHA-256 + atomic file write happen before locking (content-addressed names make this safe); duplicate stores are detected from the manifest alone and skip the clone/commit.
+3. **Backpressure** — opportunistic read-through stores are dropped past 1,024 queued jobs / 128 MiB queued payload bytes (memory tiers still serve them); coherence ops are never dropped.
+4. **Small-read read-ahead granularity** — the prefetcher now schedules at the granularity the demand read used (1 MiB for sub-1 MiB reads) instead of always `--cache-block-kib`, so Preview-style 64 KiB read streams and files smaller than the big block get read-ahead. Cold 7 MB JPG via 64 KiB reads: 25 s → 4.3 s.
+
+Validated live against RAID (fresh state dir, chat account): 60-file thumbnail flood + cold sequential + mixed load; daemon returns to 0.0 % CPU at idle. **The elijb mount must be restarted onto the new binary** — the old daemon still runs the per-store manifest rewrite and is still draining its backlog.
+
+Known remaining scalability item (acceptable for now, documented): each mutating job still clones the full entry map under the lock (O(n) per job, n ≈ manifest entries); the manifest itself is still O(n) per batch flush. A delta/sharded manifest would remove both. `get_covering_range_value` is also an O(n) scan per persistent range lookup.
+
+---
+
 ## Why this document exists
 
 quicKFS's whole reason to exist is making a **high-latency** mount feel fast — the goal is to *hide* long round trips, not pay for them one read at a time. The write path already does this (v6 write-coalescing batches the kernel's 16 KiB `FUSE_WRITE` chunks into 8 MiB `WriteRange`s, so a copy is a handful of big requests instead of thousands of serial ones). **The read path has no equivalent yet, and it is the current bottleneck on real high-latency mounts.** This document is the plan to fix that.

@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
 };
@@ -25,6 +25,19 @@ const MAX_NAMESPACE_COMPONENT_LENGTH: usize = 1_024;
 const MANIFEST_FILE: &str = "manifest.json";
 const LOCK_FILE: &str = ".cache.lock";
 const DEFAULT_HOT_RANGE_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum queued writer jobs executed under one deferred-commit batch. The
+/// batch bounds how many state mutations share a single manifest write, so a
+/// flood of read-through stores costs one manifest serialization per batch
+/// instead of one per store.
+const WRITER_BATCH_MAX: usize = 256;
+/// Opportunistic read-through stores are dropped (memory tiers still serve
+/// them) once this many writer jobs are queued. Coherence-critical operations
+/// are never dropped. Bounds the writer backlog so waited operations cannot
+/// stall behind minutes of speculative persistence.
+const MAX_PENDING_STORE_JOBS: usize = 1_024;
+/// Companion bound on queued range payload bytes. Each queued range store owns
+/// a copy of its payload, so this also caps the writer queue's memory.
+const MAX_PENDING_STORE_BYTES: u64 = 128 * 1024 * 1024;
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -347,7 +360,27 @@ pub struct PersistentCache {
     directory: PathBuf,
     maximum_payload_bytes: u64,
     state: Mutex<PersistentState>,
+    /// Group-commit state for the writer thread. While a batch is active,
+    /// `commit_state` applies mutations in memory and records the manifest as
+    /// dirty; `flush_deferred_commits` then writes the manifest once for the
+    /// whole batch. Guarded by its own mutex but only ever manipulated while
+    /// the state mutex is held (or by the writer thread between jobs), so the
+    /// two never race. Lock order is always `state` before `deferred`.
+    deferred: Mutex<DeferredCommits>,
+    /// Total manifests written since open; used by tests and diagnostics to
+    /// prove that batched mutations coalesce into few manifest writes.
+    manifest_writes: AtomicU64,
     _lock_file: File,
+}
+
+#[derive(Default)]
+struct DeferredCommits {
+    active: bool,
+    dirty: bool,
+    /// Payload files orphaned by deferred commits. They stay on disk until the
+    /// batch's single manifest write lands, preserving the existing crash
+    /// ordering (manifest first, then file removal).
+    pending_removals: Vec<String>,
 }
 
 /// Runs persistent-cache filesystem work outside Tokio's asynchronous worker
@@ -359,6 +392,15 @@ pub struct NonBlockingPersistentCache {
     writer: mpsc::Sender<PersistentWrite>,
     memory: Arc<MemoryCache>,
     hot_ranges: Arc<HotRangeCache>,
+    /// Writer jobs queued but not yet executed. Opportunistic read-through
+    /// stores consult this so a flood of speculative persistence (read-ahead,
+    /// thumbnail sweeps) can never grow the queue without bound.
+    pending_jobs: Arc<AtomicUsize>,
+    /// Bytes of range payloads owned by queued jobs; the memory bound for the
+    /// writer queue.
+    pending_store_bytes: Arc<AtomicU64>,
+    store_job_limit: usize,
+    store_byte_limit: u64,
 }
 
 struct HotRangeCache {
@@ -373,7 +415,13 @@ struct HotRangeState {
     bytes: usize,
 }
 
-type PersistentWrite = Box<dyn FnOnce(&PersistentCache) + Send + 'static>;
+struct PersistentWrite {
+    job: Box<dyn FnOnce(&PersistentCache) + Send + 'static>,
+    /// Present for `enqueue_and_wait` jobs. Fired only after the batch's
+    /// manifest flush, so a waiter observing completion knows its mutation is
+    /// durable, exactly as before batching.
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
 
 impl HotRangeCache {
     fn new(maximum_bytes: usize) -> Self {
@@ -478,11 +526,38 @@ impl NonBlockingPersistentCache {
         )?);
         let (writer, writes) = mpsc::channel::<PersistentWrite>();
         let worker_cache = Arc::clone(&inner);
+        let pending_jobs = Arc::new(AtomicUsize::new(0));
+        let worker_pending_jobs = Arc::clone(&pending_jobs);
         std::thread::Builder::new()
             .name("quickfs-cache-writer".into())
             .spawn(move || {
-                while let Ok(write) = writes.recv() {
-                    write(&worker_cache);
+                // Group commit: drain a batch of queued jobs, run them with
+                // manifest writes deferred, then write the manifest once for
+                // the whole batch. A backlog of N read-through stores costs
+                // N/WRITER_BATCH_MAX manifest serializations instead of N,
+                // which is what keeps a large cache's manifest (megabytes of
+                // JSON) from monopolizing the state lock and the CPU.
+                while let Ok(first) = writes.recv() {
+                    let mut batch = vec![first];
+                    while batch.len() < WRITER_BATCH_MAX {
+                        match writes.try_recv() {
+                            Ok(next) => batch.push(next),
+                            Err(_) => break,
+                        }
+                    }
+                    worker_cache.begin_deferred_commits();
+                    let mut completions = Vec::new();
+                    for write in batch {
+                        (write.job)(&worker_cache);
+                        if let Some(done) = write.done {
+                            completions.push(done);
+                        }
+                        worker_pending_jobs.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    let _ = worker_cache.flush_deferred_commits();
+                    for done in completions {
+                        let _ = done.send(());
+                    }
                 }
             })?;
         let hot_range_bytes =
@@ -493,6 +568,10 @@ impl NonBlockingPersistentCache {
             writer,
             memory: Arc::new(MemoryCache::default()),
             hot_ranges: Arc::new(HotRangeCache::new(hot_range_bytes)),
+            pending_jobs,
+            pending_store_bytes: Arc::new(AtomicU64::new(0)),
+            store_job_limit: MAX_PENDING_STORE_JOBS,
+            store_byte_limit: MAX_PENDING_STORE_BYTES,
         })
     }
 
@@ -500,21 +579,62 @@ impl NonBlockingPersistentCache {
         self.inner.namespace()
     }
 
+    /// Total manifest files written by the underlying persistent cache.
+    pub fn manifest_writes(&self) -> u64 {
+        self.inner.manifest_writes()
+    }
+
+    #[cfg(test)]
+    fn set_store_limits(&mut self, jobs: usize, bytes: u64) {
+        self.store_job_limit = jobs;
+        self.store_byte_limit = bytes;
+    }
+
+    #[cfg(test)]
+    fn persistent(&self) -> &PersistentCache {
+        &self.inner
+    }
+
     fn enqueue(&self, write: impl FnOnce(&PersistentCache) + Send + 'static) {
-        let _ = self.writer.send(Box::new(write));
+        self.pending_jobs.fetch_add(1, Ordering::Relaxed);
+        if self
+            .writer
+            .send(PersistentWrite {
+                job: Box::new(write),
+                done: None,
+            })
+            .is_err()
+        {
+            self.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Queues an opportunistic read-through store unless the writer backlog is
+    /// already over its bounds. Dropping is safe: the in-memory tiers were
+    /// updated by the caller, so only a later cold start or eviction pays an
+    /// extra network fetch. Coherence-critical work must use `enqueue` /
+    /// `enqueue_and_wait`, which never drop.
+    fn enqueue_store_behind(&self, write: impl FnOnce(&PersistentCache) + Send + 'static) {
+        if self.pending_jobs.load(Ordering::Relaxed) > self.store_job_limit {
+            return;
+        }
+        self.enqueue(write);
     }
 
     async fn enqueue_and_wait(&self, write: impl FnOnce(&PersistentCache) + Send + 'static) {
         let (complete, completed) = tokio::sync::oneshot::channel();
+        self.pending_jobs.fetch_add(1, Ordering::Relaxed);
         if self
             .writer
-            .send(Box::new(move |cache| {
-                write(cache);
-                let _ = complete.send(());
-            }))
+            .send(PersistentWrite {
+                job: Box::new(write),
+                done: Some(complete),
+            })
             .is_ok()
         {
             let _ = completed.await;
+        } else {
+            self.pending_jobs.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -543,6 +663,8 @@ impl PersistentCache {
             directory,
             maximum_payload_bytes,
             state: Mutex::new(state),
+            deferred: Mutex::new(DeferredCommits::default()),
+            manifest_writes: AtomicU64::new(0),
             _lock_file: lock_file,
         };
         cache.enforce_budget()?;
@@ -859,39 +981,80 @@ impl PersistentCache {
     }
 
     fn insert_entries(&self, entries: Vec<(EntryKey, Vec<u8>)>) -> Result<(), CacheError> {
-        let mut state = self.lock_state()?;
-        let mut proposed = state.clone();
+        // Phase 1, no lock held: validate sizes and hash payloads. Hashing a
+        // multi-megabyte block is the expensive part of a store and used to
+        // run under the state mutex, starving every concurrent cache read.
+        struct PreparedEntry {
+            key: EntryKey,
+            bytes: Vec<u8>,
+            file_name: String,
+            sha256: [u8; 32],
+            stored_length: u64,
+        }
+        let mut prepared = Vec::new();
+        for (key, bytes) in entries {
+            let stored_length =
+                u64::try_from(bytes.len()).map_err(|_| CacheError::EntryTooLarge)?;
+            if stored_length > self.maximum_payload_bytes {
+                return Err(CacheError::EntryTooLarge);
+            }
+            let key_bytes = serde_json::to_vec(&key)?;
+            let mut hasher = Sha256::new();
+            hasher.update(&key_bytes);
+            hasher.update(&bytes);
+            let file_name = format!("{}.bin", hex::encode(hasher.finalize()));
+            let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+            prepared.push(PreparedEntry {
+                key,
+                bytes,
+                file_name,
+                sha256,
+                stored_length,
+            });
+        }
+
+        // Phase 2, brief lock: drop stores whose manifest entry is already
+        // current. This is a manifest-only comparison; the old disk-content
+        // verification re-hashed the stored payload under the lock, and a
+        // corrupt file is self-healed on read anyway (the entry is removed and
+        // the next store rewrites it).
+        {
+            let state = self.lock_state()?;
+            prepared.retain(|entry| {
+                !state.entries.get(&entry.key).is_some_and(|existing| {
+                    existing.file_name == entry.file_name
+                        && existing.stored_length == entry.stored_length
+                        && existing.sha256 == entry.sha256
+                })
+            });
+        }
+        if prepared.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 3, no lock held: write the payload files. Names are
+        // content-addressed (hash of key + payload), so concurrent writers of
+        // the same content converge on identical bytes and the atomic rename
+        // makes the last one win harmlessly.
         let mut written = Vec::new();
-        let result = (|| -> Result<bool, CacheError> {
-            let mut changed = false;
-            for (key, bytes) in entries {
-                let stored_length =
-                    u64::try_from(bytes.len()).map_err(|_| CacheError::EntryTooLarge)?;
-                if stored_length > self.maximum_payload_bytes {
-                    return Err(CacheError::EntryTooLarge);
+        for entry in &prepared {
+            match write_private_atomic(&self.directory.join(&entry.file_name), &entry.bytes) {
+                Ok(()) => written.push(entry.file_name.clone()),
+                Err(error) => {
+                    let state = self.lock_state()?;
+                    let _ = self.remove_unreferenced_files(&state, written);
+                    return Err(error);
                 }
+            }
+        }
 
-                let key_bytes = serde_json::to_vec(&key)?;
-                let mut hasher = Sha256::new();
-                hasher.update(&key_bytes);
-                hasher.update(&bytes);
-                let file_name = format!("{}.bin", hex::encode(hasher.finalize()));
-                let payload_sha256: [u8; 32] = Sha256::digest(&bytes).into();
-                if proposed.entries.get(&key).is_some_and(|existing| {
-                    existing.file_name == file_name
-                        && existing.stored_length == stored_length
-                        && existing.sha256 == payload_sha256
-                        && self.read_disk_entry(existing).is_ok()
-                }) {
-                    continue;
-                }
-
-                let destination = self.directory.join(&file_name);
-                write_private_atomic(&destination, &bytes)?;
-                written.push(file_name.clone());
-
+        // Phase 4: take the lock once to splice the new entries in.
+        let mut state = self.lock_state()?;
+        let result = (|| -> Result<(), CacheError> {
+            let mut proposed = state.clone();
+            for entry in prepared {
                 let last_access = next_clock(&mut proposed);
-                if let Some(previous) = proposed.entries.remove(&key) {
+                if let Some(previous) = proposed.entries.remove(&entry.key) {
                     proposed.payload_bytes = proposed
                         .payload_bytes
                         .checked_sub(previous.stored_length)
@@ -899,53 +1062,30 @@ impl PersistentCache {
                 }
                 proposed.payload_bytes = proposed
                     .payload_bytes
-                    .checked_add(stored_length)
+                    .checked_add(entry.stored_length)
                     .ok_or(CacheError::EntryTooLarge)?;
                 proposed.entries.insert(
-                    key.clone(),
+                    entry.key.clone(),
                     DiskEntry {
-                        key,
-                        file_name,
-                        stored_length,
-                        sha256: payload_sha256,
+                        key: entry.key,
+                        file_name: entry.file_name,
+                        stored_length: entry.stored_length,
+                        sha256: entry.sha256,
                         last_access,
                     },
                 );
-                changed = true;
-            }
-            if !changed {
-                return Ok(false);
             }
             if proposed.entries.len() > MAX_MANIFEST_ENTRIES {
                 return Err(CacheError::InvalidManifest);
             }
             evict_to_budget(&mut proposed, self.maximum_payload_bytes)?;
-            self.commit_state(&mut state, proposed)?;
-            Ok(true)
+            self.commit_state(&mut state, proposed)
         })();
 
-        if result.is_err() {
-            for file_name in &written {
-                if !state
-                    .entries
-                    .values()
-                    .any(|entry| entry.file_name == *file_name)
-                {
-                    let _ = remove_cache_file(&self.directory.join(file_name));
-                }
-            }
-        } else if matches!(result, Ok(true)) {
-            for file_name in &written {
-                if !state
-                    .entries
-                    .values()
-                    .any(|entry| entry.file_name == *file_name)
-                {
-                    remove_cache_file(&self.directory.join(file_name))?;
-                }
-            }
-        }
-        result.map(|_| ())
+        // Written files that did not end up referenced (eviction, error) are
+        // removed; on error the removal itself is best-effort.
+        let cleanup = self.remove_unreferenced_files(&state, written);
+        result.and(cleanup)
     }
 
     fn remove_matching(&self, predicate: impl Fn(&EntryKey) -> bool) -> Result<(), CacheError> {
@@ -994,7 +1134,6 @@ impl PersistentCache {
         state: &mut PersistentState,
         proposed: PersistentState,
     ) -> Result<(), CacheError> {
-        self.write_manifest(&proposed)?;
         let retained: HashSet<_> = proposed
             .entries
             .values()
@@ -1006,12 +1145,93 @@ impl PersistentCache {
             .filter(|entry| !retained.contains(entry.file_name.as_str()))
             .map(|entry| entry.file_name.clone())
             .collect();
-        *state = proposed;
-        for file_name in obsolete {
-            remove_cache_file(&self.directory.join(file_name))?;
+        {
+            let mut deferred = self
+                .deferred
+                .lock()
+                .map_err(|_| CacheError::StateUnavailable)?;
+            if deferred.active {
+                // Inside a writer batch: apply in memory now, persist once at
+                // the batch flush. Obsolete payload files are also deferred so
+                // the manifest-before-removal crash ordering is preserved.
+                *state = proposed;
+                deferred.dirty = true;
+                deferred.pending_removals.extend(obsolete);
+                return Ok(());
+            }
         }
+        self.write_manifest(&proposed)?;
+        *state = proposed;
+        let pending = {
+            let mut deferred = self
+                .deferred
+                .lock()
+                .map_err(|_| CacheError::StateUnavailable)?;
+            deferred.dirty = false;
+            std::mem::take(&mut deferred.pending_removals)
+        };
+        self.remove_unreferenced_files(state, pending.into_iter().chain(obsolete))?;
         sync_directory(&self.directory)?;
         Ok(())
+    }
+
+    /// Removes payload files that are no longer referenced by the current
+    /// state. The referenced check protects deferred removals: a name queued
+    /// for deletion in one batch can be re-created by a later content-addressed
+    /// insert, and deleting it then would orphan a live manifest entry.
+    fn remove_unreferenced_files(
+        &self,
+        state: &PersistentState,
+        file_names: impl IntoIterator<Item = String>,
+    ) -> Result<(), CacheError> {
+        for file_name in file_names {
+            if !state
+                .entries
+                .values()
+                .any(|entry| entry.file_name == file_name)
+            {
+                remove_cache_file(&self.directory.join(file_name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enters group-commit mode: subsequent `commit_state` calls apply their
+    /// mutations in memory and defer the manifest write until
+    /// [`Self::flush_deferred_commits`]. Only the writer thread calls this,
+    /// bracketing one batch of queued jobs.
+    fn begin_deferred_commits(&self) {
+        if let Ok(mut deferred) = self.deferred.lock() {
+            deferred.active = true;
+        }
+    }
+
+    /// Leaves group-commit mode, writing the manifest once if any deferred
+    /// commit dirtied it and then removing the batch's obsolete payload files.
+    /// On a manifest write error the dirty flag and pending removals are kept,
+    /// so the next commit or flush retries them.
+    fn flush_deferred_commits(&self) -> Result<(), CacheError> {
+        let state = self.lock_state()?;
+        let mut deferred = self
+            .deferred
+            .lock()
+            .map_err(|_| CacheError::StateUnavailable)?;
+        deferred.active = false;
+        if !deferred.dirty {
+            return Ok(());
+        }
+        self.write_manifest(&state)?;
+        deferred.dirty = false;
+        let pending = std::mem::take(&mut deferred.pending_removals);
+        drop(deferred);
+        self.remove_unreferenced_files(&state, pending)?;
+        sync_directory(&self.directory)?;
+        Ok(())
+    }
+
+    /// Total manifest files written since this cache was opened.
+    pub fn manifest_writes(&self) -> u64 {
+        self.manifest_writes.load(Ordering::Relaxed)
     }
 
     fn write_manifest(&self, state: &PersistentState) -> Result<(), CacheError> {
@@ -1027,7 +1247,9 @@ impl PersistentCache {
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_SIZE {
             return Err(CacheError::InvalidManifest);
         }
-        write_private_atomic(&self.directory.join(MANIFEST_FILE), &bytes)
+        write_private_atomic(&self.directory.join(MANIFEST_FILE), &bytes)?;
+        self.manifest_writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn read_disk_entry(&self, entry: &DiskEntry) -> Result<Vec<u8>, CacheError> {
@@ -1186,7 +1408,7 @@ impl MetadataCache for NonBlockingPersistentCache {
 
     async fn store_readthrough(&self, value: Metadata) {
         MetadataCache::insert(self.memory.as_ref(), value.clone()).await;
-        self.enqueue(move |cache| {
+        self.enqueue_store_behind(move |cache| {
             let _ = cache.insert_metadata_value(value);
         });
     }
@@ -1229,7 +1451,7 @@ impl DirectoryCache for NonBlockingPersistentCache {
 
     async fn store_readthrough_snapshot(&self, key: RevisionKey, value: Vec<DirectoryEntry>) {
         DirectoryCache::store_readthrough_snapshot(self.memory.as_ref(), key, value.clone()).await;
-        self.enqueue(move |cache| {
+        self.enqueue_store_behind(move |cache| {
             let _ = cache.insert_directory_snapshot_value(key, &value);
         });
     }
@@ -1286,8 +1508,25 @@ impl RangeCache for NonBlockingPersistentCache {
 
     async fn store_readthrough(&self, key: RangeKey, value: Vec<u8>) {
         self.hot_ranges.insert(key, value.clone());
+        // Range payloads dominate the writer queue's memory, so they are
+        // additionally bounded by bytes: sequential read-ahead can otherwise
+        // queue hundreds of megabytes of block copies faster than the disk
+        // absorbs them.
+        let bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        if self.pending_jobs.load(Ordering::Relaxed) > self.store_job_limit
+            || self
+                .pending_store_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(bytes)
+                > self.store_byte_limit
+        {
+            return;
+        }
+        self.pending_store_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let pending_store_bytes = Arc::clone(&self.pending_store_bytes);
         self.enqueue(move |cache| {
             let _ = cache.insert_range_value(key, &value);
+            pending_store_bytes.fetch_sub(bytes, Ordering::Relaxed);
         });
     }
 
@@ -1328,7 +1567,7 @@ impl FilesystemStateCache for NonBlockingPersistentCache {
 
     async fn store_readthrough_filesystem_stats(&self, value: FilesystemStats) {
         self.memory.insert_filesystem_stats(value).await;
-        self.enqueue(move |cache| {
+        self.enqueue_store_behind(move |cache| {
             let _ = cache.insert_filesystem_stats_value(value);
         });
     }
@@ -2160,6 +2399,143 @@ mod tests {
         assert_eq!(cache.get_range_value(first).unwrap().unwrap(), b"aaaa");
         assert_eq!(cache.get_range_value(third).unwrap().unwrap(), b"cccc");
         assert_eq!(cache.stats().unwrap().payload_bytes, 8);
+    }
+
+    /// A deferred-commit batch must apply every mutation with exactly one
+    /// manifest write at the flush, and the result must be durable across a
+    /// reopen. This is the group-commit contract that keeps a flood of
+    /// read-through stores from serializing the manifest once per store.
+    #[test]
+    fn deferred_commits_coalesce_manifest_writes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = open_cache(&temporary, namespace(7, "batch"), 1_024 * 1_024);
+        let baseline = cache.manifest_writes();
+
+        cache.begin_deferred_commits();
+        for index in 0..20u64 {
+            cache
+                .insert_range_value(range(1, index * 8, 8), &[index as u8; 8])
+                .unwrap();
+        }
+        assert_eq!(
+            cache.manifest_writes(),
+            baseline,
+            "manifest must not be written while a batch is active"
+        );
+        cache.flush_deferred_commits().unwrap();
+        assert_eq!(cache.manifest_writes(), baseline + 1);
+
+        drop(cache);
+        let reopened = open_cache(&temporary, namespace(7, "batch"), 1_024 * 1_024);
+        for index in 0..20u64 {
+            assert_eq!(
+                reopened
+                    .get_range_value(range(1, index * 8, 8))
+                    .unwrap()
+                    .unwrap(),
+                vec![index as u8; 8]
+            );
+        }
+    }
+
+    /// Flushing a batch that made no changes must not touch the manifest, and
+    /// commits made outside a batch must keep writing it immediately.
+    #[test]
+    fn deferred_flush_is_a_no_op_when_clean() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = open_cache(&temporary, namespace(7, "clean"), 1_024);
+        let baseline = cache.manifest_writes();
+        cache.begin_deferred_commits();
+        cache.flush_deferred_commits().unwrap();
+        assert_eq!(cache.manifest_writes(), baseline);
+
+        cache.insert_range_value(range(1, 0, 4), b"data").unwrap();
+        assert_eq!(cache.manifest_writes(), baseline + 1);
+    }
+
+    /// Replacing an entry inside a batch defers the old payload file's removal
+    /// to the flush; afterwards only the live payload remains on disk.
+    #[test]
+    fn deferred_commit_removes_replaced_payloads_at_flush() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = open_cache(&temporary, namespace(7, "replace"), 1_024);
+        cache.insert_range_value(range(1, 0, 4), b"old!").unwrap();
+
+        cache.begin_deferred_commits();
+        cache.insert_range_value(range(1, 0, 4), b"new!").unwrap();
+        cache.flush_deferred_commits().unwrap();
+
+        assert_eq!(
+            cache.get_range_value(range(1, 0, 4)).unwrap().unwrap(),
+            b"new!"
+        );
+        let payloads = fs::read_dir(&cache.directory)
+            .unwrap()
+            .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+            .filter(|name| name.ends_with(".bin"))
+            .count();
+        assert_eq!(payloads, 1, "replaced payload must be removed at flush");
+    }
+
+    /// Re-storing an identical value must be recognized from the manifest
+    /// alone and skip payload and manifest writes entirely.
+    #[test]
+    fn identical_store_skips_manifest_write() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = open_cache(&temporary, namespace(7, "dedup"), 1_024);
+        cache.insert_range_value(range(1, 0, 4), b"data").unwrap();
+        let after_first = cache.manifest_writes();
+        cache.insert_range_value(range(1, 0, 4), b"data").unwrap();
+        assert_eq!(cache.manifest_writes(), after_first);
+    }
+
+    /// When the writer backlog exceeds its byte bound, an opportunistic range
+    /// store is dropped: the hot tier still serves it, nothing reaches the
+    /// durable cache, and a later waited insert is unaffected and durable once
+    /// its wait returns.
+    #[tokio::test]
+    async fn range_store_readthrough_is_dropped_under_backpressure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut cache = NonBlockingPersistentCache::open(
+            temporary.path().join("cache"),
+            namespace(7, "pressure"),
+            1_024 * 1_024,
+        )
+        .unwrap();
+        cache.set_store_limits(usize::MAX, 0);
+
+        let speculative = range(3, 0, 4);
+        RangeCache::store_readthrough(&cache, speculative, b"spec".to_vec()).await;
+        assert_eq!(
+            RangeCache::get(&cache, speculative).await.unwrap(),
+            b"spec",
+            "memory tier must keep serving a dropped store"
+        );
+
+        let demanded = range(3, 8, 4);
+        RangeCache::insert(&cache, demanded, b"real".to_vec()).await;
+        // The waited insert drained the queue past any earlier job, so the
+        // speculative store's absence below proves it was dropped, not merely
+        // still queued.
+        assert!(
+            cache
+                .persistent()
+                .get_range_value(speculative)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .persistent()
+                .get_range_value(demanded)
+                .unwrap()
+                .unwrap(),
+            b"real"
+        );
+        assert!(
+            cache.manifest_writes() >= 1,
+            "a waited insert must be durable when its wait returns"
+        );
     }
 
     #[cfg(unix)]

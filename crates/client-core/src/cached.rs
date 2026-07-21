@@ -644,6 +644,19 @@ impl CachedFilesystem {
         .await
     }
 
+    /// Block granularity used to serve a demand read of `length` bytes. Header
+    /// probes and thumbnail reads should not pull 16 MiB from every file Finder
+    /// touches: sequential/copy-sized requests retain the large aligned block,
+    /// while small reads use a bounded 1 MiB window. Read-ahead schedules at
+    /// the same granularity so speculative and demand fetches coalesce.
+    fn demand_block_size(&self, length: u64) -> u64 {
+        if length < SMALL_READ_THRESHOLD {
+            self.policy.block_size.min(SMALL_READ_AHEAD_BLOCK_SIZE)
+        } else {
+            self.policy.block_size
+        }
+    }
+
     fn blocks_for(&self, state: &CachedHandle, offset: u64, length: u64) -> Result<Vec<RangeKey>> {
         if offset.checked_add(length).is_none() {
             return Err(ClientError::Server(
@@ -659,14 +672,7 @@ impl CachedFilesystem {
         let requested_end = offset
             .checked_add(requested)
             .ok_or(ClientError::UnexpectedResponse)?;
-        // Header probes and thumbnail reads should not pull 16 MiB from every
-        // file Finder touches. Sequential/copy-sized requests retain the large
-        // aligned block, while small random reads use a bounded 1 MiB window.
-        let block_size = if length < SMALL_READ_THRESHOLD {
-            self.policy.block_size.min(SMALL_READ_AHEAD_BLOCK_SIZE)
-        } else {
-            self.policy.block_size
-        };
+        let block_size = self.demand_block_size(length);
         let mut block_offset = offset / block_size * block_size;
         let mut blocks = Vec::new();
         while block_offset < requested_end {
@@ -695,6 +701,13 @@ impl CachedFilesystem {
     /// of the consumer. Every fetch routes through the shared single-flight
     /// gate, so a later kernel read for a prefetched block finds it cached or
     /// joins the in-flight fetch instead of stalling a full round trip.
+    ///
+    /// `granularity` is the block size the demand path chose for this read
+    /// (`blocks_for` uses 1 MiB blocks for sub-1 MiB reads). Scheduling
+    /// read-ahead at the same granularity keeps speculative and demand
+    /// `RangeKey`s identical so they coalesce, and it is what lets a stream of
+    /// small kernel reads — Preview and Quick Look read images this way — and
+    /// files smaller than the large block size get read-ahead at all.
     async fn maybe_prefetch(
         &self,
         state: &CachedHandle,
@@ -702,8 +715,12 @@ impl CachedFilesystem {
         offset: u64,
         returned: u64,
         elapsed: Duration,
+        granularity: u64,
     ) {
-        let cap_blocks = self.policy.read_ahead_cap_blocks();
+        if granularity == 0 {
+            return;
+        }
+        let cap_blocks = self.policy.read_ahead_max_bytes / granularity;
         if cap_blocks == 0 {
             return;
         }
@@ -716,7 +733,7 @@ impl CachedFilesystem {
                 state.revision,
                 state.size,
                 elapsed,
-                self.policy.block_size,
+                granularity,
                 cap_blocks,
             )
         };
@@ -1248,8 +1265,15 @@ impl RemoteFilesystem for CachedFilesystem {
         };
         if let Some(data) = RangeCache::get(&assembled, requested).await {
             let returned = u64::try_from(data.len()).unwrap_or(0);
-            self.maybe_prefetch(&state, inner_handle, offset, returned, demand_elapsed)
-                .await;
+            self.maybe_prefetch(
+                &state,
+                inner_handle,
+                offset,
+                returned,
+                demand_elapsed,
+                self.demand_block_size(length),
+            )
+            .await;
             return Ok(RangeRead {
                 revision: state.revision,
                 data,
@@ -1935,6 +1959,63 @@ mod tests {
         );
         // Every block was fetched exactly once; prefetch and demand coalesced.
         assert_eq!(inner.reads.load(Ordering::SeqCst) as u64, blocks);
+    }
+
+    /// A stream of sub-1 MiB kernel reads — Preview and Quick Look read images
+    /// this way — must get read-ahead at the small-read (1 MiB) granularity,
+    /// even when the file is smaller than the large cache block. Before the
+    /// granularity fix the prefetch cursor was aligned to the full
+    /// `block_size`, which for a file smaller than one block meant no
+    /// speculation at all and one serial round trip per megabyte.
+    #[tokio::test]
+    async fn small_sequential_reads_prefetch_at_demand_granularity() {
+        let inner = latency_toggle(20);
+        let filesystem = CachedFilesystem::new(
+            inner.clone(),
+            Arc::new(MemoryCache::default()),
+            CachePolicy {
+                block_size: 16 * 1024 * 1024,
+                read_ahead_max_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
+
+        // Demand only the first megabyte, in Preview-sized 256 KiB steps. The
+        // small-read path serves these from 1 MiB blocks.
+        let step = 256 * 1024_u64;
+        let mut assembled = Vec::new();
+        for index in 0..4 {
+            let data = filesystem
+                .read_range(handle, index * step, step)
+                .await
+                .unwrap();
+            assembled.extend_from_slice(&data);
+        }
+        // The second megabyte was never demanded; read-ahead at the 1 MiB
+        // demand granularity must fetch it speculatively. (Cursor alignment to
+        // the 16 MiB policy block would schedule nothing for a 2 MiB file.)
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while inner.reads.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            inner.reads.load(Ordering::SeqCst),
+            2,
+            "expected the trailing megabyte to be prefetched"
+        );
+
+        // The demanded tail then coalesces with the speculative fetch: bytes
+        // are correct and no block is fetched twice.
+        for index in 4..8 {
+            let data = filesystem
+                .read_range(handle, index * step, step)
+                .await
+                .unwrap();
+            assembled.extend_from_slice(&data);
+        }
+        assert_eq!(assembled, vec![0x5a; 2 * 1024 * 1024]);
+        assert_eq!(inner.reads.load(Ordering::SeqCst), 2);
     }
 
     /// Random, non-sequential access must not speculate: prefetch stays off, so
