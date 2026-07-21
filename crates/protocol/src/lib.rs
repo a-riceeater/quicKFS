@@ -5,8 +5,66 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub const PROTOCOL_VERSION: u16 = 8;
-pub const ALPN_PROTOCOL: &[u8] = b"quickfs/8";
+/// Protocol **major** version. A major bump is a genuine flag day: the wire
+/// contract is incompatible, the ALPN identifier changes, and peers refuse to
+/// talk across majors. Everything additive rides a **minor** bump instead
+/// (see [`PROTOCOL_MINOR`]).
+pub const PROTOCOL_MAJOR: u16 = 6;
+
+/// Protocol **minor** version. Minors are backward-negotiated within a major:
+/// two peers use the intersection of what they both speak (see
+/// [`peer_supports_frame_compression`]). A newer minor may add optional,
+/// individually gated capabilities, so a newer client and an older same-major
+/// daemon still interoperate — the newer side simply does not emit a feature
+/// the older side did not advertise. Bumping the minor is **not** a flag day.
+///
+/// - `6.0` baseline enriched-directory-view protocol.
+/// - `6.1` streamed directory-view pagination (`DirectoryViewStart`/`Chunk`/`End`).
+/// - `6.3` per-frame compression ([`MINOR_FRAME_COMPRESSION`]).
+pub const PROTOCOL_MINOR: u16 = 3;
+
+/// The wire version word: major in the high byte, minor in the low byte. Carried
+/// in every [`Envelope`] and echoed in `HelloAck` so each side learns the other's
+/// exact version. Kept a single `u16` so the frame layout is unchanged.
+pub const PROTOCOL_VERSION: u16 = make_version(PROTOCOL_MAJOR, PROTOCOL_MINOR);
+
+/// ALPN identifier. Keyed to the **major only**, so every `6.x` peer negotiates
+/// the same QUIC connection and minor differences are resolved in the
+/// application handshake rather than by refusing to connect.
+pub const ALPN_PROTOCOL: &[u8] = b"quickfs/6";
+
+/// Compose a wire version word from a major/minor pair.
+pub const fn make_version(major: u16, minor: u16) -> u16 {
+    (major << 8) | (minor & 0x00ff)
+}
+
+/// Major component of a wire version word.
+pub const fn version_major(version: u16) -> u16 {
+    version >> 8
+}
+
+/// Minor component of a wire version word.
+pub const fn version_minor(version: u16) -> u16 {
+    version & 0x00ff
+}
+
+/// Minor version in which per-frame compression was introduced. A peer only
+/// *emits* a compressed frame to a partner whose advertised version is at least
+/// this, so an older same-major peer that cannot decompress never receives one.
+/// Decoding a compressed frame is always supported regardless of the partner's
+/// version — the compressed flag is self-describing — so this gates the sender,
+/// not the receiver.
+pub const MINOR_FRAME_COMPRESSION: u16 = 3;
+
+/// Whether it is safe to send `peer` a compressed frame: same major and a minor
+/// at least [`MINOR_FRAME_COMPRESSION`]. Both sides use this — the server against
+/// each request's advertised version, the client against the version it learned
+/// from `HelloAck`.
+pub fn peer_supports_frame_compression(peer_version: u16) -> bool {
+    version_major(peer_version) == PROTOCOL_MAJOR
+        && version_minor(peer_version) >= MINOR_FRAME_COMPRESSION
+}
+
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 /// High bit of the four-byte frame length prefix, set when the framed body is
@@ -810,18 +868,27 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, CodecError> 
 }
 
 /// Encode `value` and wrap it as an on-wire frame: return the four-byte length
-/// prefix word and the body bytes to write after it. The body is
-/// zstd-compressed only when that actually shrinks a payload at or above
+/// prefix word and the body bytes to write after it. Compression is attempted
+/// only when `compress` is set — the caller passes the negotiated decision (does
+/// the partner advertise [`MINOR_FRAME_COMPRESSION`]?) so a peer that cannot
+/// decompress never receives a compressed frame. Even when `compress` is set the
+/// body is zstd-compressed only if that actually shrinks a payload at or above
 /// [`FRAME_COMPRESSION_THRESHOLD`]; otherwise the raw postcard encoding is sent,
-/// so an incompressible or tiny frame is never larger than it was before
-/// compression existed. When compressed, the prefix has [`FRAME_COMPRESSED_FLAG`]
-/// set and its low 31 bits hold the compressed body length; when not, the prefix
-/// is simply the postcard length, bit-for-bit compatible with the pre-compression
-/// framing. The postcard payload is still bounded by [`MAX_FRAME_SIZE`] via
-/// [`encode`], so packing decisions (directory-view chunking) stay measured
-/// against the uncompressed size — compression happens *after* the fit.
-pub fn encode_frame<T: Serialize>(value: &T) -> Result<(u32, Vec<u8>), CodecError> {
-    Ok(frame_body(encode(value)?))
+/// so an incompressible or tiny frame is never larger. When compressed, the
+/// prefix has [`FRAME_COMPRESSED_FLAG`] set and its low 31 bits hold the
+/// compressed body length; when not, the prefix is simply the postcard length.
+/// The postcard payload is still bounded by [`MAX_FRAME_SIZE`] via [`encode`], so
+/// packing decisions (directory-view chunking) stay measured against the
+/// uncompressed size — compression happens *after* the fit.
+pub fn encode_frame<T: Serialize>(value: &T, compress: bool) -> Result<(u32, Vec<u8>), CodecError> {
+    let payload = encode(value)?;
+    if compress {
+        Ok(frame_body(payload))
+    } else {
+        // `payload.len()` is bounded by `MAX_FRAME_SIZE` (2^20), so it fits in the
+        // low 31 bits and never sets `FRAME_COMPRESSED_FLAG`.
+        Ok((payload.len() as u32, payload))
+    }
 }
 
 fn frame_body(mut payload: Vec<u8>) -> (u32, Vec<u8>) {
@@ -865,7 +932,10 @@ pub fn decode_frame<T: DeserializeOwned>(compressed: bool, body: &[u8]) -> Resul
 }
 pub fn decode_request(bytes: &[u8]) -> Result<Envelope<Request>, CodecError> {
     let msg: Envelope<Request> = decode(bytes)?;
-    if msg.version != PROTOCOL_VERSION {
+    // Compatibility is per-major: a same-major peer on any minor is accepted and
+    // its features are resolved by negotiation. Only a different major is a hard
+    // rejection.
+    if version_major(msg.version) != PROTOCOL_MAJOR {
         return Err(CodecError::UnsupportedVersion(msg.version));
     }
     Ok(msg)
@@ -995,7 +1065,7 @@ mod tests {
         // the compressed flag and must decode identically to the pre-compression
         // framing (raw postcard).
         let message = Envelope::new(Response::Pong { nonce: 7 });
-        let (prefix, body) = encode_frame(&message).unwrap();
+        let (prefix, body) = encode_frame(&message, true).unwrap();
         assert_eq!(prefix & FRAME_COMPRESSED_FLAG, 0);
         assert_eq!(body, encode(&message).unwrap());
         let (compressed, length) = parse_frame_header(prefix).unwrap();
@@ -1016,7 +1086,7 @@ mod tests {
             entries: (0..2000).map(sample_view_entry).collect(),
         });
         let uncompressed = encode(&chunk).unwrap();
-        let (prefix, body) = encode_frame(&chunk).unwrap();
+        let (prefix, body) = encode_frame(&chunk, true).unwrap();
         assert_ne!(prefix & FRAME_COMPRESSED_FLAG, 0);
         assert!(
             body.len() < uncompressed.len(),
@@ -1057,12 +1127,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_version() {
-        let mut m = Envelope::new(Request::Ping { nonce: 1 });
-        m.version = 99;
+    fn compress_flag_gates_emission_but_not_decoding() {
+        // With compress=false the sender must emit raw postcard even for a highly
+        // compressible payload — this is how an older partner that cannot
+        // decompress is protected. The receiver still round-trips it.
+        let chunk = Envelope::new(Response::DirectoryViewChunk {
+            entries: (0..2000).map(sample_view_entry).collect(),
+        });
+        let (prefix, body) = encode_frame(&chunk, false).unwrap();
+        assert_eq!(prefix & FRAME_COMPRESSED_FLAG, 0);
+        assert_eq!(body, encode(&chunk).unwrap());
+        let (compressed, _) = parse_frame_header(prefix).unwrap();
+        assert_eq!(
+            decode_frame::<Envelope<Response>>(compressed, &body).unwrap(),
+            chunk
+        );
+    }
+
+    #[test]
+    fn version_packing_and_compression_negotiation() {
+        assert_eq!(version_major(PROTOCOL_VERSION), PROTOCOL_MAJOR);
+        assert_eq!(version_minor(PROTOCOL_VERSION), PROTOCOL_MINOR);
+        assert_eq!(make_version(6, 3), PROTOCOL_VERSION);
+        // Same major, minor at/above the compression floor: compress. Below it or
+        // a different major: do not.
+        assert!(peer_supports_frame_compression(make_version(6, 3)));
+        assert!(peer_supports_frame_compression(make_version(6, 9)));
+        assert!(!peer_supports_frame_compression(make_version(6, 2)));
+        assert!(!peer_supports_frame_compression(make_version(6, 0)));
+        assert!(!peer_supports_frame_compression(make_version(7, 3)));
+    }
+
+    #[test]
+    fn accepts_same_major_any_minor_but_rejects_other_major() {
+        // A newer same-major minor is accepted (negotiation resolves features)…
+        let mut newer = Envelope::new(Request::Ping { nonce: 1 });
+        newer.version = make_version(PROTOCOL_MAJOR, 99);
+        assert!(decode_request(&encode(&newer).unwrap()).is_ok());
+        // …while a different major is a hard rejection.
+        let mut other = Envelope::new(Request::Ping { nonce: 1 });
+        other.version = make_version(7, 0);
         assert!(matches!(
-            decode_request(&encode(&m).unwrap()),
-            Err(CodecError::UnsupportedVersion(99))
+            decode_request(&encode(&other).unwrap()),
+            Err(CodecError::UnsupportedVersion(_))
         ));
     }
     #[test]

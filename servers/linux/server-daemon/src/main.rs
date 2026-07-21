@@ -738,17 +738,24 @@ async fn handle(
     let peer_ip = context.peer_ip;
     let request: Envelope<Request> = read_frame(&mut recv).await?;
     let id = request.request_id;
-    if request.version != PROTOCOL_VERSION {
+    let peer_version = request.version;
+    // Compatibility is per-major; a different major cannot be served and gets an
+    // uncompressed error (that peer may not understand our framing at all).
+    if version_major(peer_version) != PROTOCOL_MAJOR {
         return write_and_finish(
             &mut send,
             id,
             Response::Error(ProtocolError {
                 code: ErrorCode::UnsupportedVersion,
-                message: "unsupported protocol version".into(),
+                message: "unsupported protocol major version".into(),
             }),
+            false,
         )
         .await;
     }
+    // Compress responses only if this peer's advertised minor supports it. Every
+    // request carries the peer's version, so this needs no per-connection state.
+    let compress = peer_supports_frame_compression(peer_version);
     let allowed = matches!(
         request.message,
         Request::Hello { .. }
@@ -764,6 +771,7 @@ async fn handle(
                 code: ErrorCode::Unauthenticated,
                 message: "authenticate first".into(),
             }),
+            compress,
         )
         .await;
     }
@@ -850,6 +858,7 @@ async fn handle(
                             code: ErrorCode::Timeout,
                             message: "authentication capacity is busy; retry later".into(),
                         }),
+                        compress,
                     )
                     .await;
                 };
@@ -910,7 +919,7 @@ async fn handle(
             match export.directory_view(node, options).await {
                 Ok(view) => {
                     let entries = view.entries.len();
-                    let result = write_directory_view(&mut send, id, view).await;
+                    let result = write_directory_view(&mut send, id, view, compress).await;
                     tracing::debug!(
                         node = %node.0,
                         entries,
@@ -1347,7 +1356,7 @@ async fn handle(
             .unwrap_or_else(|error| Response::Error(error.protocol())),
         Request::Ping { nonce } => Response::Pong { nonce },
     };
-    write_response(&mut send, id, response).await?;
+    write_response(&mut send, id, response, compress).await?;
     if let Some(data) = raw {
         send.write_all(&data).await?
     }
@@ -1355,7 +1364,12 @@ async fn handle(
     drop(read_permit);
     Ok(())
 }
-async fn write_response(send: &mut SendStream, id: RequestId, message: Response) -> Result<()> {
+async fn write_response(
+    send: &mut SendStream,
+    id: RequestId,
+    message: Response,
+    compress: bool,
+) -> Result<()> {
     write_frame(
         send,
         &Envelope {
@@ -1363,13 +1377,19 @@ async fn write_response(send: &mut SendStream, id: RequestId, message: Response)
             request_id: id,
             message,
         },
+        compress,
     )
     .await?;
     Ok(())
 }
 
-async fn write_and_finish(send: &mut SendStream, id: RequestId, message: Response) -> Result<()> {
-    write_response(send, id, message).await?;
+async fn write_and_finish(
+    send: &mut SendStream,
+    id: RequestId,
+    message: Response,
+    compress: bool,
+) -> Result<()> {
+    write_response(send, id, message, compress).await?;
     send.finish()?;
     Ok(())
 }
@@ -1420,13 +1440,14 @@ async fn write_directory_view(
     send: &mut SendStream,
     id: RequestId,
     view: DirectoryView,
+    compress: bool,
 ) -> Result<()> {
     let single = Envelope {
         version: PROTOCOL_VERSION,
         request_id: id,
         message: Response::DirectoryView(view),
     };
-    match encode_frame(&single) {
+    match encode_frame(&single, compress) {
         Ok((prefix, body)) => {
             write_frame_parts(send, prefix, &body).await?;
             send.finish()?;
@@ -1438,7 +1459,7 @@ async fn write_directory_view(
     let Response::DirectoryView(view) = single.message else {
         unreachable!("envelope was constructed as DirectoryView");
     };
-    stream_directory_view(send, id, view).await?;
+    stream_directory_view(send, id, view, compress).await?;
     send.finish()?;
     Ok(())
 }
@@ -1452,6 +1473,7 @@ async fn stream_directory_view(
     send: &mut SendStream,
     id: RequestId,
     view: DirectoryView,
+    compress: bool,
 ) -> Result<()> {
     let DirectoryView {
         revision,
@@ -1470,6 +1492,7 @@ async fn stream_directory_view(
             xattrs,
             entry_count: entries.len() as u64,
         },
+        compress,
     )
     .await?;
 
@@ -1494,6 +1517,7 @@ async fn stream_directory_view(
                 Response::DirectoryViewChunk {
                     entries: std::mem::take(&mut chunk),
                 },
+                compress,
             )
             .await?;
             chunk_bytes = 0;
@@ -1502,9 +1526,15 @@ async fn stream_directory_view(
         chunk.push(entry);
     }
     if !chunk.is_empty() {
-        write_response(send, id, Response::DirectoryViewChunk { entries: chunk }).await?;
+        write_response(
+            send,
+            id,
+            Response::DirectoryViewChunk { entries: chunk },
+            compress,
+        )
+        .await?;
     }
-    write_response(send, id, Response::DirectoryViewEnd).await?;
+    write_response(send, id, Response::DirectoryViewEnd, compress).await?;
     Ok(())
 }
 
@@ -1814,6 +1844,85 @@ mod tests {
         ));
         // ...and the connection remains fully usable afterwards.
         assert_eq!(client.ping(9).await.unwrap(), 9);
+
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn directory_view_compression_is_negotiated_by_minor_version() {
+        // A client advertising an older minor (< MINOR_FRAME_COMPRESSION) must
+        // receive the streamed view uncompressed, while a current-minor client
+        // receives compressed chunks — the daemon reads the decision straight off
+        // each request's version, and either way the reassembled view is correct.
+        const ENTRIES: usize = 14_000;
+        let server = TestServer::start_big_directory(ENTRIES).await;
+        let client = server.pinned_client().await;
+        assert!(matches!(
+            request(
+                &client,
+                Request::Authenticate {
+                    username: "alice".into(),
+                    password: "correct horse battery staple".to_string().into(),
+                },
+            )
+            .await,
+            Response::AuthenticateAck
+        ));
+
+        // Drive one enriched-view request at an explicit protocol version and
+        // return (whether any frame was compressed, the reassembled entry count).
+        async fn streamed_view(client: &QuicClient, version: u16) -> (bool, usize) {
+            let request = Envelope {
+                version,
+                request_id: RequestId::new(),
+                message: Request::ListDirectoryView {
+                    node: ROOT_NODE,
+                    options: DirectoryViewOptions::NATIVE,
+                },
+            };
+            let (mut send, mut recv) = client.stream().await.unwrap();
+            client.send_frame(&mut send, &request).await.unwrap();
+            send.finish().unwrap();
+
+            let mut any_compressed = false;
+            let mut entries = 0usize;
+            loop {
+                let mut prefix = [0u8; 4];
+                client.receive_exact(&mut recv, &mut prefix).await.unwrap();
+                let (compressed, size) = parse_frame_header(u32::from_be_bytes(prefix)).unwrap();
+                any_compressed |= compressed;
+                let mut body = vec![0u8; size];
+                client.receive_exact(&mut recv, &mut body).await.unwrap();
+                let frame: Envelope<Response> = decode_frame(compressed, &body).unwrap();
+                assert_eq!(version_major(frame.version), PROTOCOL_MAJOR);
+                match frame.message {
+                    Response::DirectoryViewStart { .. } => {}
+                    Response::DirectoryViewChunk { entries: chunk } => entries += chunk.len(),
+                    Response::DirectoryViewEnd => break,
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+            (any_compressed, entries)
+        }
+
+        let (old_compressed, old_entries) =
+            streamed_view(&client, make_version(PROTOCOL_MAJOR, 0)).await;
+        assert!(
+            !old_compressed,
+            "older-minor client must not get compressed frames"
+        );
+        assert_eq!(old_entries, ENTRIES);
+
+        let (new_compressed, new_entries) = streamed_view(
+            &client,
+            make_version(PROTOCOL_MAJOR, MINOR_FRAME_COMPRESSION),
+        )
+        .await;
+        assert!(
+            new_compressed,
+            "current-minor client must get compressed chunks"
+        );
+        assert_eq!(new_entries, ENTRIES);
 
         server.stop().await;
     }

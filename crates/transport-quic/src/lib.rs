@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
 use quickfs_protocol::{
-    ALPN_PROTOCOL, CodecError, Envelope, PROTOCOL_VERSION, Request, Response, decode_frame,
-    encode_frame, parse_frame_header,
+    ALPN_PROTOCOL, CodecError, Envelope, PROTOCOL_MAJOR, Request, Response, decode_frame,
+    encode_frame, parse_frame_header, version_major,
 };
 use quinn::{Connection, Endpoint, TransportConfig, VarInt};
 pub use quinn::{RecvStream, SendStream};
@@ -15,7 +15,10 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use uuid::Uuid;
@@ -56,6 +59,12 @@ pub struct QuicClient {
     endpoint: Endpoint,
     connection: Connection,
     timeout: Duration,
+    /// Whether outbound frames may be compressed. Off until the `Hello`/`HelloAck`
+    /// handshake learns the peer advertises at least `MINOR_FRAME_COMPRESSION`, so
+    /// the handshake itself and any peer too old to decompress are never sent a
+    /// compressed frame. Decoding inbound compressed frames is always supported
+    /// and does not consult this.
+    compression: AtomicBool,
 }
 impl QuicClient {
     pub async fn connect(
@@ -162,7 +171,15 @@ impl QuicClient {
             endpoint,
             connection,
             timeout,
+            compression: AtomicBool::new(false),
         })
+    }
+
+    /// Enable or disable outbound frame compression. The client sets this once,
+    /// after `HelloAck` reveals the server's version, via
+    /// [`quickfs_protocol::peer_supports_frame_compression`].
+    pub fn set_compression(&self, enabled: bool) {
+        self.compression.store(enabled, Ordering::Relaxed);
     }
 
     pub fn peer_certificate_fingerprint(&self) -> Result<[u8; 32], TransportError> {
@@ -190,7 +207,8 @@ impl QuicClient {
         send: &mut SendStream,
         value: &T,
     ) -> Result<(), TransportError> {
-        tokio::time::timeout(self.timeout, write_frame(send, value))
+        let compress = self.compression.load(Ordering::Relaxed);
+        tokio::time::timeout(self.timeout, write_frame(send, value, compress))
             .await
             .map_err(|_| TransportError::Timeout)?
     }
@@ -267,10 +285,10 @@ impl PairingClient {
         write_result?;
         send.finish()?;
         let response: Envelope<Response> = self.inner.receive_frame(&mut recv).await?;
-        if response.version != PROTOCOL_VERSION {
+        if version_major(response.version) != PROTOCOL_MAJOR {
             return Err(TransportError::Protocol(format!(
-                "unsupported response protocol version {}",
-                response.version
+                "unsupported response protocol major version {}",
+                version_major(response.version)
             )));
         }
         if response.request_id != request.request_id {
@@ -528,8 +546,9 @@ fn validate_buffer_size(data_len: usize, maximum: u64, label: &str) -> Result<()
 pub async fn write_frame<T: Serialize>(
     send: &mut SendStream,
     value: &T,
+    compress: bool,
 ) -> Result<(), TransportError> {
-    let (prefix, body) = encode_frame(value)?;
+    let (prefix, body) = encode_frame(value, compress)?;
     let body = Zeroizing::new(body);
     send.write_all(&prefix.to_be_bytes()).await?;
     send.write_all(&body).await?;

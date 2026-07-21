@@ -330,6 +330,7 @@ impl NetworkFilesystem {
         let this = Self {
             transport: Arc::new(transport),
         };
+        this.negotiate().await?;
         match this
             .request(Request::Authenticate {
                 username,
@@ -339,6 +340,27 @@ impl NetworkFilesystem {
             .0
         {
             Response::AuthenticateAck => Ok(this),
+            r => Err(response_error(r)),
+        }
+    }
+
+    /// Exchange `Hello`/`HelloAck` before authenticating so each side learns the
+    /// other's exact version. The major was already validated by [`request`]; the
+    /// server's minor decides whether we may compress the frames we send it.
+    /// Requests before this (only the `Hello` itself) go out uncompressed.
+    async fn negotiate(&self) -> Result<()> {
+        match self
+            .request(Request::Hello {
+                client_name: "quickfs-client".into(),
+            })
+            .await?
+            .0
+        {
+            Response::HelloAck { version } => {
+                self.transport
+                    .set_compression(peer_supports_frame_compression(version));
+                Ok(())
+            }
             r => Err(response_error(r)),
         }
     }
@@ -353,7 +375,9 @@ impl NetworkFilesystem {
         write_result?;
         send.finish().map_err(TransportError::Closed)?;
         let response: Envelope<Response> = self.transport.receive_frame(&mut recv).await?;
-        if response.version != PROTOCOL_VERSION || response.request_id != request.request_id {
+        if version_major(response.version) != PROTOCOL_MAJOR
+            || response.request_id != request.request_id
+        {
             return Err(ClientError::UnexpectedResponse);
         };
         Ok((response.message, Some(recv)))
@@ -377,7 +401,8 @@ impl NetworkFilesystem {
         send.finish().map_err(TransportError::Closed)?;
 
         let first: Envelope<Response> = self.transport.receive_frame(&mut recv).await?;
-        if first.version != PROTOCOL_VERSION || first.request_id != request.request_id {
+        if version_major(first.version) != PROTOCOL_MAJOR || first.request_id != request.request_id
+        {
             return Err(ClientError::UnexpectedResponse);
         }
         let (revision, directory, parent, xattrs, entry_count) = match first.message {
@@ -399,7 +424,9 @@ impl NetworkFilesystem {
         let mut entries: Vec<DirectoryViewEntry> = Vec::with_capacity(capacity);
         loop {
             let frame: Envelope<Response> = self.transport.receive_frame(&mut recv).await?;
-            if frame.version != PROTOCOL_VERSION || frame.request_id != request.request_id {
+            if version_major(frame.version) != PROTOCOL_MAJOR
+                || frame.request_id != request.request_id
+            {
                 return Err(ClientError::UnexpectedResponse);
             }
             match frame.message {
@@ -433,7 +460,9 @@ impl NetworkFilesystem {
         self.transport.send_all(&mut send, data).await?;
         send.finish().map_err(TransportError::Closed)?;
         let response: Envelope<Response> = self.transport.receive_frame(&mut recv).await?;
-        if response.version != PROTOCOL_VERSION || response.request_id != request.request_id {
+        if version_major(response.version) != PROTOCOL_MAJOR
+            || response.request_id != request.request_id
+        {
             return Err(ClientError::UnexpectedResponse);
         }
         Ok((response.message, Some(recv)))
