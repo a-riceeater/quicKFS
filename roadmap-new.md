@@ -93,14 +93,21 @@ about HTTP.
 
 ## 2. Protocol surface & framing
 
-- **[P0] Directory pagination.** `MAX_FRAME_SIZE = 1 MiB` caps one response
-  frame, so a single directory with more than ~10k entries cannot be projected
-  in one `DirectoryView` even after inline xattrs/snapshots are stripped
-  (`fit_directory_view_response` → `TooLarge` → client `EFBIG`). Real media
-  libraries hit this. Needs a **paginated or streamed directory response**
-  (cursor/continuation token, or multi-frame streaming over the request's
-  stream). *Where:* `crates/protocol/src/lib.rs` (`ListDirectoryView`,
-  `fit_directory_view_response`), server handler, client `readdir`.
+- **[DONE — protocol v7] Directory pagination.** `MAX_FRAME_SIZE = 1 MiB` used
+  to cap one response frame, so a single directory with more than ~10k entries
+  could not be projected in one `DirectoryView` even after inline
+  xattrs/snapshots were stripped (`fit_directory_view_response` → `TooLarge` →
+  client `EFBIG`). Real media libraries hit this. **Resolved** with multi-frame
+  streaming over the request's own stream (chosen over cursor tokens to keep one
+  revision-consistent snapshot and avoid server-side cursor state): a view too
+  large for one frame is sent as `DirectoryViewStart` + N `DirectoryViewChunk` +
+  `DirectoryViewEnd`; the client reassembles it transparently so layers above
+  the transport are unchanged. Scan cap changed from a frame estimate to
+  `MAX_DIRECTORY_ENTRIES`; legacy `ListDirectory` now returns a clean `TooLarge`
+  instead of dropping the connection. *Where landed:* `crates/protocol`
+  (variants + `DIRECTORY_VIEW_CHUNK_BUDGET`), `crates/server-core` scan gate,
+  daemon `write_directory_view`/`stream_directory_view`, client-core
+  `list_directory_view_streamed`.
 - **[P1] No server-initiated messages.** The protocol is strictly
   request/response — the server cannot push. This blocks **cross-client cache
   invalidation** (§4) and lease/notify features. Add a server-push channel
