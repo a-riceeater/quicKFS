@@ -46,15 +46,72 @@ const SEQUENTIAL_TRIGGER: u64 = 2;
 /// sequential scan as random.
 const SEQUENTIAL_SLACK_BLOCKS: u64 = 1;
 
-/// Relative delivered-throughput change treated as a real gradient rather than
-/// measurement noise when the controller decides to grow, hold, or shrink.
-const THROUGHPUT_EPSILON: f64 = 0.10;
+/// Maximum concurrently tracked sequential streams per open handle.
+///
+/// macOS multiplexes several independent readers over one FUSE file handle:
+/// page-ins for a media player's sequential stream arrive interleaved with
+/// Spotlight indexing, Quick Look thumbnailing, and the player's own index
+/// probes, all carrying the same `fh`. A single-stream tracker treats every
+/// switch between those readers as a seek, zeroes its window, and never
+/// keeps speculation alive; live traces during video playback showed exactly
+/// that (see docs/caching.md). Tracking a small fixed set of streams lets each
+/// interleaved sequential reader keep its own cursor and window.
+const MAX_PREFETCH_STREAMS: usize = 4;
+
+/// A demand read that blocked at least this long is treated as evidence that
+/// the speculative window is too small (a prefetch miss or near-miss), which
+/// is what drives window growth. Memory-cache hits complete in microseconds
+/// and persistent-cache verifications in a few milliseconds; a real network
+/// fetch is well above this floor on any link.
+const DEMAND_STALL_FLOOR: Duration = Duration::from_millis(10);
+
+/// Granularity of the global speculative in-flight budget. The permit pool is
+/// denominated in these units rather than in whole `block_size` blocks so
+/// that small-granularity streams (video players read well under 1 MiB per
+/// kernel read, so their blocks are 1 MiB) can use the whole configured byte
+/// ceiling instead of being capped at `read_ahead_max / block_size` fetches.
+const PREFETCH_PERMIT_UNIT: u64 = 64 * 1024;
+
+/// Most speculative blocks one demand read may spawn. Without this, a window
+/// refill after a stall or ramp step launches the whole window in one burst,
+/// and a concurrent demand miss then waits behind that entire wall of
+/// transfers on the wire. Topping the window up a few blocks per kernel read
+/// fills it within milliseconds of real traffic while keeping any instant's
+/// burst small.
+const SCHEDULE_BURST_BLOCKS: u64 = 8;
+
+/// Most speculative fetches in flight at once across the whole mount,
+/// independent of the byte budget.
+///
+/// The window is a *buffer* target — how far ahead of the consumer data
+/// should already be cached — not a concurrency target. Fetching the whole
+/// window concurrently runs the link as a convoy: QUIC fair-shares bandwidth,
+/// so every block's completion time becomes `in-flight bytes ÷ link rate`
+/// (live-traced at 64 × 1 MiB in flight: every fetch took ~1–3.5 s, and any
+/// demand miss during a convoy stalled playback that long). A handful of
+/// concurrent transfers is enough to run any realistic link at capacity with
+/// 1 MiB blocks (8 ÷ ~250 ms round trip ≈ 32 MB/s even at WAN latency) while
+/// keeping each individual fetch — and any demand read sharing the wire —
+/// fast. The byte pool stays the binding constraint for large-block streams.
+const PREFETCH_MAX_CONCURRENT_FETCHES: usize = 8;
+
+/// Hard deadline on one speculative fetch, comfortably above a full transport
+/// phase timeout plus reconnect budget so it only fires when the fetch is
+/// genuinely wedged rather than slow.
+const PREFETCH_FETCH_DEADLINE: Duration = Duration::from_secs(120);
 
 /// How many times a demand read refreshes its revision snapshot and retries
 /// after observing that the remote file moved past the handle's recorded
 /// revision. Each retry re-reads at the newest known revision, so more than a
 /// couple only lose against a continuously rewriting concurrent writer.
 const STALE_REVISION_RETRIES: u32 = 3;
+
+/// Temporary diagnostic switch: `QUICKFS_PREFETCH_DEBUG=1` streams controller
+/// decisions and demand-stall events to stderr.
+fn prefetch_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QUICKFS_PREFETCH_DEBUG").is_some())
+}
 
 pub trait FilesystemCache:
     MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache + NodeCacheInvalidation
@@ -86,18 +143,6 @@ impl Default for CachePolicy {
     }
 }
 
-impl CachePolicy {
-    /// Maximum number of `block_size` blocks the speculative window may hold in
-    /// flight at once, derived from the memory ceiling. `0` means read-ahead is
-    /// disabled.
-    fn read_ahead_cap_blocks(&self) -> u64 {
-        if self.block_size == 0 {
-            return 0;
-        }
-        self.read_ahead_max_bytes / self.block_size
-    }
-}
-
 #[derive(Clone)]
 struct CachedHandle {
     node: NodeId,
@@ -126,37 +171,61 @@ impl HandlePrefetch {
     }
 }
 
-/// Adaptive, self-tuning sequential read-ahead controller for a single handle.
+/// Adaptive sequential read-ahead controller for a single handle.
 ///
 /// quicKFS exists to hide long round trips. A lone sequential read fails to do
 /// that because macFUSE issues sequential access as independent `read`
 /// callbacks: each one stalls a full RTT before the next begins, so only one
 /// range request is ever in flight and the link sits mostly idle. This
 /// controller keeps a *window* of speculative block fetches in flight ahead of
-/// the consumer so that, by the time the kernel asks for the next block, it is
-/// already cached or already being fetched.
+/// each sequential consumer so that, by the time the kernel asks for the next
+/// block, it is already cached or already being fetched.
 ///
-/// The window is not a constant. The number of concurrent range requests that
-/// saturates a link depends on its bandwidth-delay product, which varies by
-/// location, network, and even minute to minute — a sub-millisecond LAN needs
-/// ~1 while a high-RTT WAN needs many. The controller therefore hill-climbs the
-/// window against *measured delivered throughput*: it grows the window while
-/// serving reads faster, holds when throughput plateaus (the link is
-/// saturated), and backs off on regression or error. Delivered throughput is
-/// measured directly at the demand-read path — when the window is too small,
-/// demand reads stall on the network (low rate); as the window grows to cover
-/// the pipe, demand reads become cache hits (high rate) — so no separate
-/// bandwidth probe is needed. Growth is bounded by [`CachePolicy`]'s memory
-/// ceiling.
+/// Two properties matter for real macOS traffic:
+///
+/// * **Multiple interleaved streams.** The kernel multiplexes independent
+///   readers over one FUSE handle (a video player's page-ins interleave with
+///   Spotlight and Quick Look touching the same file). The controller tracks
+///   up to [`MAX_PREFETCH_STREAMS`] concurrent sequential streams, matching
+///   each read to the stream it continues, so one reader's seeks never destroy
+///   another reader's window. Reads that continue no tracked stream recycle
+///   the least-recently-used slot and start cold — genuinely random access
+///   therefore never speculates.
+/// * **Stall-driven window sizing.** The window grows exactly when a demand
+///   read actually blocked on the network ([`DEMAND_STALL_FLOOR`]) — direct
+///   evidence the window does not cover the link's bandwidth-delay product —
+///   and holds while demand reads are being served from prefetched data.
+///   Growth is paced by delivered bytes (at most one doubling per half-window
+///   delivered) so a single long stall cannot balloon the window, and it is
+///   bounded by [`CachePolicy`]'s memory ceiling. An earlier design
+///   hill-climbed on delivered throughput measured over demand-blocked time;
+///   once reads became prefetch hits that signal was pure noise and the
+///   window whipsawed instead of holding (live-debugged on a LAN mount —
+///   see docs/caching.md).
 #[derive(Default)]
 struct SequentialPrefetcher {
-    /// File revision the cursor and window are tracking. A revision bump orphans
-    /// speculatively fetched blocks, so state resets when it changes.
+    /// File revision the streams are tracking. A revision bump orphans
+    /// speculatively fetched blocks, so all stream state resets when it
+    /// changes.
     revision: u64,
-    /// Whether a sequential run long enough to speculate on is in progress.
+    /// Monotonic source for stream identifiers, used by completion callbacks.
+    next_stream_id: u64,
+    /// Monotonic touch ordinal for least-recently-used slot recycling.
+    touch_counter: u64,
+    /// Concurrently tracked sequential streams, at most
+    /// [`MAX_PREFETCH_STREAMS`].
+    streams: Vec<PrefetchStream>,
+}
+
+/// One tracked sequential stream within a handle.
+struct PrefetchStream {
+    /// Stable identifier so completion callbacks survive slot recycling.
+    id: u64,
+    /// Last touch ordinal for LRU replacement.
+    last_touch: u64,
+    /// Whether the run is long enough to speculate on.
     active: bool,
-    /// Byte offset at which the next read is expected to begin if the stream is
-    /// still sequential.
+    /// Byte offset at which this stream's next read is expected to begin.
     next_expected: u64,
     /// Consecutive in-order reads observed in the current run.
     run: u64,
@@ -166,18 +235,15 @@ struct SequentialPrefetcher {
     window_blocks: u64,
     /// Speculative fetches spawned but not yet completed.
     inflight: u64,
-    /// Delivered bytes accumulated since the last window decision.
-    epoch_bytes: u64,
-    /// Demand-read blocking time accumulated since the last window decision.
-    epoch_elapsed: Duration,
-    /// Delivered throughput measured at the previous decision, for the gradient.
-    last_rate: f64,
+    /// Demand bytes delivered since the window last grew, pacing growth.
+    bytes_since_growth: u64,
 }
 
 impl SequentialPrefetcher {
-    /// Records a completed demand read and returns the speculative blocks to
-    /// schedule next. `inflight` is bumped for every returned block so the
-    /// caller only has to spawn the fetches.
+    /// Records a completed demand read and returns the stream it matched plus
+    /// the speculative blocks to schedule next. The stream's `inflight` is
+    /// bumped for every returned block so the caller only has to spawn the
+    /// fetches and report each completion via [`Self::complete`].
     #[allow(clippy::too_many_arguments)]
     fn observe(
         &mut self,
@@ -189,12 +255,12 @@ impl SequentialPrefetcher {
         elapsed: Duration,
         block_size: u64,
         cap_blocks: u64,
-    ) -> Vec<RangeKey> {
+    ) -> (u64, Vec<RangeKey>) {
         if block_size == 0 || cap_blocks == 0 {
-            return Vec::new();
+            return (0, Vec::new());
         }
         // A new revision invalidates every speculatively fetched block; start
-        // the run over rather than reading a stale cursor forward.
+        // over rather than reading stale cursors forward.
         if revision != self.revision {
             *self = SequentialPrefetcher {
                 revision,
@@ -204,94 +270,119 @@ impl SequentialPrefetcher {
 
         let read_end = offset.saturating_add(returned);
         let slack = block_size.saturating_mul(SEQUENTIAL_SLACK_BLOCKS);
-        let sequential = self.run > 0
-            && offset <= self.next_expected.saturating_add(slack)
-            && offset.saturating_add(slack) >= self.next_expected;
-        if sequential {
-            self.run = self.run.saturating_add(1);
-            self.next_expected = self.next_expected.max(read_end);
-        } else {
-            // A non-trivial seek ends the run. Disable speculation until a fresh
-            // sequential run re-establishes; random/seeky access must not
-            // prefetch and waste bandwidth.
-            self.active = false;
-            self.run = 1;
-            self.window_blocks = 0;
-            self.cursor = read_end;
-            self.next_expected = read_end;
-            self.epoch_bytes = 0;
-            self.epoch_elapsed = Duration::ZERO;
-            self.last_rate = 0.0;
-            return Vec::new();
+        self.touch_counter = self.touch_counter.wrapping_add(1);
+        let touch = self.touch_counter;
+
+        // Match this read to the tracked stream it continues: the one whose
+        // expected offset is nearest, within slack for kernel read-ahead
+        // reordering.
+        let matched = self
+            .streams
+            .iter()
+            .enumerate()
+            .filter(|(_, stream)| {
+                offset <= stream.next_expected.saturating_add(slack)
+                    && offset.saturating_add(slack) >= stream.next_expected
+            })
+            .min_by_key(|(_, stream)| stream.next_expected.abs_diff(offset))
+            .map(|(index, _)| index);
+
+        let Some(index) = matched else {
+            // A read continuing no tracked stream starts a fresh one; recycle
+            // the least-recently-used slot. Other streams keep their windows,
+            // so one reader's seek never resets another reader's speculation.
+            if self.streams.len() >= MAX_PREFETCH_STREAMS
+                && let Some(oldest) = self
+                    .streams
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, stream)| stream.last_touch)
+                    .map(|(index, _)| index)
+            {
+                let evicted = self.streams.swap_remove(oldest);
+                if prefetch_debug() && evicted.active {
+                    eprintln!(
+                        "[prefetch] stream {} evicted: expected={} window={} inflight={}",
+                        evicted.id, evicted.next_expected, evicted.window_blocks, evicted.inflight
+                    );
+                }
+            }
+            self.next_stream_id = self.next_stream_id.wrapping_add(1);
+            let id = self.next_stream_id;
+            self.streams.push(PrefetchStream {
+                id,
+                last_touch: touch,
+                active: false,
+                next_expected: read_end,
+                run: 1,
+                cursor: read_end,
+                window_blocks: 0,
+                inflight: 0,
+                bytes_since_growth: 0,
+            });
+            return (id, Vec::new());
+        };
+
+        let revision = self.revision;
+        let stream = &mut self.streams[index];
+        stream.last_touch = touch;
+        stream.run = stream.run.saturating_add(1);
+        stream.next_expected = stream.next_expected.max(read_end);
+        if stream.run < SEQUENTIAL_TRIGGER {
+            return (stream.id, Vec::new());
+        }
+        if !stream.active {
+            stream.active = true;
+            stream.window_blocks = 1;
+            stream.cursor = stream.cursor.max(read_end);
+            stream.bytes_since_growth = 0;
         }
 
-        if self.run < SEQUENTIAL_TRIGGER {
-            return Vec::new();
-        }
-        if !self.active {
-            self.active = true;
-            self.window_blocks = 1;
-            self.cursor = self.cursor.max(read_end);
+        // Grow on direct evidence of a too-small window: the demand read
+        // blocked on the network. Pace doublings by delivered bytes so one
+        // stall spread across several kernel reads grows the window once, and
+        // hold (never shrink) while prefetch is keeping demand reads unblocked
+        // — jitter absorption is worth far more than the bounded memory a
+        // resting window holds.
+        stream.bytes_since_growth = stream.bytes_since_growth.saturating_add(returned);
+        if elapsed >= DEMAND_STALL_FLOOR
+            && stream.window_blocks < cap_blocks
+            && stream.bytes_since_growth
+                >= stream.window_blocks.max(1).saturating_mul(block_size) / 2
+        {
+            stream.window_blocks = (stream.window_blocks.saturating_mul(2)).min(cap_blocks);
+            stream.bytes_since_growth = 0;
+            if prefetch_debug() {
+                eprintln!(
+                    "[prefetch] stream {} grow: window={} blocked={}ms inflight={}",
+                    stream.id,
+                    stream.window_blocks,
+                    elapsed.as_millis(),
+                    stream.inflight
+                );
+            }
         }
 
-        self.accumulate_and_adjust(returned, elapsed, block_size, cap_blocks);
-        self.schedule(node, read_end, size, block_size, cap_blocks)
-    }
-
-    /// Folds one demand read into the current decision epoch and, once a
-    /// window's worth of data has been delivered, hill-climbs `window_blocks`
-    /// against the delivered-throughput gradient.
-    fn accumulate_and_adjust(
-        &mut self,
-        returned: u64,
-        elapsed: Duration,
-        block_size: u64,
-        cap_blocks: u64,
-    ) {
-        self.epoch_bytes = self.epoch_bytes.saturating_add(returned);
-        self.epoch_elapsed = self.epoch_elapsed.saturating_add(elapsed);
-        // Decide roughly once per window's worth of delivered data so the rate
-        // sample spans the current depth and the window can ramp within a few
-        // blocks rather than waiting on a fixed byte count.
-        let quantum = self.window_blocks.max(1).saturating_mul(block_size);
-        if self.epoch_bytes < quantum {
-            return;
-        }
-        let seconds = self.epoch_elapsed.as_secs_f64().max(1e-6);
-        let rate = self.epoch_bytes as f64 / seconds;
-        if self.last_rate <= 0.0 {
-            // First sample: no gradient yet, take one growth step to start the
-            // climb.
-            self.window_blocks = (self.window_blocks.saturating_mul(2))
-                .min(cap_blocks)
-                .max(1);
-        } else if rate > self.last_rate * (1.0 + THROUGHPUT_EPSILON) {
-            // Throughput still rising with depth: keep filling the pipe.
-            self.window_blocks = (self.window_blocks.saturating_mul(2))
-                .min(cap_blocks)
-                .max(1);
-        } else if rate < self.last_rate * (1.0 - THROUGHPUT_EPSILON) {
-            // Regression (congestion, server queueing, consumer slowdown): back
-            // off multiplicatively.
-            self.window_blocks = (self.window_blocks / 2).max(1);
-        }
-        // Otherwise the link is saturated (plateau): hold the window.
-        self.last_rate = rate;
-        self.epoch_bytes = 0;
-        self.epoch_elapsed = Duration::ZERO;
+        let blocks = Self::schedule(
+            stream, node, revision, read_end, size, block_size, cap_blocks,
+        );
+        (stream.id, blocks)
     }
 
     /// Builds the list of not-yet-scheduled blocks in `[cursor, target)` up to
-    /// the window depth, advancing the cursor and reserving in-flight slots.
+    /// the stream's window depth, advancing its cursor and reserving in-flight
+    /// slots.
+    #[allow(clippy::too_many_arguments)]
     fn schedule(
-        &mut self,
+        stream: &mut PrefetchStream,
         node: NodeId,
+        revision: u64,
         read_end: u64,
         size: u64,
         block_size: u64,
         cap_blocks: u64,
     ) -> Vec<RangeKey> {
-        let window = self.window_blocks.min(cap_blocks);
+        let window = stream.window_blocks.min(cap_blocks);
         if window == 0 || size == 0 {
             return Vec::new();
         }
@@ -301,45 +392,73 @@ impl SequentialPrefetcher {
             .div_ceil(block_size)
             .saturating_mul(block_size)
             .min(size);
-        self.cursor = self.cursor.max(demand_block_end);
+        stream.cursor = stream.cursor.max(demand_block_end);
         let target = demand_block_end
             .saturating_add(window.saturating_mul(block_size))
             .min(size);
-        // Cap new fetches so total outstanding speculation stays within the
-        // window; the rest is picked up on later reads as slots free.
-        let mut budget = window.saturating_sub(self.inflight);
+        // Cap new fetches so this stream's outstanding speculation stays
+        // within its window (and any one read's burst stays small); the rest
+        // is picked up on later reads as slots free.
+        let mut budget = window
+            .saturating_sub(stream.inflight)
+            .min(SCHEDULE_BURST_BLOCKS);
         let mut blocks = Vec::new();
-        while self.cursor < target && budget > 0 {
-            let length = block_size.min(size - self.cursor);
+        while stream.cursor < target && budget > 0 {
+            let length = block_size.min(size - stream.cursor);
             if length == 0 {
                 break;
             }
             blocks.push(RangeKey {
-                file: RevisionKey {
-                    node,
-                    revision: self.revision,
-                },
-                offset: self.cursor,
+                file: RevisionKey { node, revision },
+                offset: stream.cursor,
                 length,
             });
-            self.cursor = self.cursor.saturating_add(block_size);
+            stream.cursor = stream.cursor.saturating_add(block_size);
             budget -= 1;
         }
-        self.inflight = self.inflight.saturating_add(blocks.len() as u64);
+        stream.inflight = stream.inflight.saturating_add(blocks.len() as u64);
         blocks
     }
 
-    /// Marks one spawned speculative fetch as finished. On error the run is
-    /// paused so a dead connection is not hammered; a later successful demand
-    /// read re-establishes the run.
-    fn complete(&mut self, ok: bool) {
-        self.inflight = self.inflight.saturating_sub(1);
+    /// Returns blocks whose permit budget was unavailable to `stream_id`: the
+    /// cursor rewinds to the first unscheduled block and the reserved
+    /// in-flight slots are released, so a later read re-schedules them once
+    /// budget frees instead of leaving a never-fetched hole in the window.
+    fn unschedule(&mut self, stream_id: u64, blocks: &[RangeKey]) {
+        let Some(first) = blocks.first() else {
+            return;
+        };
+        let Some(stream) = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.id == stream_id)
+        else {
+            return;
+        };
+        stream.inflight = stream.inflight.saturating_sub(blocks.len() as u64);
+        stream.cursor = stream.cursor.min(first.offset);
+    }
+
+    /// Marks one spawned speculative fetch of `stream_id` as finished. On
+    /// error that stream is paused so a dead connection is not hammered; a
+    /// later successful demand read re-establishes it. The stream may already
+    /// have been recycled, in which case there is nothing to update.
+    fn complete(&mut self, stream_id: u64, ok: bool) {
+        let Some(stream) = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.id == stream_id)
+        else {
+            return;
+        };
+        stream.inflight = stream.inflight.saturating_sub(1);
         if !ok {
-            self.active = false;
-            self.window_blocks = 0;
-            self.last_rate = 0.0;
-            self.epoch_bytes = 0;
-            self.epoch_elapsed = Duration::ZERO;
+            if prefetch_debug() {
+                eprintln!("[prefetch] stream {stream_id} speculative fetch FAILED; pausing");
+            }
+            stream.active = false;
+            stream.window_blocks = 0;
+            stream.bytes_since_growth = 0;
         }
     }
 }
@@ -402,11 +521,29 @@ struct Fetcher {
     inner: Arc<dyn RemoteFilesystem>,
     cache: Arc<dyn FilesystemCache>,
     range_fetches: Mutex<HashMap<RangeKey, Arc<RangeFetch>>>,
-    /// Global cap on concurrent *speculative* fetches, sized to the read-ahead
-    /// memory ceiling so total speculative bytes in flight stay bounded across
-    /// every handle. Demand fetches never take a permit, so a wall of
-    /// speculation can never delay an interactive read.
+    /// Global budget on speculative bytes in flight, denominated in
+    /// [`PREFETCH_PERMIT_UNIT`] units and sized to the read-ahead memory
+    /// ceiling. Each speculative fetch acquires permits proportional to its
+    /// block length, so the ceiling holds regardless of block granularity
+    /// (an earlier version counted whole `block_size` blocks, which capped
+    /// 1 MiB-granularity video streams at four concurrent fetches). Demand
+    /// fetches never take a permit, so a wall of speculation can never delay
+    /// an interactive read.
     prefetch_permits: Arc<Semaphore>,
+    /// Total permits in `prefetch_permits`, for clamping one block's request.
+    prefetch_permit_total: u32,
+    /// Cap on concurrent speculative fetches
+    /// ([`PREFETCH_MAX_CONCURRENT_FETCHES`]), so speculation streams the
+    /// window as a fast trickle instead of a convoy.
+    prefetch_fetch_slots: Arc<Semaphore>,
+}
+
+/// Permits one speculative fetch of `length` bytes must hold, clamped so a
+/// single block can never request more than the whole pool.
+fn prefetch_permits_for(length: u64, total: u32) -> u32 {
+    u32::try_from(length.div_ceil(PREFETCH_PERMIT_UNIT))
+        .unwrap_or(u32::MAX)
+        .clamp(1, total.max(1))
 }
 
 impl Fetcher {
@@ -503,16 +640,22 @@ impl CachedFilesystem {
                 "cache block size must be within the client read limit".into(),
             ));
         }
-        // At least one permit keeps the semaphore usable even when read-ahead is
-        // configured off; scheduling is separately gated on the block cap.
-        let prefetch_permits = Arc::new(Semaphore::new(
-            policy.read_ahead_cap_blocks().max(1) as usize
-        ));
+        // At least one permit keeps the semaphore usable even when read-ahead
+        // is configured off; scheduling is separately gated on the block cap.
+        // The pool is denominated in PREFETCH_PERMIT_UNIT bytes (clamped well
+        // under tokio's permit ceiling) so streams of any block granularity
+        // share the same byte budget.
+        let prefetch_permit_total =
+            u32::try_from((policy.read_ahead_max_bytes / PREFETCH_PERMIT_UNIT).clamp(1, 1 << 20))
+                .unwrap_or(1 << 20);
+        let prefetch_permits = Arc::new(Semaphore::new(prefetch_permit_total as usize));
         let fetcher = Arc::new(Fetcher {
             inner: Arc::clone(&inner),
             cache: Arc::clone(&cache),
             range_fetches: Mutex::new(HashMap::new()),
             prefetch_permits,
+            prefetch_permit_total,
+            prefetch_fetch_slots: Arc::new(Semaphore::new(PREFETCH_MAX_CONCURRENT_FETCHES)),
         });
         Ok(Self {
             inner,
@@ -656,7 +799,11 @@ impl CachedFilesystem {
     /// while small reads use a bounded 1 MiB window. Read-ahead schedules at
     /// the same granularity so speculative and demand fetches coalesce.
     fn demand_block_size(&self, length: u64) -> u64 {
-        if length < SMALL_READ_THRESHOLD {
+        // Inclusive: macFUSE commonly delivers reads of exactly 1 MiB (its
+        // negotiated max read-ahead), and serving those from 16 MiB blocks
+        // makes every prefetch miss a whole-large-block wait — a multi-second
+        // playback freeze on links in the tens of MB/s.
+        if length <= SMALL_READ_THRESHOLD {
             self.policy.block_size.min(SMALL_READ_AHEAD_BLOCK_SIZE)
         } else {
             self.policy.block_size
@@ -730,9 +877,9 @@ impl CachedFilesystem {
         if cap_blocks == 0 {
             return;
         }
-        let blocks = {
+        let (stream_id, blocks) = {
             let mut controller = state.prefetch.controller.lock().await;
-            controller.observe(
+            let (stream_id, scheduled) = controller.observe(
                 state.node,
                 offset,
                 returned,
@@ -741,22 +888,96 @@ impl CachedFilesystem {
                 elapsed,
                 granularity,
                 cap_blocks,
-            )
+            );
+            if prefetch_debug() && elapsed.as_millis() > 250 {
+                eprintln!(
+                    "[prefetch] demand stalled: off={:.1}MB len={}KiB blocked={}ms gran={}KiB stream={} sched={}",
+                    offset as f64 / 1e6,
+                    returned / 1024,
+                    elapsed.as_millis(),
+                    granularity / 1024,
+                    stream_id,
+                    scheduled.len()
+                );
+            }
+            // Reserve byte-proportional permits from the global pool *now*,
+            // while the blocks are still ours to unschedule. A block whose
+            // budget is unavailable must not be scheduled at all: a task
+            // parked on the semaphore counts as in-flight and has advanced
+            // the cursor, so the controller believes the block is coming
+            // while nothing fetches it — a hole in the prefetched region
+            // that later surfaces as a multi-second demand stall behind a
+            // wall of speculative transfers. Demand reads never take
+            // permits, so speculation still can never starve interactive
+            // I/O.
+            let mut granted = Vec::with_capacity(scheduled.len());
+            let mut denied = None;
+            for (index, block) in scheduled.iter().enumerate() {
+                let units = prefetch_permits_for(block.length, self.fetcher.prefetch_permit_total);
+                let Ok(slot) = Arc::clone(&self.fetcher.prefetch_fetch_slots).try_acquire_owned()
+                else {
+                    denied = Some(index);
+                    break;
+                };
+                match Arc::clone(&self.fetcher.prefetch_permits).try_acquire_many_owned(units) {
+                    Ok(permit) => granted.push((*block, slot, permit)),
+                    Err(_) => {
+                        denied = Some(index);
+                        break;
+                    }
+                }
+            }
+            if let Some(denied) = denied {
+                controller.unschedule(stream_id, &scheduled[denied..]);
+                if prefetch_debug() {
+                    eprintln!(
+                        "[prefetch] stream {} permit-starved: unscheduled {} of {} blocks",
+                        stream_id,
+                        scheduled.len() - denied,
+                        scheduled.len()
+                    );
+                }
+            }
+            (stream_id, granted)
         };
-        for block in blocks {
+        for (block, slot, permit) in blocks {
             let fetcher = Arc::clone(&self.fetcher);
             let handle_prefetch = Arc::clone(&state.prefetch);
-            let permits = Arc::clone(&self.fetcher.prefetch_permits);
             let expected_revision = state.revision;
             tokio::spawn(async move {
-                // Speculation waits for a global permit; demand reads never do,
-                // so read-ahead can never starve interactive I/O.
-                let _permit = permits.acquire_owned().await;
-                let ok = fetcher
-                    .fetch_block(inner_handle, expected_revision, block)
+                // The fetch slot and byte permits reserved above are held for
+                // the fetch's lifetime and released on drop. The fetch itself
+                // is deadlined: a fetch wedged behind a dying connection and
+                // its reconnect/retry ladder must not pin its slot and byte
+                // budget indefinitely — with all slots pinned, speculation
+                // halts mount-wide, and a demand read that single-flight-joins
+                // the wedged fetch inherits the unbounded wait (observed live
+                // as a multi-minute mmap page-in hang). On timeout the fetch
+                // future is dropped (a single-flight joiner, if any, takes
+                // over the initialization), the stream is paused, and the
+                // block is simply refetched on demand later.
+                let _slot = slot;
+                let _permit = permit;
+                let started = Instant::now();
+                let ok = tokio::time::timeout(
+                    PREFETCH_FETCH_DEADLINE,
+                    fetcher.fetch_block(inner_handle, expected_revision, block),
+                )
+                .await
+                .map(|result| result.is_ok())
+                .unwrap_or(false);
+                if prefetch_debug() && (!ok || started.elapsed().as_millis() > 1000) {
+                    eprintln!(
+                        "[prefetch] speculative fetch off={:.1}MB took {}ms ok={ok}",
+                        block.offset as f64 / 1e6,
+                        started.elapsed().as_millis()
+                    );
+                }
+                handle_prefetch
+                    .controller
+                    .lock()
                     .await
-                    .is_ok();
-                handle_prefetch.controller.lock().await.complete(ok);
+                    .complete(stream_id, ok);
             });
         }
     }
@@ -1639,6 +1860,9 @@ mod tests {
             let mut metadata = Self::metadata(node);
             if node == FILE_NODE {
                 metadata.revision = self.file_revision();
+                if !self.data.is_empty() {
+                    metadata.size = self.data.len() as u64;
+                }
             }
             Ok(metadata)
         }
@@ -1685,7 +1909,11 @@ mod tests {
                 } else {
                     Self::metadata(node).revision
                 },
-                size: Self::metadata(node).size,
+                size: if node == FILE_NODE && !self.data.is_empty() {
+                    self.data.len() as u64
+                } else {
+                    Self::metadata(node).size
+                },
             })
         }
 
@@ -1965,6 +2193,10 @@ mod tests {
     /// Builds a `FILE_NODE`-sized filesystem whose reads take `delay_ms`,
     /// simulating a high-latency link so the effect of concurrency is visible.
     fn latency_toggle(delay_ms: u64) -> Arc<ToggleFilesystem> {
+        latency_toggle_with_size(delay_ms, 2 * 1024 * 1024)
+    }
+
+    fn latency_toggle_with_size(delay_ms: u64, bytes: usize) -> Arc<ToggleFilesystem> {
         Arc::new(ToggleFilesystem {
             offline: AtomicBool::new(false),
             fail_reads: AtomicBool::new(false),
@@ -1977,7 +2209,7 @@ mod tests {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             revision_bump: AtomicU64::new(0),
-            data: vec![0x5a; 2 * 1024 * 1024],
+            data: vec![0x5a; bytes],
         })
     }
 
@@ -2133,6 +2365,10 @@ mod tests {
 
     /// Random, non-sequential access must not speculate: prefetch stays off, so
     /// concurrency stays at one and no block beyond the demand is fetched.
+    /// With multi-stream tracking a "random" pattern is one where no read
+    /// continues any tracked stream's expected offset — descending jumps
+    /// guarantee that, since every tracked expectation is ahead of its last
+    /// read.
     #[tokio::test]
     async fn random_reads_do_not_prefetch() {
         let inner = latency_toggle(5);
@@ -2147,9 +2383,7 @@ mod tests {
         .unwrap();
         let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
 
-        // Offsets that jump by more than the sequential slack each time, so the
-        // run never establishes.
-        let offsets = [0_u64, 6 * BLOCK, 2 * BLOCK, 7 * BLOCK, BLOCK];
+        let offsets = [7 * BLOCK, 5 * BLOCK, 3 * BLOCK, BLOCK];
         for offset in offsets {
             filesystem.read_range(handle, offset, BLOCK).await.unwrap();
         }
@@ -2159,6 +2393,96 @@ mod tests {
 
         assert_eq!(inner.max_in_flight.load(Ordering::SeqCst), 1);
         assert_eq!(inner.reads.load(Ordering::SeqCst), offsets.len());
+    }
+
+    /// Two sequential readers interleaved on one handle — a media player's
+    /// stream plus Spotlight/Quick Look page-ins share one FUSE `fh` on macOS
+    /// — must each keep their own speculative window. The old single-stream
+    /// tracker treated every switch as a seek and reset the window to zero,
+    /// so playback never got read-ahead while anything else touched the file.
+    #[tokio::test]
+    async fn interleaved_sequential_streams_both_prefetch() {
+        let inner = latency_toggle(20);
+        let filesystem = CachedFilesystem::new(
+            inner.clone(),
+            Arc::new(MemoryCache::default()),
+            CachePolicy {
+                block_size: BLOCK,
+                read_ahead_max_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
+
+        // Stream A reads blocks 0..4, stream B reads blocks 4..8, interleaved.
+        let mut assembled = Vec::new();
+        for index in 0..4_u64 {
+            let a = filesystem
+                .read_range(handle, index * BLOCK, BLOCK)
+                .await
+                .unwrap();
+            let b = filesystem
+                .read_range(handle, (4 + index) * BLOCK, BLOCK)
+                .await
+                .unwrap();
+            assembled.extend_from_slice(&a);
+            assembled.extend_from_slice(&b);
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(assembled.len(), 2 * 1024 * 1024);
+        assert!(assembled.iter().all(|byte| *byte == 0x5a));
+        // Speculation overlapped fetches despite the interleaving...
+        assert!(
+            inner.max_in_flight.load(Ordering::SeqCst) >= 2,
+            "interleaved streams got no read-ahead: max in flight {}",
+            inner.max_in_flight.load(Ordering::SeqCst)
+        );
+        // ...and single-flight still fetched every block exactly once.
+        assert_eq!(inner.reads.load(Ordering::SeqCst) as u64, 8);
+    }
+
+    /// The speculative in-flight budget is a byte ceiling, not a fetch-count
+    /// ceiling: streams fetching at the small (1 MiB) demand granularity must
+    /// be able to hold more concurrent fetches than
+    /// `read_ahead_max / block_size` would allow. With the old block-count
+    /// permits this configuration (8 MiB ceiling, 16 MiB policy blocks) had a
+    /// single permit and could never overlap speculation at all.
+    #[tokio::test]
+    async fn small_granularity_streams_use_full_byte_budget() {
+        let inner = latency_toggle_with_size(20, 16 * 1024 * 1024);
+        let filesystem = CachedFilesystem::new(
+            inner.clone(),
+            Arc::new(MemoryCache::default()),
+            CachePolicy {
+                block_size: 16 * 1024 * 1024,
+                read_ahead_max_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
+
+        // A paced sequential consumer in sub-1 MiB steps: every stall grows
+        // the window, which only pays off if more than one 1 MiB speculative
+        // fetch can actually be in flight.
+        let step = 256 * 1024_u64;
+        for index in 0..24 {
+            filesystem
+                .read_range(handle, index * step, step)
+                .await
+                .unwrap();
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            inner.max_in_flight.load(Ordering::SeqCst) >= 3,
+            "byte-denominated permits should allow several 1 MiB fetches, got {}",
+            inner.max_in_flight.load(Ordering::SeqCst)
+        );
     }
 
     /// The adaptive window is hard-bounded by the configured memory ceiling: even
@@ -2199,8 +2523,8 @@ mod tests {
         assert_eq!(inner.reads.load(Ordering::SeqCst) as u64, blocks);
     }
 
-    /// The controller pauses speculation on a non-sequential seek and resets its
-    /// cursor and window when the tracked revision changes, so a speculatively
+    /// The controller starts a fresh cold stream on a far seek and resets all
+    /// stream state when the tracked revision changes, so a speculatively
     /// fetched block from an old revision is never carried forward.
     #[test]
     fn controller_detects_pattern_and_resets_on_revision_change() {
@@ -2211,40 +2535,102 @@ mod tests {
         let mut controller = SequentialPrefetcher::default();
 
         // First read establishes the run but does not yet speculate.
-        assert!(
-            controller
-                .observe(node, 0, block, 17, size, Duration::ZERO, block, cap)
-                .is_empty()
-        );
+        let (first_stream, scheduled) =
+            controller.observe(node, 0, block, 17, size, Duration::ZERO, block, cap);
+        assert!(scheduled.is_empty());
         // Second, contiguous read crosses the trigger and schedules read-ahead
-        // beyond the demand region.
-        let scheduled =
+        // beyond the demand region on the same stream.
+        let (second_stream, scheduled) =
             controller.observe(node, block, block, 17, size, Duration::ZERO, block, cap);
+        assert_eq!(first_stream, second_stream);
         assert!(!scheduled.is_empty());
         assert!(scheduled.iter().all(|key| key.offset >= 2 * block));
         assert!(scheduled.iter().all(|key| key.file.revision == 17));
 
-        // A far seek ends the run: no speculation.
+        // A far seek continues no tracked stream: it starts a cold one with no
+        // speculation, and the original stream keeps its window.
+        let (seek_stream, scheduled) = controller.observe(
+            node,
+            40 * block,
+            block,
+            17,
+            size,
+            Duration::ZERO,
+            block,
+            cap,
+        );
+        assert_ne!(seek_stream, second_stream);
+        assert!(scheduled.is_empty());
         assert!(
             controller
-                .observe(
-                    node,
-                    40 * block,
-                    block,
-                    17,
-                    size,
-                    Duration::ZERO,
-                    block,
-                    cap
-                )
-                .is_empty()
+                .streams
+                .iter()
+                .any(|stream| stream.id == second_stream && stream.active),
+            "an unrelated seek must not reset an established stream"
         );
-        assert!(!controller.active);
 
         // A revision bump resets tracking; the next contiguous pair speculates
         // only on the new revision.
         controller.observe(node, 0, block, 18, size, Duration::ZERO, block, cap);
-        let after = controller.observe(node, block, block, 18, size, Duration::ZERO, block, cap);
+        assert_eq!(controller.streams.len(), 1);
+        let (_, after) =
+            controller.observe(node, block, block, 18, size, Duration::ZERO, block, cap);
+        assert!(!after.is_empty());
         assert!(after.iter().all(|key| key.file.revision == 18));
+    }
+
+    /// The window grows only on direct evidence of a too-small window — a
+    /// demand read that actually blocked — and holds while demand reads are
+    /// served from prefetched data. The old throughput hill-climb shrank the
+    /// window on measurement noise, which live traces showed whipsawing
+    /// between 1 and 4 blocks forever during smooth playback.
+    #[test]
+    fn controller_grows_on_stalls_and_holds_on_hits() {
+        let node = FILE_NODE;
+        let block = 1024 * 1024_u64;
+        let cap = 64;
+        let size = 1024 * 1024 * 1024;
+        let stall = Duration::from_millis(80);
+        let mut controller = SequentialPrefetcher::default();
+
+        // Establish the stream.
+        controller.observe(node, 0, block, 17, size, stall, block, cap);
+        let (stream, _) = controller.observe(node, block, block, 17, size, stall, block, cap);
+        let window_of = |controller: &SequentialPrefetcher| {
+            controller
+                .streams
+                .iter()
+                .find(|candidate| candidate.id == stream)
+                .map(|candidate| candidate.window_blocks)
+                .unwrap_or(0)
+        };
+
+        // Stalled boundary reads grow the window multiplicatively.
+        let mut offset = 2 * block;
+        let mut grown = window_of(&controller);
+        assert!(grown >= 1);
+        for _ in 0..12 {
+            controller.observe(node, offset, block, 17, size, stall, block, cap);
+            offset += block;
+        }
+        let after_stalls = window_of(&controller);
+        assert!(
+            after_stalls > grown,
+            "stalled reads must grow the window: {grown} -> {after_stalls}"
+        );
+        grown = after_stalls;
+
+        // A long stretch of prefetch hits (no blocking) holds the window
+        // instead of shrinking it — hits carry no evidence the window is
+        // wrong, and jitter absorption depends on keeping it.
+        for _ in 0..64 {
+            controller.observe(node, offset, block, 17, size, Duration::ZERO, block, cap);
+            offset += block;
+        }
+        assert_eq!(
+            window_of(&controller),
+            grown,
+            "unblocked reads must hold the window"
+        );
     }
 }

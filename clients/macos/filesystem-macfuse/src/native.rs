@@ -132,6 +132,21 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
         // --max-known-nodes-per-connection flag): an undersized ceiling would
         // surface here as directory listings failing with "too many known nodes".
         MountOption::CUSTOM("auto_xattr".into()),
+        // Disable the macOS kernel's own read-ahead for this volume. The
+        // kernel's speculative read machinery is tuned for microsecond-latency
+        // local disks: on a network filesystem it races hundreds of megabytes
+        // ahead of a sequential consumer (video playback), its speculative
+        // pages are evicted under memory pressure before the app reads them,
+        // and the kernel then re-reads the same regions in multi-hundred-MB
+        // sweeps while the app's own page-in waits behind the storm. Live
+        // traces of paced 4 MB/s playback showed 5.5x read amplification and
+        // repeating 2-4 s pageout/re-read stalls at exponentially spaced
+        // offsets (the kernel read-ahead window doubling), with the FUSE layer
+        // answering every request in under a millisecond; the same workload
+        // with kernel read-ahead disabled had zero stalls. Read pipelining is
+        // instead provided by client-core's adaptive prefetcher, which is
+        // revision-keyed, link-aware, and bounded (see docs/caching.md).
+        MountOption::CUSTOM("noreadahead".into()),
     ]);
     if !capabilities.supports_special_nodes {
         fuser_config.mount_options.push(MountOption::NoDev);

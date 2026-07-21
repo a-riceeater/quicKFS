@@ -1,5 +1,20 @@
 # quicKFS handoff — high-latency read performance
 
+## ✅ UPDATE 3 (2026-07-21): video playback stutter — kernel read-ahead thrash + prefetcher rework
+
+The user's LAN video-stutter report ("2 GB video plays ~25 s then pauses constantly") is fixed, entirely client-side. Reproduced with a paced 4 MB/s cold reader: 9–14 stalls/min, 18–27 s stalled/min. After the fix: **zero stalls** at 4 and 8 MB/s paced (60 s, cold, two files), zero-stall paced mmap, and flat-out cold sequential up 26.8 → **49.8 MB/s** (and now smooth instead of burst/stall).
+
+Five stacked causes (full narrative in a.md §2026-07-21, design in docs/caching.md):
+1. Window hill-climb on `bytes ÷ blocked-time` was noise once reads were hits → whipsawed 1↔4, never held. Now stall-driven: grow ×2 on a ≥10 ms-blocked demand read, hold on hits.
+2. One prefetch stream per FUSE handle, but macOS multiplexes player + Spotlight + Quick Look page-ins on one `fh` → every interleave reset the window. Now 4 streams/handle, LRU-recycled.
+3. Permit pool counted `read_ahead_max ÷ policy.block_size` = 4 permits while 1 MiB-granularity windows wanted 64 → 60 tasks parked as in-flight = never-fetched holes. Now byte-denominated permits + non-blocking reservation at schedule time (unfundable blocks unscheduled, cursor rewinds).
+4. Whole window fetched concurrently = convoy: QUIC fair-share made every block take `in-flight ÷ link` (1–3.5 s traced) and demand misses waited that long. Now window = buffer target; concurrency capped at 8 fetches + 8-block bursts. Exactly-1 MiB kernel reads now use 1 MiB blocks (`<=` threshold).
+5. **Dominant:** macOS kernel read-ahead raced 100+ MB past the paced consumer in 16 KiB page-ins, had its speculative pages evicted before use, re-read the same regions in sweeps (5.5× amplification) while the app's page-in queued behind the storm. Proof: same mount, control = 9 stalls/18.7 s; `F_RDAHEAD=0` = 0 stalls; `F_NOCACHE` = 0.3 s. Stall offsets doubled from run start (8/16/32/64 MB) = the kernel RA window ramp. Fix: `-o noreadahead`; our prefetcher is the read-ahead engine.
+
+Also: speculative fetches now carry a 120 s deadline after a live transport wedge pinned all 8 fetch slots and hung an mmap page-in that single-flight-joined a wedged fetch for 10+ min. The wedge itself (reconnect/retry ladder compounding) is a separate open item.
+
+The b.md §"Complementary ideas" adaptive-chunk / demand-priority notes are largely superseded: small blocks + capped concurrency achieved the same effect. The user must remount onto the new binary.
+
 ## ✅ UPDATE (2026-07-20 evening): read-ahead shipped, then throttled the cache writer — fixed
 
 The adaptive read-ahead below landed in `be60fc63` and works (cold 25 MB sequential: 0.6–1.0 → 7.2 MB/s on the RAID WAN link). But in real Finder use it exposed a persistent-cache scaling defect: **every durable store rewrote the entire manifest (state clone + full JSON serialize + 2× fsync) under the global state mutex**. With the browsed RAID tree at ~33k cache entries the manifest was 10.4 MB, so the single cache-writer thread fell hours behind, pinned a core at >100% even at idle, and starved every cache read of the state lock. Symptoms: Finder copy remote→remote failing with error 100070, Preview stalling on a cold 7 MB JPG, daemon RSS growth — while `dd` limped through and uploads (which bypass durable per-chunk cache work) looked fine.
