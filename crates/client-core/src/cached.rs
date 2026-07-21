@@ -35,10 +35,35 @@ const SMALL_READ_THRESHOLD: u64 = 1024 * 1024;
 /// [`SequentialPrefetcher`] for how the window auto-tunes within this bound.
 pub const DEFAULT_READ_AHEAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-/// A sequential run must reach this many consecutive in-order reads before
-/// speculation begins, so an isolated touch or a header probe never triggers a
-/// wave of read-ahead.
+/// A sequential run must reach this many consecutive in-order reads before the
+/// *adaptive* window arms, so an isolated touch or a header probe never triggers
+/// a full wave of read-ahead. The very first read still primes a shallow
+/// [`PRIME_WINDOW_BLOCKS`] read-ahead (below) so the second read is a cache hit
+/// rather than another serial cold fetch.
 const SEQUENTIAL_TRIGGER: u64 = 2;
+
+/// Speculative blocks fetched on the very first read of a freshly opened handle
+/// (when no stream is tracked yet), before a sequential run is confirmed. The
+/// adaptive window only arms after [`SEQUENTIAL_TRIGGER`] in-order reads, which
+/// used to leave the opening reads of a file with no cushion at all: each cold
+/// block was demand-fetched serially at full per-block latency, and on a
+/// low-latency LAN that serial ramp — not bandwidth — is what stalls the start
+/// of playback (measured: a first-open paced stream stalled 150 ms–1 s at the
+/// start, and ~1 s under a concurrent directory crawl; priming drops both to a
+/// single sub-130 ms first-block fetch). Priming pipelines the next fetch
+/// alongside the first demand read. It is gated on there being no tracked
+/// stream, so only the cold open primes — a mid-playback seek and the many
+/// short-lived streams of a metadata/thumbnail crawl do not — bounding the
+/// wasted read-ahead of a one-shot probe to at most this much (reclaimed by the
+/// LRU range cache anyway).
+const PRIME_WINDOW_BLOCKS: u64 = 2;
+
+/// Window depth a stream arms with once its sequential run is confirmed
+/// (replacing a cold start at a single block). Sized so the buffer is already a
+/// few blocks deep the moment speculation begins — deep enough to hide per-block
+/// latency at the start of playback, still far below both the concurrent-fetch
+/// cap and the byte ceiling, so it fills as a trickle rather than a convoy.
+const INITIAL_ACTIVE_WINDOW_BLOCKS: u64 = 4;
 
 /// Forward/backward slack (in blocks) still treated as one sequential stream.
 /// Kernel read-ahead and overlapping FUSE callbacks reorder slightly, so a
@@ -291,6 +316,13 @@ impl SequentialPrefetcher {
             // A read continuing no tracked stream starts a fresh one; recycle
             // the least-recently-used slot. Other streams keep their windows,
             // so one reader's seek never resets another reader's speculation.
+            //
+            // Prime a shallow read-ahead only when this is the first read of the
+            // handle (no stream tracked yet) — the cold open the user actually
+            // waits on. A seek that lands mid-file while another stream is live,
+            // or a crawl's short-lived one-shot reads, start cold with no
+            // speculation exactly as before.
+            let prime_cold_start = self.streams.is_empty();
             if self.streams.len() >= MAX_PREFETCH_STREAMS
                 && let Some(oldest) = self
                     .streams
@@ -309,7 +341,7 @@ impl SequentialPrefetcher {
             }
             self.next_stream_id = self.next_stream_id.wrapping_add(1);
             let id = self.next_stream_id;
-            self.streams.push(PrefetchStream {
+            let mut stream = PrefetchStream {
                 id,
                 last_touch: touch,
                 active: false,
@@ -319,8 +351,30 @@ impl SequentialPrefetcher {
                 window_blocks: 0,
                 inflight: 0,
                 bytes_since_growth: 0,
-            });
-            return (id, Vec::new());
+            };
+            // Prime a shallow read-ahead so the next read is served from cache
+            // instead of a serial cold fetch. `window_blocks` is only borrowed
+            // to bound this one schedule pass and is reset so the adaptive
+            // controller still starts from a clean slate when the run is
+            // confirmed below.
+            let prime = if prime_cold_start {
+                stream.window_blocks = PRIME_WINDOW_BLOCKS.min(cap_blocks);
+                let scheduled = Self::schedule(
+                    &mut stream,
+                    node,
+                    revision,
+                    read_end,
+                    size,
+                    block_size,
+                    cap_blocks,
+                );
+                stream.window_blocks = 0;
+                scheduled
+            } else {
+                Vec::new()
+            };
+            self.streams.push(stream);
+            return (id, prime);
         };
 
         let revision = self.revision;
@@ -333,7 +387,7 @@ impl SequentialPrefetcher {
         }
         if !stream.active {
             stream.active = true;
-            stream.window_blocks = 1;
+            stream.window_blocks = INITIAL_ACTIVE_WINDOW_BLOCKS.min(cap_blocks);
             stream.cursor = stream.cursor.max(read_end);
             stream.bytes_since_growth = 0;
         }
@@ -2534,10 +2588,14 @@ mod tests {
         let size = 64 * 1024 * 1024;
         let mut controller = SequentialPrefetcher::default();
 
-        // First read establishes the run but does not yet speculate.
+        // The first read of a cold handle primes a shallow read-ahead past the
+        // demand block — so the next read is a cache hit instead of a serial
+        // cold fetch — but does not yet arm the adaptive window.
         let (first_stream, scheduled) =
             controller.observe(node, 0, block, 17, size, Duration::ZERO, block, cap);
-        assert!(scheduled.is_empty());
+        assert_eq!(scheduled.len() as u64, PRIME_WINDOW_BLOCKS);
+        assert!(scheduled.iter().all(|key| key.offset >= block));
+        assert!(scheduled.iter().all(|key| key.file.revision == 17));
         // Second, contiguous read crosses the trigger and schedules read-ahead
         // beyond the demand region on the same stream.
         let (second_stream, scheduled) =
@@ -2577,6 +2635,53 @@ mod tests {
             controller.observe(node, block, block, 18, size, Duration::ZERO, block, cap);
         assert!(!after.is_empty());
         assert!(after.iter().all(|key| key.file.revision == 18));
+    }
+
+    /// A cold handle's very first read primes a shallow read-ahead so the
+    /// opening reads of playback are served from cache instead of a serial cold
+    /// fetch, and the second in-order read arms the adaptive window at its full
+    /// initial depth rather than a single block — together the fix for the
+    /// first-open buffering the adaptive-only ramp left exposed. Priming past
+    /// end-of-file schedules nothing.
+    #[test]
+    fn cold_open_primes_read_ahead_and_arms_a_deep_window() {
+        let node = FILE_NODE;
+        let block = 1024 * 1024;
+        let cap = 64;
+        let size = 64 * 1024 * 1024;
+        let mut controller = SequentialPrefetcher::default();
+
+        // First read of the cold handle primes exactly PRIME_WINDOW_BLOCKS,
+        // starting past the demand block so the two never overlap.
+        let (_, primed) = controller.observe(node, 0, block, 17, size, Duration::ZERO, block, cap);
+        assert_eq!(primed.len() as u64, PRIME_WINDOW_BLOCKS);
+        assert_eq!(primed[0].offset, block);
+
+        // The second in-order read arms the adaptive window at its full initial
+        // depth, so read-ahead is several blocks deep the moment speculation
+        // begins instead of ramping up from one.
+        controller.observe(node, block, block, 17, size, Duration::ZERO, block, cap);
+        let window = controller
+            .streams
+            .iter()
+            .find(|stream| stream.active)
+            .map(|stream| stream.window_blocks);
+        assert_eq!(window, Some(INITIAL_ACTIVE_WINDOW_BLOCKS));
+
+        // A cold open whose first read is already at end-of-file has nothing to
+        // prime, and must not schedule past the end.
+        let mut at_eof = SequentialPrefetcher::default();
+        let (_, none) = at_eof.observe(
+            node,
+            size - block,
+            block,
+            17,
+            size,
+            Duration::ZERO,
+            block,
+            cap,
+        );
+        assert!(none.is_empty());
     }
 
     /// The window grows only on direct evidence of a too-small window — a
