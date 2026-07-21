@@ -58,7 +58,7 @@ cached RemoteFilesystem
 resilient authenticated client
           │
           ▼
-QUIC/TLS 1.3  ── quickfs/6 ── independent request streams
+QUIC/TLS 1.3  ── quickfs/8 ── independent request streams
           │
           ▼
 Linux server daemon
@@ -86,7 +86,7 @@ See [Architecture](ARCHITECTURE.md) for the crate and trust boundaries.
 
 ### Transport and framing
 
-QUIC/TLS negotiates the version-specific ALPN identifier `quickfs/6`. Each filesystem operation normally uses an independent bidirectional QUIC stream on one authenticated connection, allowing concurrent reads and unrelated metadata requests to progress independently. The client sends a 10-second keepalive, both peers allow five minutes of idle time, and the connection/stream flow-control windows accommodate several concurrent maximum-size reads. Protocol versions are intentionally incompatible, so upgrade the server and clients together.
+QUIC/TLS negotiates the version-specific ALPN identifier `quickfs/8`. Each filesystem operation normally uses an independent bidirectional QUIC stream on one authenticated connection, allowing concurrent reads and unrelated metadata requests to progress independently. Control frames carry an optional per-frame zstd compression flag (see [docs/protocol.md](docs/protocol.md)). The client sends a 10-second keepalive, both peers allow five minutes of idle time, and the connection/stream flow-control windows accommodate several concurrent maximum-size reads. Protocol versions are intentionally incompatible, so upgrade the server and clients together.
 
 Control messages are Postcard-encoded and length-prefixed with a 1 MiB frame limit. Bulk read, write, and xattr data follows its control frame as an explicitly sized raw body rather than being embedded in serialization. The default negotiated read limit is 16 MiB, matching the maximum macFUSE read; writes remain limited to 8 MiB. Larger direct adapter operations are split while preserving one expected revision.
 
