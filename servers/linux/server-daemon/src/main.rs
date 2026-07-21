@@ -903,21 +903,24 @@ async fn handle(
         Request::ListDirectory { node } => export
             .list_with_revision(node)
             .await
-            .map(|(revision, entries)| Response::DirectoryListing { revision, entries })
+            .map(|(revision, entries)| directory_listing_response(id, revision, entries))
             .unwrap_or_else(|error| Response::Error(error.protocol())),
         Request::ListDirectoryView { node, options } => {
             let started = Instant::now();
-            let result = export
-                .directory_view(node, options)
-                .await
-                .map(|view| fit_directory_view_response(id, view))
-                .unwrap_or_else(|error| Response::Error(error.protocol()));
-            tracing::debug!(
-                node = %node.0,
-                elapsed_ms = started.elapsed().as_millis(),
-                "prepared enriched directory view"
-            );
-            result
+            match export.directory_view(node, options).await {
+                Ok(view) => {
+                    let entries = view.entries.len();
+                    let result = write_directory_view(&mut send, id, view).await;
+                    tracing::debug!(
+                        node = %node.0,
+                        entries,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "streamed enriched directory view"
+                    );
+                    return result;
+                }
+                Err(error) => Response::Error(error.protocol()),
+            }
         }
         Request::OpenFile { node, options } => export
             .open(node, options)
@@ -1385,43 +1388,132 @@ fn internal_error() -> Response {
     })
 }
 
-fn fit_directory_view_response(id: RequestId, mut view: DirectoryView) -> Response {
-    let fits = |candidate: &DirectoryView| {
-        encode(&Envelope {
-            version: PROTOCOL_VERSION,
-            request_id: id,
-            message: Response::DirectoryView(candidate.clone()),
-        })
-        .is_ok()
+/// Wrap a legacy (non-enriched) directory listing, degrading cleanly to a
+/// `TooLarge` error rather than crashing the connection when the single frame
+/// cannot hold the listing. The enriched `ListDirectoryView` path is streamed
+/// instead (see [`write_directory_view`]); this legacy path stays single-frame.
+fn directory_listing_response(
+    id: RequestId,
+    revision: DirectoryRevision,
+    entries: Vec<DirectoryEntry>,
+) -> Response {
+    let envelope = Envelope {
+        version: PROTOCOL_VERSION,
+        request_id: id,
+        message: Response::DirectoryListing { revision, entries },
     };
-    if fits(&view) {
-        return Response::DirectoryView(view);
-    }
-
-    if let Some(xattrs) = &mut view.xattrs {
-        xattrs.inline_values.clear();
-    }
-    for entry in &mut view.entries {
-        if let Some(xattrs) = &mut entry.xattrs {
-            xattrs.inline_values.clear();
-        }
-    }
-    if fits(&view) {
-        return Response::DirectoryView(view);
-    }
-
-    view.xattrs = None;
-    for entry in &mut view.entries {
-        entry.xattrs = None;
-    }
-    if fits(&view) {
-        Response::DirectoryView(view)
+    if encode(&envelope).is_ok() {
+        envelope.message
     } else {
         Response::Error(ProtocolError {
             code: ErrorCode::TooLarge,
-            message: "directory view exceeds the control-frame limit".into(),
+            message: "directory listing exceeds the control-frame limit".into(),
         })
     }
+}
+
+/// Send an enriched directory view. A view that fits one frame is written as a
+/// single `DirectoryView` response, unchanged from the pre-streaming protocol.
+/// A larger view is streamed as `DirectoryViewStart` + N `DirectoryViewChunk` +
+/// `DirectoryViewEnd` on the same stream. The stream is finished either way.
+async fn write_directory_view(
+    send: &mut SendStream,
+    id: RequestId,
+    view: DirectoryView,
+) -> Result<()> {
+    let single = Envelope {
+        version: PROTOCOL_VERSION,
+        request_id: id,
+        message: Response::DirectoryView(view),
+    };
+    match encode(&single) {
+        Ok(frame) => {
+            write_length_prefixed(send, &frame).await?;
+            send.finish()?;
+            return Ok(());
+        }
+        Err(CodecError::TooLarge(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let Response::DirectoryView(view) = single.message else {
+        unreachable!("envelope was constructed as DirectoryView");
+    };
+    stream_directory_view(send, id, view).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Stream a directory view whose projection exceeds one frame. Entries are
+/// packed greedily into `DirectoryViewChunk` frames of at most
+/// `DIRECTORY_VIEW_CHUNK_BUDGET` bytes; a lone entry larger than the budget
+/// sheds its inline xattr values (still reachable via `GetXattr`) so the wire
+/// remains frame-bounded.
+async fn stream_directory_view(
+    send: &mut SendStream,
+    id: RequestId,
+    view: DirectoryView,
+) -> Result<()> {
+    let DirectoryView {
+        revision,
+        directory,
+        parent,
+        xattrs,
+        entries,
+    } = view;
+    write_response(
+        send,
+        id,
+        Response::DirectoryViewStart {
+            revision,
+            directory,
+            parent,
+            xattrs,
+            entry_count: entries.len() as u64,
+        },
+    )
+    .await?;
+
+    let mut chunk: Vec<DirectoryViewEntry> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    for mut entry in entries {
+        let mut len = encoded_len(&entry)?;
+        if len > DIRECTORY_VIEW_CHUNK_BUDGET {
+            if let Some(xattrs) = &mut entry.xattrs {
+                xattrs.inline_values.clear();
+            }
+            len = encoded_len(&entry)?;
+            if len > DIRECTORY_VIEW_CHUNK_BUDGET {
+                entry.xattrs = None;
+                len = encoded_len(&entry)?;
+            }
+        }
+        if !chunk.is_empty() && chunk_bytes + len > DIRECTORY_VIEW_CHUNK_BUDGET {
+            write_response(
+                send,
+                id,
+                Response::DirectoryViewChunk {
+                    entries: std::mem::take(&mut chunk),
+                },
+            )
+            .await?;
+            chunk_bytes = 0;
+        }
+        chunk_bytes += len;
+        chunk.push(entry);
+    }
+    if !chunk.is_empty() {
+        write_response(send, id, Response::DirectoryViewChunk { entries: chunk }).await?;
+    }
+    write_response(send, id, Response::DirectoryViewEnd).await?;
+    Ok(())
+}
+
+async fn write_length_prefixed(send: &mut SendStream, frame: &[u8]) -> Result<()> {
+    // `frame` originates from `encode`, which caps length at MAX_FRAME_SIZE, so
+    // the u32 length prefix cannot overflow.
+    send.write_all(&(frame.len() as u32).to_be_bytes()).await?;
+    send.write_all(frame).await?;
+    Ok(())
 }
 async fn shutdown_signal() {
     #[cfg(unix)]
@@ -1477,6 +1569,48 @@ mod tests {
             add_user(state.path(), "alice", b"correct horse battery staple").unwrap();
             set_user_writable(state.path(), "alice", true).unwrap();
             Self::start_prepared_with_write_setting(state, export, request_timeout_ms, true).await
+        }
+
+        /// A read-only server whose export holds `entries` empty files, with the
+        /// node ceilings raised so a single directory view can remember them all.
+        async fn start_big_directory(entries: usize) -> Self {
+            let state = tempfile::tempdir().unwrap();
+            let export = tempfile::tempdir().unwrap();
+            for index in 0..entries {
+                std::fs::write(export.path().join(format!("entry_{index:08}.dat")), []).unwrap();
+            }
+            initialize(state.path(), vec!["localhost".into()]).unwrap();
+            add_user(state.path(), "alice", b"correct horse battery staple").unwrap();
+
+            let active_identity = StatePaths::resolve(state.path().to_path_buf()).unwrap();
+            let certificates = load_certificates(&active_identity.certificate).unwrap();
+            let fingerprint = certificate_fingerprint(certificates[0].as_ref());
+            let mut config = test_configuration(state.path(), export.path(), 60_000);
+            config.max_known_nodes_per_connection = entries.saturating_add(64);
+            config.max_total_known_nodes = entries.saturating_mul(2).saturating_add(128);
+            config.max_directory_entry_tasks = 16;
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let task = tokio::spawn(serve_until(
+                config,
+                async move {
+                    let _ = stop_rx.await;
+                },
+                Some(ready_tx),
+            ));
+            let address = match ready_rx.await {
+                Ok(address) => address,
+                Err(_) => panic!("server startup failed: {:?}", task.await.unwrap()),
+            };
+            Self {
+                state_path: state.path().to_path_buf(),
+                _state: state,
+                _export: export,
+                address,
+                fingerprint,
+                stop: stop_tx,
+                task,
+            }
         }
 
         async fn start_with_identity(
@@ -1635,6 +1769,51 @@ mod tests {
         assert_eq!(response.version, PROTOCOL_VERSION);
         assert_eq!(response.request_id, envelope.request_id);
         response.message
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_directory_view_streams_across_frames() {
+        // 14k entries push the enriched view (and even the metadata-only listing)
+        // past MAX_FRAME_SIZE, so this exercises the streamed directory-view path
+        // end to end over a real QUIC connection.
+        const ENTRIES: usize = 14_000;
+        let server = TestServer::start_big_directory(ENTRIES).await;
+        let client = NetworkFilesystem::authenticate(
+            server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+
+        let view = client
+            .list_directory_view(ROOT_NODE, DirectoryViewOptions::NATIVE)
+            .await
+            .unwrap();
+        assert_eq!(view.entries.len(), ENTRIES);
+        assert_eq!(view.directory.node, ROOT_NODE);
+        // Every entry reassembled exactly once, in name order.
+        let mut names: Vec<_> = view
+            .entries
+            .iter()
+            .map(|entry| entry.entry.name.clone())
+            .collect();
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        names.dedup();
+        assert_eq!(names.len(), ENTRIES);
+        // The reassembled view genuinely could not have fit one frame.
+        assert!(encoded_len(&Response::DirectoryView(view)).unwrap() > MAX_FRAME_SIZE);
+
+        // The legacy single-frame ListDirectory path degrades to a clean
+        // TooLarge error instead of wedging the connection...
+        assert!(matches!(
+            client.list_directory(ROOT_NODE).await,
+            Err(ClientError::Server(ErrorCode::TooLarge, _))
+        ));
+        // ...and the connection remains fully usable afterwards.
+        assert_eq!(client.ping(9).await.unwrap(), 9);
+
+        server.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

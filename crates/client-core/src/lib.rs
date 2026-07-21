@@ -359,6 +359,69 @@ impl NetworkFilesystem {
         Ok((response.message, Some(recv)))
     }
 
+    /// Fetch an enriched directory view, reassembling a streamed response.
+    ///
+    /// A view that fit one frame arrives as a single `DirectoryView` (the
+    /// pre-streaming fast path). A larger view arrives as `DirectoryViewStart`
+    /// followed by `DirectoryViewChunk` frames and a `DirectoryViewEnd`, all on
+    /// this request's stream; they are stitched back into one `DirectoryView`
+    /// so every caller above the transport sees an identical result either way.
+    async fn list_directory_view_streamed(
+        &self,
+        node: NodeId,
+        options: DirectoryViewOptions,
+    ) -> Result<DirectoryView> {
+        let request = Envelope::new(Request::ListDirectoryView { node, options });
+        let (mut send, mut recv) = self.transport.stream().await?;
+        self.transport.send_frame(&mut send, &request).await?;
+        send.finish().map_err(TransportError::Closed)?;
+
+        let first: Envelope<Response> = self.transport.receive_frame(&mut recv).await?;
+        if first.version != PROTOCOL_VERSION || first.request_id != request.request_id {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let (revision, directory, parent, xattrs, entry_count) = match first.message {
+            Response::DirectoryView(view) => return Ok(view),
+            Response::DirectoryViewStart {
+                revision,
+                directory,
+                parent,
+                xattrs,
+                entry_count,
+            } => (revision, directory, parent, xattrs, entry_count),
+            response => return Err(response_error(response)),
+        };
+
+        // entry_count is advisory; cap the pre-allocation and re-check the real
+        // total as chunks arrive so a misbehaving server cannot force unbounded
+        // buffering on the client.
+        let capacity = entry_count.min(MAX_DIRECTORY_ENTRIES as u64) as usize;
+        let mut entries: Vec<DirectoryViewEntry> = Vec::with_capacity(capacity);
+        loop {
+            let frame: Envelope<Response> = self.transport.receive_frame(&mut recv).await?;
+            if frame.version != PROTOCOL_VERSION || frame.request_id != request.request_id {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            match frame.message {
+                Response::DirectoryViewChunk { entries: chunk } => {
+                    if entries.len().saturating_add(chunk.len()) > MAX_DIRECTORY_ENTRIES {
+                        return Err(ClientError::UnexpectedResponse);
+                    }
+                    entries.extend(chunk);
+                }
+                Response::DirectoryViewEnd => break,
+                response => return Err(response_error(response)),
+            }
+        }
+        Ok(DirectoryView {
+            revision,
+            directory,
+            parent,
+            xattrs,
+            entries,
+        })
+    }
+
     async fn request_with_data(
         &self,
         message: Request,
@@ -463,14 +526,7 @@ impl RemoteFilesystem for NetworkFilesystem {
         node: NodeId,
         options: DirectoryViewOptions,
     ) -> Result<DirectoryView> {
-        match self
-            .request(Request::ListDirectoryView { node, options })
-            .await?
-            .0
-        {
-            Response::DirectoryView(view) => Ok(view),
-            response => Err(response_error(response)),
-        }
+        self.list_directory_view_streamed(node, options).await
     }
     async fn open_file(&self, node: NodeId) -> Result<(FileHandle, u64, u64)> {
         let opened = self
