@@ -50,6 +50,12 @@ const SEQUENTIAL_SLACK_BLOCKS: u64 = 1;
 /// measurement noise when the controller decides to grow, hold, or shrink.
 const THROUGHPUT_EPSILON: f64 = 0.10;
 
+/// How many times a demand read refreshes its revision snapshot and retries
+/// after observing that the remote file moved past the handle's recorded
+/// revision. Each retry re-reads at the newest known revision, so more than a
+/// couple only lose against a continuously rewriting concurrent writer.
+const STALE_REVISION_RETRIES: u32 = 3;
+
 pub trait FilesystemCache:
     MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache + NodeCacheInvalidation
 {
@@ -761,6 +767,100 @@ impl CachedFilesystem {
             state.size = result.size;
         }
     }
+
+    /// One attempt to serve an online demand read at the revision recorded in
+    /// `state`. Returns [`ClientError::StaleRevision`] when the remote file has
+    /// moved past that revision; the caller refreshes its snapshot and retries.
+    async fn read_online(
+        &self,
+        state: &CachedHandle,
+        inner_handle: FileHandle,
+        offset: u64,
+        length: u64,
+    ) -> Result<RangeRead> {
+        let blocks = self.blocks_for(state, offset, length)?;
+        if blocks.is_empty() {
+            return Ok(RangeRead {
+                revision: state.revision,
+                data: Vec::new(),
+            });
+        }
+        let assembled = MemoryCache::default();
+        // Every block, including a cache lookup, passes through the per-block
+        // gate. Concurrent kernel read-ahead callbacks therefore share one
+        // persistent-cache verification or one network request instead of all
+        // hashing the same large block before they reach the fetch gate.
+        let reads = blocks.iter().map(|block| async {
+            (
+                *block,
+                self.fetcher
+                    .fetch_block(inner_handle, state.revision, *block)
+                    .await,
+            )
+        });
+        // Time how long the demand read blocks. When the adaptive window is too
+        // small, blocks miss and this is dominated by network RTT; once the
+        // window covers the pipe, blocks are prefetched hits and this collapses.
+        // That gradient is exactly what drives the controller.
+        let demand_started = Instant::now();
+        let mut offline_error = false;
+        for (block, result) in join_all(reads).await {
+            match result {
+                Ok(data) => {
+                    let actual =
+                        u64::try_from(data.len()).map_err(|_| ClientError::UnexpectedResponse)?;
+                    if actual > block.length {
+                        return Err(ClientError::UnexpectedResponse);
+                    }
+                    if actual > 0 {
+                        let actual_key = RangeKey {
+                            length: actual,
+                            ..block
+                        };
+                        RangeCache::insert(&assembled, actual_key, data).await;
+                    }
+                }
+                Err(error) if is_offline(&error) => offline_error = true,
+                Err(error) => return Err(error),
+            }
+        }
+        let demand_elapsed = demand_started.elapsed();
+        let requested = RangeKey {
+            file: RevisionKey {
+                node: state.node,
+                revision: state.revision,
+            },
+            offset,
+            length: length.min(state.size.saturating_sub(offset)),
+        };
+        if let Some(data) = RangeCache::get(&assembled, requested).await {
+            let returned = u64::try_from(data.len()).unwrap_or(0);
+            self.maybe_prefetch(
+                state,
+                inner_handle,
+                offset,
+                returned,
+                demand_elapsed,
+                self.demand_block_size(length),
+            )
+            .await;
+            return Ok(RangeRead {
+                revision: state.revision,
+                data,
+            });
+        }
+        if let Some(data) = self.cached_range(state, offset, length).await {
+            return Ok(RangeRead {
+                revision: state.revision,
+                data,
+            });
+        }
+        if offline_error {
+            Err(ClientError::OfflineCacheMiss)
+        } else {
+            Err(ClientError::UnexpectedResponse)
+        }
+    }
 }
 
 fn is_offline(error: &ClientError) -> bool {
@@ -1190,7 +1290,7 @@ impl RemoteFilesystem for CachedFilesystem {
         offset: u64,
         length: u64,
     ) -> Result<RangeRead> {
-        let state = self.handle(handle).await?;
+        let mut state = self.handle(handle).await?;
         if offset.checked_add(length).is_none() {
             return Err(ClientError::Server(
                 ErrorCode::InvalidRequest,
@@ -1208,87 +1308,32 @@ impl RemoteFilesystem for CachedFilesystem {
                 .ok_or(ClientError::OfflineCacheMiss);
         };
 
-        let blocks = self.blocks_for(&state, offset, length)?;
-        if blocks.is_empty() {
-            return Ok(RangeRead {
-                revision: state.revision,
-                data: Vec::new(),
-            });
-        }
-        let assembled = MemoryCache::default();
-        // Every block, including a cache lookup, passes through the per-block
-        // gate. Concurrent kernel read-ahead callbacks therefore share one
-        // persistent-cache verification or one network request instead of all
-        // hashing the same large block before they reach the fetch gate.
-        let reads = blocks.iter().map(|block| async {
-            (
-                *block,
-                self.fetcher
-                    .fetch_block(inner_handle, state.revision, *block)
-                    .await,
-            )
-        });
-        // Time how long the demand read blocks. When the adaptive window is too
-        // small, blocks miss and this is dominated by network RTT; once the
-        // window covers the pipe, blocks are prefetched hits and this collapses.
-        // That gradient is exactly what drives the controller.
-        let demand_started = Instant::now();
-        let mut offline_error = false;
-        for (block, result) in join_all(reads).await {
-            match result {
-                Ok(data) => {
-                    let actual =
-                        u64::try_from(data.len()).map_err(|_| ClientError::UnexpectedResponse)?;
-                    if actual > block.length {
-                        return Err(ClientError::UnexpectedResponse);
+        // A newer revision observed on the wire is not an application-visible
+        // error: POSIX guarantees an open descriptor keeps reading after
+        // another actor updates the file, and macOS does so constantly —
+        // Finder's copy engine sets a fresh copy's timestamps immediately
+        // after writing it, which bumps the remote revision and used to turn
+        // every later read on an already-open handle into ESTALE (Finder
+        // error 100070; SIGBUS under mmap for Preview/QuickTime). Refresh the
+        // handle's revision snapshot and retry instead. Each attempt is still
+        // torn-free because every block within it is fetched at one expected
+        // revision.
+        let mut attempt = 0;
+        loop {
+            match self.read_online(&state, inner_handle, offset, length).await {
+                Err(ClientError::StaleRevision) if attempt < STALE_REVISION_RETRIES => {
+                    attempt += 1;
+                    let metadata = self.inner.get_metadata(state.node).await?;
+                    MetadataCache::store_readthrough(self.cache.as_ref(), metadata.clone()).await;
+                    if let Some(entry) = self.handles.write().await.get_mut(&handle) {
+                        entry.revision = metadata.revision;
+                        entry.size = metadata.size;
                     }
-                    if actual > 0 {
-                        let actual_key = RangeKey {
-                            length: actual,
-                            ..block
-                        };
-                        RangeCache::insert(&assembled, actual_key, data).await;
-                    }
+                    state.revision = metadata.revision;
+                    state.size = metadata.size;
                 }
-                Err(error) if is_offline(&error) => offline_error = true,
-                Err(error) => return Err(error),
+                result => return result,
             }
-        }
-        let demand_elapsed = demand_started.elapsed();
-        let requested = RangeKey {
-            file: RevisionKey {
-                node: state.node,
-                revision: state.revision,
-            },
-            offset,
-            length: length.min(state.size.saturating_sub(offset)),
-        };
-        if let Some(data) = RangeCache::get(&assembled, requested).await {
-            let returned = u64::try_from(data.len()).unwrap_or(0);
-            self.maybe_prefetch(
-                &state,
-                inner_handle,
-                offset,
-                returned,
-                demand_elapsed,
-                self.demand_block_size(length),
-            )
-            .await;
-            return Ok(RangeRead {
-                revision: state.revision,
-                data,
-            });
-        }
-        if let Some(data) = self.cached_range(&state, offset, length).await {
-            return Ok(RangeRead {
-                revision: state.revision,
-                data,
-            });
-        }
-        if offline_error {
-            Err(ClientError::OfflineCacheMiss)
-        } else {
-            Err(ClientError::UnexpectedResponse)
         }
     }
 
@@ -1526,6 +1571,9 @@ mod tests {
         read_delay_ms: AtomicU64,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+        /// Added to `FILE_NODE`'s base revision (17), simulating another actor
+        /// updating the file while handles are open.
+        revision_bump: AtomicU64,
         data: Vec<u8>,
     }
 
@@ -1536,6 +1584,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn file_revision(&self) -> u64 {
+            17 + self.revision_bump.load(Ordering::SeqCst)
         }
 
         fn metadata(node: NodeId) -> Metadata {
@@ -1584,7 +1636,11 @@ mod tests {
         async fn get_metadata(&self, node: NodeId) -> Result<Metadata> {
             self.check_online()?;
             self.metadata_reads.fetch_add(1, Ordering::SeqCst);
-            Ok(Self::metadata(node))
+            let mut metadata = Self::metadata(node);
+            if node == FILE_NODE {
+                metadata.revision = self.file_revision();
+            }
+            Ok(metadata)
         }
 
         async fn list_directory(&self, node: NodeId) -> Result<Vec<DirectoryEntry>> {
@@ -1624,7 +1680,11 @@ mod tests {
             self.check_online()?;
             Ok(OpenedFile {
                 handle: FileHandle(Uuid::new_v4()),
-                revision: Self::metadata(node).revision,
+                revision: if node == FILE_NODE {
+                    self.file_revision()
+                } else {
+                    Self::metadata(node).revision
+                },
                 size: Self::metadata(node).size,
             })
         }
@@ -1665,7 +1725,7 @@ mod tests {
                 .unwrap()
                 .min(self.data.len());
             Ok(RangeRead {
-                revision: 17,
+                revision: self.file_revision(),
                 data: self.data[start..end].to_vec(),
             })
         }
@@ -1698,6 +1758,7 @@ mod tests {
             reads: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            revision_bump: AtomicU64::new(0),
             read_lengths: std::sync::Mutex::new(Vec::new()),
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
@@ -1757,6 +1818,7 @@ mod tests {
             reads: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            revision_bump: AtomicU64::new(0),
             read_lengths: std::sync::Mutex::new(Vec::new()),
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
@@ -1805,6 +1867,7 @@ mod tests {
             reads: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            revision_bump: AtomicU64::new(0),
             read_lengths: std::sync::Mutex::new(Vec::new()),
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
@@ -1840,6 +1903,7 @@ mod tests {
             reads: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            revision_bump: AtomicU64::new(0),
             read_lengths: std::sync::Mutex::new(Vec::new()),
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
@@ -1870,6 +1934,7 @@ mod tests {
             reads: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            revision_bump: AtomicU64::new(0),
             read_lengths: std::sync::Mutex::new(Vec::new()),
             metadata_reads: AtomicUsize::new(0),
             directory_reads: AtomicUsize::new(0),
@@ -1911,6 +1976,7 @@ mod tests {
             read_delay_ms: AtomicU64::new(delay_ms),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            revision_bump: AtomicU64::new(0),
             data: vec![0x5a; 2 * 1024 * 1024],
         })
     }
@@ -2016,6 +2082,53 @@ mod tests {
         }
         assert_eq!(assembled, vec![0x5a; 2 * 1024 * 1024]);
         assert_eq!(inner.reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// An open handle must keep serving reads after another actor updates the
+    /// file. macOS relies on this constantly: Finder's copy engine sets a
+    /// fresh copy's timestamps right after writing it, bumping the remote
+    /// revision; pinning handles to their open-time revision surfaced that as
+    /// ESTALE (Finder error 100070) and SIGBUS under mmap. The cached layer
+    /// must refresh its snapshot and retry instead.
+    #[tokio::test]
+    async fn open_handle_survives_revision_bump_and_serves_fresh_data() {
+        let inner = latency_toggle(0);
+        let filesystem = CachedFilesystem::new(
+            inner.clone(),
+            Arc::new(MemoryCache::default()),
+            CachePolicy {
+                block_size: 1024 * 1024,
+                read_ahead_max_bytes: 0,
+            },
+        )
+        .unwrap();
+        let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
+
+        let first = filesystem.read_range(handle, 0, 4_096).await.unwrap();
+        assert_eq!(first, vec![0x5a; 4_096]);
+
+        // Another actor updates the file: revision moves past the handle's
+        // open-time snapshot.
+        inner.revision_bump.store(5, Ordering::SeqCst);
+
+        // An uncached block forces a remote fetch that observes the newer
+        // revision. It must be served, not fail with StaleRevision.
+        let second = filesystem
+            .read_range(handle, 1024 * 1024, 4_096)
+            .await
+            .unwrap();
+        assert_eq!(second, vec![0x5a; 4_096]);
+
+        // The handle adopted the new revision: previously cached blocks of the
+        // old revision are orphaned, so re-reading the first block fetches
+        // fresh bytes instead of serving the stale cache entry.
+        let reads_before = inner.reads.load(Ordering::SeqCst);
+        let third = filesystem.read_range(handle, 0, 4_096).await.unwrap();
+        assert_eq!(third, vec![0x5a; 4_096]);
+        assert!(
+            inner.reads.load(Ordering::SeqCst) > reads_before,
+            "old-revision cache entry must not satisfy the refreshed handle"
+        );
     }
 
     /// Random, non-sequential access must not speculate: prefetch stays off, so

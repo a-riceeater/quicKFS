@@ -898,7 +898,16 @@ impl Adapter {
             let mut data = Vec::with_capacity(capacity);
             let mut remaining = length;
             let mut position = offset;
-            let mut expected_revision = opened.revision;
+            // Revision consistency is enforced only WITHIN this callback: the
+            // first chunk pins the revision and later chunks must match so the
+            // kernel never sees a torn assembly. The open-time revision is
+            // deliberately not used — an open descriptor must keep reading
+            // after another actor updates the file (Finder stamps fresh
+            // copies' timestamps, bumping the revision; pinning to open time
+            // surfaced that as ESTALE/SIGBUS). A mid-read drift restarts the
+            // assembly once at the newer revision before giving up.
+            let mut expected_revision = 0;
+            let mut restarted = false;
             while remaining > 0 {
                 let requested = remaining.min(chunk_limit);
                 let result = self
@@ -913,7 +922,15 @@ impl Adapter {
                 }
                 if result.revision != 0 {
                     if expected_revision != 0 && result.revision != expected_revision {
-                        return Err(AdapterError::StaleRevision);
+                        if restarted {
+                            return Err(AdapterError::StaleRevision);
+                        }
+                        restarted = true;
+                        data.clear();
+                        remaining = length;
+                        position = offset;
+                        expected_revision = 0;
+                        continue;
                     }
                     expected_revision = result.revision;
                 }

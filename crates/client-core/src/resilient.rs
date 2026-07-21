@@ -364,8 +364,20 @@ impl ResilientFilesystem {
             .open_file_with_options(state.node, reopen_options)
             .await?;
         if reopened.revision != state.revision {
-            let _ = current.filesystem.close_file(reopened.handle).await;
-            return Err(ClientError::StaleRevision);
+            // A read-only handle without lock history adopts the newer
+            // revision: POSIX keeps an open descriptor readable while other
+            // actors update the file, and macOS mutates constantly (Finder
+            // sets timestamps on fresh copies, bumping the revision). Only a
+            // writable or locked handle cannot silently continue on content
+            // that changed underneath it.
+            if state.options.access == quickfs_protocol::FileAccess::ReadOnly
+                && state.lock_history.is_empty()
+            {
+                state.revision = reopened.revision;
+            } else {
+                let _ = current.filesystem.close_file(reopened.handle).await;
+                return Err(ClientError::StaleRevision);
+            }
         }
         for lock in &state.lock_history {
             current
@@ -377,6 +389,17 @@ impl ResilientFilesystem {
         state.size = reopened.size;
         state.generation = current.generation;
         Ok((current, state.clone()))
+    }
+
+    /// Records that the remote file moved to `revision` while `logical` was
+    /// open. Revisions only move forward, so a stale concurrent adoption
+    /// (two reads racing) can never roll the handle's view back.
+    async fn adopt_revision(&self, logical: FileHandle, revision: u64) {
+        if let Some(state) = self.handles.write().await.get_mut(&logical)
+            && revision > state.revision
+        {
+            state.revision = revision;
+        }
     }
 
     async fn update_written_handle(
@@ -629,8 +652,18 @@ impl RemoteFilesystem for ResilientFilesystem {
             .read_range_versioned(state.remote, offset, length)
             .await
         {
-            Ok(read) if read.revision == state.revision => Ok(read),
-            Ok(_) => Err(ClientError::StaleRevision),
+            // A read observing a revision the handle has not seen yet is not
+            // an error: another actor updated the file while it was open
+            // (macOS does this routinely — Finder stamps a fresh copy's
+            // timestamps, bumping the revision). Adopt the newer revision so
+            // the handle keeps serving reads; the caller sees which revision
+            // the bytes belong to via `RangeRead::revision`.
+            Ok(read) => {
+                if read.revision != state.revision {
+                    self.adopt_revision(handle, read.revision).await;
+                }
+                Ok(read)
+            }
             Err(ClientError::Transport(_)) => {
                 self.mark_failed(slot.generation);
                 let (_, reopened) = self.remote_handle(handle).await?;
@@ -639,11 +672,10 @@ impl RemoteFilesystem for ResilientFilesystem {
                     .filesystem
                     .read_range_versioned(reopened.remote, offset, length)
                     .await?;
-                if read.revision == reopened.revision {
-                    Ok(read)
-                } else {
-                    Err(ClientError::StaleRevision)
+                if read.revision != reopened.revision {
+                    self.adopt_revision(handle, read.revision).await;
                 }
+                Ok(read)
             }
             Err(error) => Err(error),
         }
@@ -1237,8 +1269,13 @@ mod tests {
         assert_eq!(second.opens.load(Ordering::SeqCst), 1);
     }
 
+    /// A read-only handle that reconnects onto a newer file revision keeps
+    /// working: POSIX guarantees an open descriptor stays readable while other
+    /// actors update the file (Finder stamps fresh copies' timestamps, bumping
+    /// the revision). The handle adopts the new revision instead of failing
+    /// every subsequent read with ESTALE.
     #[tokio::test]
-    async fn rejects_mixed_revision_reads_after_reconnect() {
+    async fn read_only_handle_adopts_newer_revision_after_reconnect() {
         let epoch = Uuid::new_v4();
         let first = Arc::new(ScriptedFilesystem::new(epoch, 3));
         first.fail_read.store(true, Ordering::SeqCst);
@@ -1247,6 +1284,36 @@ mod tests {
             .await
             .unwrap();
         let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
+
+        assert_eq!(filesystem.read_range(handle, 0, 2).await.unwrap(), b"01");
+        // The adopted revision is now the handle's view.
+        let read = filesystem.read_range_versioned(handle, 0, 2).await.unwrap();
+        assert_eq!(read.revision, 4);
+    }
+
+    /// A writable handle cannot silently continue onto content that changed
+    /// underneath it across a reconnect; it still fails stale.
+    #[tokio::test]
+    async fn writable_handle_rejects_revision_drift_after_reconnect() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 3));
+        first.fail_read.store(true, Ordering::SeqCst);
+        let second = Arc::new(ScriptedFilesystem::new(epoch, 4));
+        let filesystem = ResilientFilesystem::new(first, connector(second), test_policy())
+            .await
+            .unwrap();
+        let handle = filesystem
+            .open_file_with_options(
+                FILE_NODE,
+                FileOpenOptions {
+                    access: quickfs_protocol::FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .await
+            .unwrap()
+            .handle;
 
         assert!(matches!(
             filesystem.read_range(handle, 0, 2).await,

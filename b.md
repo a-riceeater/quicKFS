@@ -14,6 +14,20 @@ Validated live against RAID (fresh state dir, chat account): 60-file thumbnail f
 
 Known remaining scalability item (acceptable for now, documented): each mutating job still clones the full entry map under the lock (O(n) per job, n ≈ manifest entries); the manifest itself is still O(n) per batch flush. A delta/sharded manifest would remove both. `get_covering_range_value` is also an O(n) scan per persistent range lookup.
 
+## ✅ UPDATE 2 (2026-07-20 night): ESTALE / Finder error 100070 — revision pinning fixed
+
+The cache-writer fix alone did not clear the user's symptoms. The remaining bug: **Finder error 100070 is literally 100000 + errno 70 (ESTALE)**. All three client layers pinned an open handle to its open-time file revision and turned any later revision drift into `StaleRevision` → ESTALE:
+
+- `resilient.rs` rejected any read whose returned revision differed from the handle's remembered one, and poisoned reconnected handles the same way;
+- `cached.rs`'s `fetch_block` errored instead of refreshing when the wire revision moved past the handle snapshot;
+- the adapter's `read_async` pinned `opened.revision` across the handle's whole life.
+
+But macOS bumps revisions on open files routinely — proven live: `touch file` (setattr times) through one mount made every subsequent read on an already-open handle fail errno 70, and mmap page-ins SIGBUS. Finder's copy engine stamps a fresh copy's timestamps right after writing it, so it poisoned its own destination handles (→ 100070); Preview/QuickTime mmap media and got SIGBUS (→ stalls, black video).
+
+Fix (all read paths; write/locked handles still fail closed): reads **adopt** newer revisions — resilient updates handle state and keeps serving; cached refreshes revision+size from fresh metadata and retries (≤3); the adapter enforces revision consistency only within one callback (one restart on mid-read drift). Validated live with two mounts: plain reads and mmap page-ins keep working across `touch`-induced revision bumps that previously ESTALEd.
+
+**Data-integrity audit fallout:** copies made through the collapse-era daemon are suspect. Verified corrupt on the server (contiguous all-zero hole where a coalesced write range died with the starved daemon): root `DSC03962.JPG`, root `DSC03963.JPG` (751 KiB zero hole at ~6.16 MB). Verified clean: root↔100MSDCF `evelyn.jpg`, and post-fix Finder copies `DSC03964.JPG` + cold 25 MB `DSC03926.ARW` (byte-identical, then removed as test artifacts). Root `P1438584.jpg` has no known source pair to audit. Also observed: the old daemon's poisoned cache served wrong bytes for an UNTOUCHED source file (hash lie) — remount with the fixed binary and, if in doubt, wipe `.quickfs-client/namespaces/*` to drop collapse-era cache state.
+
 ---
 
 ## Why this document exists
