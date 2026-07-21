@@ -5,11 +5,27 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub const PROTOCOL_VERSION: u16 = 6;
-pub const ALPN_PROTOCOL: &[u8] = b"quickfs/6";
+pub const PROTOCOL_VERSION: u16 = 7;
+pub const ALPN_PROTOCOL: &[u8] = b"quickfs/7";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_DIRECTORY_INLINE_XATTR_SIZE: u32 = 4 * 1024;
 pub const MAX_DIRECTORY_INLINE_XATTR_TOTAL_SIZE: u32 = 256 * 1024;
+
+/// Upper bound on the number of children a single directory may project in one
+/// `ListDirectoryView`/`ListDirectory` response. A directory view is streamed
+/// across as many `DirectoryViewChunk` frames as needed (see
+/// [`DIRECTORY_VIEW_CHUNK_BUDGET`]), so this is no longer a `MAX_FRAME_SIZE`
+/// limit — it is a memory/DoS backstop that bounds how large the fully
+/// materialized entry set can grow on either peer. In practice the server's
+/// per-connection node-registry ceiling is reached first; this constant only
+/// rejects pathological directories before they can allocate without bound.
+pub const MAX_DIRECTORY_ENTRIES: usize = 1024 * 1024;
+
+/// Per-frame byte budget for the entries carried by one `DirectoryViewChunk`.
+/// Set below [`MAX_FRAME_SIZE`] to leave headroom for the response envelope,
+/// the enum discriminant, and the entry-vector length prefix so that a chunk
+/// filled up to this budget always encodes within `MAX_FRAME_SIZE`.
+pub const DIRECTORY_VIEW_CHUNK_BUDGET: usize = MAX_FRAME_SIZE - 16 * 1024;
 pub const ROOT_NODE: NodeId = NodeId(Uuid::from_u128(0));
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -510,6 +526,27 @@ pub enum Response {
         entries: Vec<DirectoryEntry>,
     },
     DirectoryView(DirectoryView),
+    /// Header of a directory view too large to fit one `DirectoryView` frame.
+    /// Followed on the same stream by one or more `DirectoryViewChunk` frames
+    /// and terminated by `DirectoryViewEnd`. Carries every field of
+    /// `DirectoryView` except the entries, which arrive in the chunks.
+    DirectoryViewStart {
+        revision: DirectoryRevision,
+        directory: Metadata,
+        parent: Metadata,
+        xattrs: Option<XattrSnapshot>,
+        /// Total number of entries that the following chunks will carry, so the
+        /// receiver can pre-size its buffer. Advisory: the receiver still
+        /// enforces `MAX_DIRECTORY_ENTRIES` against the entries it actually
+        /// receives rather than trusting this count.
+        entry_count: u64,
+    },
+    /// One ordered batch of entries belonging to a streamed directory view.
+    DirectoryViewChunk {
+        entries: Vec<DirectoryViewEntry>,
+    },
+    /// Terminates a streamed directory view begun with `DirectoryViewStart`.
+    DirectoryViewEnd,
     FileOpened {
         handle: FileHandle,
         revision: FileRevision,
@@ -736,6 +773,12 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     }
     Ok(out)
 }
+/// Length in bytes of the postcard encoding of `value`, without imposing the
+/// [`MAX_FRAME_SIZE`] cap that [`encode`] enforces. Used by the directory-view
+/// chunker to measure individual entries while packing frames.
+pub fn encoded_len<T: Serialize>(value: &T) -> Result<usize, CodecError> {
+    Ok(postcard::to_allocvec(value)?.len())
+}
 pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, CodecError> {
     if bytes.len() > MAX_FRAME_SIZE {
         return Err(CodecError::TooLarge(bytes.len()));
@@ -777,6 +820,97 @@ mod tests {
             MAX_DIRECTORY_INLINE_XATTR_TOTAL_SIZE
         );
     }
+    fn sample_metadata(seed: u128) -> Metadata {
+        Metadata {
+            node: NodeId(Uuid::from_u128(seed)),
+            kind: NodeKind::File,
+            size: 4096,
+            mode: 0o644,
+            allocated_blocks: 8,
+            revision: 3,
+            accessed_unix_ms: 1,
+            modified_unix_ms: 2,
+            created_unix_ms: Some(0),
+            backup_unix_ms: None,
+            link_count: 1,
+            device_major: 0,
+            device_minor: 0,
+        }
+    }
+
+    fn sample_view_entry(index: usize) -> DirectoryViewEntry {
+        let node = NodeId(Uuid::from_u128(index as u128));
+        DirectoryViewEntry {
+            entry: DirectoryEntry {
+                node,
+                name: format!("entry_{index:08}.dat").into(),
+                kind: NodeKind::File,
+                metadata: Metadata {
+                    node,
+                    ..sample_metadata(index as u128)
+                },
+            },
+            xattrs: None,
+        }
+    }
+
+    #[test]
+    fn streamed_directory_view_frames_round_trip() {
+        let start = Envelope::new(Response::DirectoryViewStart {
+            revision: 42,
+            directory: sample_metadata(1),
+            parent: sample_metadata(2),
+            xattrs: Some(XattrSnapshot {
+                names: vec!["com.apple.FinderInfo".into()],
+                inline_values: vec![InlineXattr {
+                    name: "com.apple.FinderInfo".into(),
+                    value: vec![7; 32],
+                }],
+            }),
+            entry_count: 3,
+        });
+        assert_eq!(
+            decode::<Envelope<Response>>(&encode(&start).unwrap()).unwrap(),
+            start
+        );
+
+        let chunk = Envelope::new(Response::DirectoryViewChunk {
+            entries: (0..3).map(sample_view_entry).collect(),
+        });
+        assert_eq!(
+            decode::<Envelope<Response>>(&encode(&chunk).unwrap()).unwrap(),
+            chunk
+        );
+
+        let end = Envelope::new(Response::DirectoryViewEnd);
+        assert_eq!(
+            decode::<Envelope<Response>>(&encode(&end).unwrap()).unwrap(),
+            end
+        );
+    }
+
+    #[test]
+    fn chunk_filled_to_budget_encodes_within_frame_limit() {
+        // Greedily pack entries the way the daemon does: never let the running
+        // sum of individual entry sizes exceed DIRECTORY_VIEW_CHUNK_BUDGET.
+        let mut entries = Vec::new();
+        let mut packed = 0usize;
+        for index in 0.. {
+            let entry = sample_view_entry(index);
+            let len = encoded_len(&entry).unwrap();
+            if packed + len > DIRECTORY_VIEW_CHUNK_BUDGET {
+                break;
+            }
+            packed += len;
+            entries.push(entry);
+        }
+        assert!(!entries.is_empty());
+        let frame = encode(&Envelope::new(Response::DirectoryViewChunk { entries }));
+        // encode() rejects anything over MAX_FRAME_SIZE, so success proves the
+        // budget headroom is sufficient for the envelope + framing overhead.
+        assert!(frame.is_ok(), "budget-filled chunk exceeded MAX_FRAME_SIZE");
+    }
+
     #[test]
     fn rejects_version() {
         let mut m = Envelope::new(Request::Ping { nonce: 1 });
