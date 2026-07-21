@@ -823,7 +823,6 @@ impl ExportSession {
             let before_revision = revision(&before);
             let stream = rustix::fs::Dir::read_from(&directory).map_err(std::io::Error::from)?;
             let mut discovered = Vec::new();
-            let mut estimated_frame_size = 128usize;
             for entry in stream {
                 let entry = entry.map_err(std::io::Error::from)?;
                 let bytes = entry.file_name().to_bytes();
@@ -834,10 +833,7 @@ impl ExportSession {
                 let stat = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(std::io::Error::from)?;
                 let kind = node_kind_from_mode(stat.st_mode)?;
-                estimated_frame_size = estimated_frame_size
-                    .checked_add(bytes.len().saturating_add(192))
-                    .ok_or(ServerError::DirectoryTooLarge)?;
-                if estimated_frame_size > MAX_FRAME_SIZE {
+                if discovered.len() >= MAX_DIRECTORY_ENTRIES {
                     return Err(ServerError::DirectoryTooLarge);
                 }
                 let child_identity = identity_from_stat(&stat);
@@ -2797,17 +2793,17 @@ fn prepare_directory_scan(
     )?;
     let stream = rustix::fs::Dir::read_from(&directory).map_err(std::io::Error::from)?;
     let mut names = Vec::new();
-    let mut estimated_frame_size = 512usize;
     for entry in stream {
         let entry = entry.map_err(std::io::Error::from)?;
         let bytes = entry.file_name().to_bytes();
         if bytes == b"." || bytes == b".." {
             continue;
         }
-        estimated_frame_size = estimated_frame_size
-            .checked_add(bytes.len().saturating_add(192))
-            .ok_or(ServerError::DirectoryTooLarge)?;
-        if estimated_frame_size > MAX_FRAME_SIZE {
+        // The directory view is streamed in frame-sized chunks, so the response
+        // no longer has to fit one MAX_FRAME_SIZE frame. Bound only the total
+        // entry count to keep a pathological directory from allocating without
+        // limit; realistically the per-connection node ceiling is hit first.
+        if names.len() >= MAX_DIRECTORY_ENTRIES {
             return Err(ServerError::DirectoryTooLarge);
         }
         names.push(bytes.to_vec());
@@ -4955,6 +4951,34 @@ mod tests {
             .unwrap();
         assert_eq!(nested.directory.node, folder.node);
         assert_eq!(nested.parent.node, ROOT_NODE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_view_beyond_one_frame_projects_every_entry() {
+        // A directory whose enriched view serializes past MAX_FRAME_SIZE must no
+        // longer be rejected with DirectoryTooLarge: the daemon streams it in
+        // chunks, so the server layer simply projects all entries.
+        let directory = tempfile::tempdir().unwrap();
+        let export = Export::new_writable(directory.path(), Limits::default())
+            .await
+            .unwrap();
+        let session = export.session_with_writes(true);
+        const ENTRIES: usize = 12_000;
+        for index in 0..ENTRIES {
+            std::fs::write(directory.path().join(format!("entry_{index:08}.dat")), []).unwrap();
+        }
+        let view = session
+            .directory_view(ROOT_NODE, DirectoryViewOptions::NATIVE)
+            .await
+            .unwrap();
+        assert_eq!(view.entries.len(), ENTRIES);
+        // Confirm the projection genuinely exceeds a single frame, so this test
+        // actually exercises the path that used to fail.
+        assert!(
+            encoded_len(&Response::DirectoryView(view)).unwrap() > MAX_FRAME_SIZE,
+            "test directory should exceed one frame to be meaningful"
+        );
     }
 
     #[cfg(unix)]
