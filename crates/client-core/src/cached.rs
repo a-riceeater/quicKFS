@@ -105,6 +105,27 @@ const PREFETCH_PERMIT_UNIT: u64 = 64 * 1024;
 /// burst small.
 const SCHEDULE_BURST_BLOCKS: u64 = 8;
 
+/// Ceiling on speculative prefetch bytes *in flight on the wire at once*, kept
+/// separate from the read-ahead buffer-depth ceiling (`--read-ahead-max-bytes`).
+/// Prefetch permits are held for a fetch's whole lifetime, so this bounds the
+/// convoy of background data a latency-sensitive demand read can end up queued
+/// behind on the one shared QUIC connection. The buffer may still grow deep —
+/// many blocks already fetched and cached — because that is governed by the
+/// window depth and the range cache, not by this; only how much is
+/// *simultaneously on the wire* is capped here.
+///
+/// The [`PREFETCH_MAX_CONCURRENT_FETCHES`] fetch-count cap alone was sized for
+/// 1 MiB blocks (8 fetches ≈ 8 MiB in flight). With a large cache block
+/// (`--cache-block-kib 8192` → 8 MiB) it instead put 8 × 8 = 64 MiB of
+/// speculation on the wire, and under concurrent load — Spotlight or Quick Look
+/// scanning other files during playback — a video demand read stalled hundreds
+/// of milliseconds behind that convoy (reproduced: paced playback under bulk
+/// reads spiked to ~700 ms). This is deliberately at least
+/// `PREFETCH_MAX_CONCURRENT_FETCHES` MiB so 1 MiB-granularity streams are
+/// unaffected (their fetch-count cap still binds first); it only shortens the
+/// convoy of large-block streams, which is exactly where it ran long.
+const PREFETCH_MAX_INFLIGHT_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Most speculative fetches in flight at once across the whole mount,
 /// independent of the byte budget.
 ///
@@ -699,8 +720,13 @@ impl CachedFilesystem {
         // The pool is denominated in PREFETCH_PERMIT_UNIT bytes (clamped well
         // under tokio's permit ceiling) so streams of any block granularity
         // share the same byte budget.
+        // The in-flight prefetch budget is the *convoy* ceiling, not the
+        // buffer-depth ceiling: cap it well below `read_ahead_max_bytes` (which
+        // still governs how deep the window may grow) so a demand read never
+        // queues behind a large-block speculation convoy on the shared link.
+        let prefetch_inflight_budget = policy.read_ahead_max_bytes.min(PREFETCH_MAX_INFLIGHT_BYTES);
         let prefetch_permit_total =
-            u32::try_from((policy.read_ahead_max_bytes / PREFETCH_PERMIT_UNIT).clamp(1, 1 << 20))
+            u32::try_from((prefetch_inflight_budget / PREFETCH_PERMIT_UNIT).clamp(1, 1 << 20))
                 .unwrap_or(1 << 20);
         let prefetch_permits = Arc::new(Semaphore::new(prefetch_permit_total as usize));
         let fetcher = Arc::new(Fetcher {
