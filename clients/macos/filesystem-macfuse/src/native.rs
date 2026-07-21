@@ -43,7 +43,20 @@ const VOLUME_REGISTRATION_SETTLE: Duration = Duration::from_secs(5);
 /// Mount attempts before giving up on a usable volume registration and
 /// serving the mount with a warning. A broken registration is permanent for
 /// that mount, so each retry is a fresh mount(2).
-const VOLUME_REGISTRATION_ATTEMPTS: u32 = 4;
+///
+/// On a host whose coreservicesd has accumulated degraded state (cleared only
+/// by a reboot), whether a fresh mount registers usably is effectively an
+/// independent coin flip per attempt — measured here as an identity-independent
+/// ~1-in-2-to-2-in-3 failure rate that does not depend on mountpoint, volume
+/// name, or anything the filesystem reports (statfs, capabilities, prewarm all
+/// answered correctly and from cache). Because the attempts are independent,
+/// the probability of ending up with an unusable Finder volume falls off
+/// geometrically with the retry budget (p^N), so a generous budget is the one
+/// lever that reliably improves the odds of a working volume. The cost is only
+/// paid in the rare all-fail tail — each failed attempt is `SETTLE + probe +
+/// RETRY_DELAY` (~15s), so a full exhaustion is bounded near two minutes — and
+/// on a healthy host the very first attempt succeeds and none of this runs.
+const VOLUME_REGISTRATION_ATTEMPTS: u32 = 8;
 /// Pause between registration retries so the previous volume's CoreServices
 /// teardown finishes before the replacement mount registers.
 const VOLUME_REGISTRATION_RETRY_DELAY: Duration = Duration::from_secs(10);
