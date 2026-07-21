@@ -26,7 +26,7 @@ dashmap = "6"
 futures = "0.3"
 fuser = "0.17"
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 quinn = "0.11"
 rcgen = "0.14"
