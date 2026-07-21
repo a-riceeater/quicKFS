@@ -2181,11 +2181,7 @@ impl ExportSession {
     }
 
     fn reserve_node(&self) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), ServerError> {
-        let session = self
-            .node_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ServerError::TooManyNodes)?;
+        let session = self.acquire_session_permit()?;
         let global = match self.export.shared.node_permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -2201,6 +2197,65 @@ impl ExportSession {
             }
         };
         Ok((session, global))
+    }
+
+    /// Acquire one slot in this connection's node working set, making room by
+    /// evicting an unpinned session node if the pool is full.
+    ///
+    /// The per-connection working set is a bounded cache over the larger global
+    /// registry, mirroring how [`Self::reserve_node`] treats the global pool as
+    /// a cache over the filesystem. macOS macFUSE reclaims vnodes lazily, so a
+    /// long-lived mount can reference more distinct nodes than the cap without
+    /// ever sending a `Forget`; without eviction the connection would then fail
+    /// every lookup of a new node with `TooManyNodes`. Evicting a session node
+    /// only drops this connection's reference to it — the node stays in the
+    /// global registry (four times larger by default), so the kernel's next
+    /// access re-tracks it from cache rather than paying a rediscovery walk, and
+    /// its stable identifier is unchanged so coherence is preserved.
+    fn acquire_session_permit(&self) -> Result<OwnedSemaphorePermit, ServerError> {
+        loop {
+            match self.node_permits.clone().try_acquire_owned() {
+                Ok(permit) => return Ok(permit),
+                Err(_) => {
+                    if !self.evict_unreferenced_session_node()? {
+                        return Err(ServerError::TooManyNodes);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop one node from this connection's working set to free a permit,
+    /// skipping the root and any node currently backing an open handle (a
+    /// handle would re-track its node on the very next operation, so evicting
+    /// one buys no headroom). Returns whether a node was evicted.
+    fn evict_unreferenced_session_node(&self) -> Result<bool, ServerError> {
+        let pinned: HashSet<NodeId> = self
+            .handles
+            .iter()
+            .map(|handle| handle.value().node)
+            .collect();
+        let mut known = lock_mutex(&self.known_nodes)?;
+        let victim = known
+            .keys()
+            .copied()
+            .find(|node| *node != ROOT_NODE && !pinned.contains(node));
+        let Some(node) = victim else {
+            return Ok(false);
+        };
+        // Removing the entry drops this connection's permit for the node.
+        known.remove(&node);
+        // Release the global session reference under the same lock ordering the
+        // rest of the module uses (known_nodes before the shared registry). A
+        // node deleted out from under the session is already gone from the
+        // registry, so a missing entry is simply nothing to release.
+        if let Some(shared) = lock_mutex(&self.export.shared.nodes)?
+            .by_node
+            .get_mut(&node)
+        {
+            shared.session_references = shared.session_references.saturating_sub(1);
+        }
+        Ok(true)
     }
 
     fn evict_unreferenced_global_node(&self) -> Result<bool, ServerError> {
@@ -2281,11 +2336,7 @@ impl ExportSession {
         if lock_mutex(&self.known_nodes)?.contains_key(&node) {
             return Ok(());
         }
-        let permit = self
-            .node_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ServerError::TooManyNodes)?;
+        let permit = self.acquire_session_permit()?;
         self.track_node_with_permit(node, permit)
     }
 
@@ -5176,6 +5227,95 @@ mod tests {
                 .by_node
                 .contains_key(&old)
         );
+    }
+
+    #[tokio::test]
+    async fn session_working_set_evicts_under_pressure_instead_of_failing() {
+        // One usable per-connection permit beyond the root, but a roomy global
+        // registry so evicted session nodes stay cached for cheap re-tracking.
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(directory.path().join(name), name.as_bytes()).unwrap();
+        }
+        let limits = Limits {
+            max_known_nodes: 2,
+            max_total_known_nodes: 64,
+            ..Limits::default()
+        };
+        let cap = limits.max_known_nodes;
+        let export = Export::new(directory.path(), limits).await.unwrap();
+        let session = export.session();
+
+        // Listing remembers every child, so it needs more concurrent session
+        // permits than the cap allows. Before self-healing this failed with
+        // `TooManyNodes`; now it evicts as it scans and completes.
+        let entries = session.list(ROOT_NODE).await.unwrap();
+        assert_eq!(entries.len(), 3);
+        let nodes: Vec<NodeId> = entries.iter().map(|entry| entry.node).collect();
+
+        // The per-connection working set never exceeds its bound.
+        assert!(session.known_nodes.lock().unwrap().len() <= cap);
+
+        // Every node is still individually resolvable: an eviction only drops
+        // this connection's reference, the global registry still has the node,
+        // and its stable identifier is unchanged, so metadata re-tracks it.
+        for node in &nodes {
+            assert!(session.metadata(*node).await.is_ok());
+            assert!(
+                export
+                    .shared
+                    .nodes
+                    .lock()
+                    .unwrap()
+                    .by_node
+                    .contains_key(node)
+            );
+        }
+        assert!(session.known_nodes.lock().unwrap().len() <= cap);
+    }
+
+    #[tokio::test]
+    async fn open_handles_are_never_evicted_from_the_session_working_set() {
+        // Root plus two usable permits: one is pinned by an open handle, the
+        // other rotates under eviction pressure.
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["kept", "x", "y", "z"] {
+            std::fs::write(directory.path().join(name), b"payload").unwrap();
+        }
+        let limits = Limits {
+            max_known_nodes: 3,
+            max_total_known_nodes: 64,
+            ..Limits::default()
+        };
+        let export = Export::new(directory.path(), limits).await.unwrap();
+        let session = export.session();
+
+        let entries = session.list(ROOT_NODE).await.unwrap();
+        let node_of = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.name == Name::from(name))
+                .unwrap()
+                .node
+        };
+        let kept = node_of("kept");
+        let (handle, _, _) = session
+            .open(kept, FileOpenOptions::READ_ONLY)
+            .await
+            .unwrap();
+
+        // Churn other nodes through the single rotating permit slot. The pinned
+        // node must survive every eviction.
+        for name in ["x", "y", "z", "x", "y", "z"] {
+            assert!(session.metadata(node_of(name)).await.is_ok());
+            assert!(
+                session.known_nodes.lock().unwrap().contains_key(&kept),
+                "the node backing an open handle must not be evicted"
+            );
+        }
+
+        // The handle is still usable throughout.
+        assert_eq!(session.read(handle, 0, 7).await.unwrap().1, b"payload");
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
