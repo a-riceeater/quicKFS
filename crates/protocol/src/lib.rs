@@ -1,13 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub const PROTOCOL_VERSION: u16 = 7;
-pub const ALPN_PROTOCOL: &[u8] = b"quickfs/7";
+pub const PROTOCOL_VERSION: u16 = 8;
+pub const ALPN_PROTOCOL: &[u8] = b"quickfs/8";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+
+/// High bit of the four-byte frame length prefix, set when the framed body is
+/// zstd-compressed. The remaining 31 bits carry the on-wire body length, which
+/// is always at most [`MAX_FRAME_SIZE`] (2^20), so a real length can never reach
+/// bit 31 and the flag never collides with one. A frame whose body does not set
+/// this bit is a raw postcard encoding, exactly as in protocol versions before
+/// compression existed.
+pub const FRAME_COMPRESSED_FLAG: u32 = 1 << 31;
+
+/// Payloads smaller than this are sent uncompressed. On already-tiny control
+/// messages (pings, single-node metadata, acks) the codec byte and CPU cost
+/// outweigh any saving, and such frames often do not shrink at all. The frames
+/// the roadmap targets — enriched directory views and their streamed chunks,
+/// with their repeated names and xattr keys — are far above this threshold.
+pub const FRAME_COMPRESSION_THRESHOLD: usize = 1024;
+
+/// zstd level used for frame compression. Level 3 (the zstd default) is the
+/// throughput/ratio sweet spot for the highly repetitive directory-view and
+/// metadata payloads this shrinks; higher levels cost noticeably more CPU for
+/// little extra ratio on this kind of data.
+pub const FRAME_COMPRESSION_LEVEL: i32 = 3;
 pub const MAX_DIRECTORY_INLINE_XATTR_SIZE: u32 = 4 * 1024;
 pub const MAX_DIRECTORY_INLINE_XATTR_TOTAL_SIZE: u32 = 256 * 1024;
 
@@ -764,6 +785,8 @@ pub enum CodecError {
     Malformed(#[from] postcard::Error),
     #[error("unsupported protocol version {0}")]
     UnsupportedVersion(u16),
+    #[error("frame decompression failed")]
+    Decompress,
 }
 
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
@@ -784,6 +807,62 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, CodecError> 
         return Err(CodecError::TooLarge(bytes.len()));
     }
     Ok(postcard::from_bytes(bytes)?)
+}
+
+/// Encode `value` and wrap it as an on-wire frame: return the four-byte length
+/// prefix word and the body bytes to write after it. The body is
+/// zstd-compressed only when that actually shrinks a payload at or above
+/// [`FRAME_COMPRESSION_THRESHOLD`]; otherwise the raw postcard encoding is sent,
+/// so an incompressible or tiny frame is never larger than it was before
+/// compression existed. When compressed, the prefix has [`FRAME_COMPRESSED_FLAG`]
+/// set and its low 31 bits hold the compressed body length; when not, the prefix
+/// is simply the postcard length, bit-for-bit compatible with the pre-compression
+/// framing. The postcard payload is still bounded by [`MAX_FRAME_SIZE`] via
+/// [`encode`], so packing decisions (directory-view chunking) stay measured
+/// against the uncompressed size — compression happens *after* the fit.
+pub fn encode_frame<T: Serialize>(value: &T) -> Result<(u32, Vec<u8>), CodecError> {
+    Ok(frame_body(encode(value)?))
+}
+
+fn frame_body(mut payload: Vec<u8>) -> (u32, Vec<u8>) {
+    if payload.len() >= FRAME_COMPRESSION_THRESHOLD {
+        if let Ok(compressed) = zstd::bulk::compress(&payload, FRAME_COMPRESSION_LEVEL) {
+            if compressed.len() < payload.len() {
+                // The uncompressed payload may carry redactable material (e.g. a
+                // pairing proof); clear it since it is not the buffer returned.
+                payload.zeroize();
+                return (compressed.len() as u32 | FRAME_COMPRESSED_FLAG, compressed);
+            }
+        }
+    }
+    // `payload.len()` is bounded by `MAX_FRAME_SIZE` (2^20), so it fits in the
+    // low 31 bits and never sets `FRAME_COMPRESSED_FLAG`.
+    (payload.len() as u32, payload)
+}
+
+/// Split a received four-byte frame length prefix into `(compressed, body_len)`.
+/// Rejects a declared body length beyond [`MAX_FRAME_SIZE`] before any allocation.
+pub fn parse_frame_header(prefix: u32) -> Result<(bool, usize), CodecError> {
+    let compressed = prefix & FRAME_COMPRESSED_FLAG != 0;
+    let length = (prefix & !FRAME_COMPRESSED_FLAG) as usize;
+    if length > MAX_FRAME_SIZE {
+        return Err(CodecError::TooLarge(length));
+    }
+    Ok((compressed, length))
+}
+
+/// Decode a frame body produced by [`encode_frame`]. When `compressed`, the body
+/// is zstd-decompressed with the output bounded to [`MAX_FRAME_SIZE`] so a
+/// hostile peer cannot force an unbounded allocation from a tiny frame
+/// (decompression-bomb guard), then postcard-decoded.
+pub fn decode_frame<T: DeserializeOwned>(compressed: bool, body: &[u8]) -> Result<T, CodecError> {
+    if compressed {
+        let payload =
+            zstd::bulk::decompress(body, MAX_FRAME_SIZE).map_err(|_| CodecError::Decompress)?;
+        decode(&payload)
+    } else {
+        decode(body)
+    }
 }
 pub fn decode_request(bytes: &[u8]) -> Result<Envelope<Request>, CodecError> {
     let msg: Envelope<Request> = decode(bytes)?;
@@ -909,6 +988,73 @@ mod tests {
         // encode() rejects anything over MAX_FRAME_SIZE, so success proves the
         // budget headroom is sufficient for the envelope + framing overhead.
         assert!(frame.is_ok(), "budget-filled chunk exceeded MAX_FRAME_SIZE");
+    }
+
+    #[test]
+    fn small_frame_is_left_uncompressed_and_round_trips() {
+        // A tiny control message is below the threshold: the prefix must not set
+        // the compressed flag and must decode identically to the pre-compression
+        // framing (raw postcard).
+        let message = Envelope::new(Response::Pong { nonce: 7 });
+        let (prefix, body) = encode_frame(&message).unwrap();
+        assert_eq!(prefix & FRAME_COMPRESSED_FLAG, 0);
+        assert_eq!(body, encode(&message).unwrap());
+        let (compressed, length) = parse_frame_header(prefix).unwrap();
+        assert!(!compressed);
+        assert_eq!(length, body.len());
+        assert_eq!(
+            decode_frame::<Envelope<Response>>(compressed, &body).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn large_repetitive_frame_compresses_and_round_trips() {
+        // A directory-view chunk of similar entries is exactly the highly
+        // compressible payload this targets: the body must actually shrink, the
+        // flag must be set, and it must reassemble bit-for-bit.
+        let chunk = Envelope::new(Response::DirectoryViewChunk {
+            entries: (0..2000).map(sample_view_entry).collect(),
+        });
+        let uncompressed = encode(&chunk).unwrap();
+        let (prefix, body) = encode_frame(&chunk).unwrap();
+        assert_ne!(prefix & FRAME_COMPRESSED_FLAG, 0);
+        assert!(
+            body.len() < uncompressed.len(),
+            "compressed body ({}) was not smaller than raw ({})",
+            body.len(),
+            uncompressed.len()
+        );
+        let (compressed, length) = parse_frame_header(prefix).unwrap();
+        assert!(compressed);
+        assert_eq!(length, body.len());
+        assert_eq!(
+            decode_frame::<Envelope<Response>>(compressed, &body).unwrap(),
+            chunk
+        );
+    }
+
+    #[test]
+    fn frame_header_rejects_oversized_length() {
+        let prefix = (MAX_FRAME_SIZE as u32) + 1;
+        assert!(matches!(
+            parse_frame_header(prefix),
+            Err(CodecError::TooLarge(_))
+        ));
+        // The flag bit must be masked off before the length check, so a
+        // compressed frame at exactly the cap is still accepted.
+        let (compressed, length) =
+            parse_frame_header(MAX_FRAME_SIZE as u32 | FRAME_COMPRESSED_FLAG).unwrap();
+        assert!(compressed);
+        assert_eq!(length, MAX_FRAME_SIZE);
+    }
+
+    #[test]
+    fn corrupt_compressed_body_fails_cleanly() {
+        assert!(matches!(
+            decode_frame::<Envelope<Response>>(true, &[0xff, 0x00, 0x13, 0x37]),
+            Err(CodecError::Decompress)
+        ));
     }
 
     #[test]
