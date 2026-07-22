@@ -1,4 +1,6 @@
-# Protocol version 6.3
+# Protocol version 6.4
+
+For the exhaustive wire contract — the frame layout, every `Request`/`Response` variant, the error taxonomy, the capability flags, and the guideline for adding a version — see the [formal protocol specification](protocol-spec.md). This document is the narrative overview.
 
 QUIC/TLS uses the `quickfs/6` ALPN identifier. Control messages are Postcard-encoded envelopes with a protocol version and request UUID, framed by a four-byte big-endian length prefix. Independent operations use independent bidirectional streams on one authenticated connection. The client sends a 10-second transport keepalive, both endpoints allow five minutes of idle time, the server permits 256 concurrent bidirectional streams, and 32 MiB stream/128 MiB connection receive windows allow several large reads to progress without flow-control serialization.
 
@@ -11,6 +13,7 @@ Minors are backward-negotiated. `Hello`/`HelloAck` carry each side's exact versi
 - **6.0** — baseline enriched-directory-view protocol.
 - **6.1** — streamed directory-view pagination (`DirectoryViewStart`/`Chunk`/`End`; see [Enriched directory views](#enriched-directory-views)).
 - **6.3** — per-frame compression (see [Frame compression](#frame-compression)).
+- **6.4** — multi-node metadata batching (see [Metadata batching](#metadata-batching)).
 
 ## Frame compression
 
@@ -24,7 +27,7 @@ Pairing and login remain separated from filesystem access. `Pair` proves possess
 
 Nodes and file handles are opaque UUIDs. `Name` is an arbitrary byte vector, so Unix filenames and xattr names are lossless rather than restricted to UTF-8. Persistent exports retain an epoch and secret node-key outside the export; clients reject a different epoch during reconnect. Handles are connection-local.
 
-The request model covers capabilities/statfs, metadata and enriched directory views, open/create/read/write/flush/sync/close, directory and symlink operations, remove and all rename modes, hardlinks, special nodes, xattrs, preallocation, range copy, data/hole seek, safe ioctl, poll readiness, block mapping, data exchange, volume name, backup time, byte-range locks, and advisory batch node forget. Responses carry updated metadata/revisions where coherency requires them.
+The request model covers capabilities/statfs, single-node and batched metadata and enriched directory views, open/create/read/write/flush/sync/close, directory and symlink operations, remove and all rename modes, hardlinks, special nodes, xattrs, preallocation, range copy, data/hole seek, safe ioctl, poll readiness, block mapping, data exchange, volume name, backup time, byte-range locks, and advisory batch node forget. Responses carry updated metadata/revisions where coherency requires them.
 
 ## Enriched directory views
 
@@ -41,6 +44,12 @@ The Linux server performs child stat/xattr work concurrently beside the export u
 **Pagination (6.1).** A directory whose projection fits one 1 MiB control frame is returned as a single `DirectoryView`, unchanged from earlier versions. A larger projection is *streamed* over the request's own stream as a `DirectoryViewStart` header (revision, directory and parent metadata, the directory's own xattrs, and an advisory entry count), followed by one or more `DirectoryViewChunk` frames of entries packed just under the frame limit, and terminated by `DirectoryViewEnd`. The server holds one revision-consistent snapshot for the whole stream, so there is no cursor to expire and no cross-page skew; the client reassembles the frames into an identical `DirectoryView` before returning to any caller above the transport. A single entry too large for one chunk sheds its inline xattr values (still reachable via `GetXattr`) so every frame stays bounded. Both peers cap the fully materialized entry set at `MAX_DIRECTORY_ENTRIES` (1,048,576) as a memory backstop; in practice the per-connection node ceiling (below) is reached first. The lighter `ListDirectory` request is still single-frame and returns a clean `TooLarge` error (never a dropped connection) when a plain listing would exceed the frame.
 
 The macFUSE adapter single-flights concurrent cold requests for the same directory, populates inode, metadata, complete xattr-name, xattr-size, and inline-value caches from the response, and then answers Finder's `readdir`, `lookup`, `getattr`, `listxattr`, negative xattr probes, and common small `getxattr` calls locally. Child metadata and the directory view share a 30-second lifetime; expiring children earlier would recreate the per-child metadata fan-out this request replaces. `ListDirectory` remains the lighter diagnostic/path-resolution request used by the CLI.
+
+## Metadata batching
+
+`GetMetadataBatch` (minor 6.4) resolves several nodes' metadata in one round trip. A cold crawl otherwise issues one `GetMetadata` per node — each a full RTT — which dominates latency over a WAN even though `readdirplus`-style enrichment already folds the common stat-during-`readdir` case into the directory view. One request carries up to `MAX_METADATA_BATCH` (4096) node IDs; the reply is one `MetadataBatch` with a positional result per node, in request order, so the client zips results back to its inputs. A per-node failure is reported in place as `BatchedMetadata::Failed(code)` rather than failing the whole batch, so one unresolved node never discards the metadata that did resolve. The 4096 cap keeps the reply within a single 1 MiB control frame (no streaming path) and bounds the server-side fan-out one request can trigger; a client with more nodes splits them across batches, and a server that receives an over-limit batch rejects it whole with `TooLarge` rather than truncating.
+
+Batching is **negotiated and additive**. The request and response are appended at the end of their respective enums, so every pre-existing variant keeps its Postcard discriminant and an older peer never has to decode the new ones. A client emits a batch only when the server's advertised minor is at least `MINOR_METADATA_BATCH` (6.4), learned from `HelloAck`; against an older same-major daemon it transparently falls back to one `GetMetadata` per node. The server needs no version check because it only ever *receives* the request, and only a 6.4+ client sends one. The batch is read-only and idempotent, so it may be reconnected and retried like any other safe read; a malformed or failed batch reply degrades to per-node requests so each node still yields its own true result.
 
 ## Node identity and per-connection limits
 

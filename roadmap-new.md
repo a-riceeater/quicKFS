@@ -136,12 +136,33 @@ about HTTP.
   bitset* (vs monotonic minor gating) and cross-**major** windows if ever needed.
 - **[P1] Missing `ctime` / inode-change timestamp.** "The protocol does not yet
   carry a distinct inode-change timestamp" (`native.rs:1862`) — the adapter
-  can't report an accurate `st_ctime`. Add it to `Metadata`.
-- **[P2] Batch / compound requests.** `readdirplus`-style enrichment already
-  folds stat into readdir, but multi-node metadata fetches, `ForgetNodes`
-  batching aside, and speculative opens still cost one RTT each. A compound
-  request (pipeline N ops in one frame) would cut RTTs on cold crawls over
-  WAN.
+  can't report an accurate `st_ctime`. Add it to `Metadata`. **Blocked as a
+  minor:** adding a field to `Metadata` is *not* wire-additive under Postcard
+  (positional, non-self-describing — a trailing field yields
+  `DeserializeUnexpectedEnd` or steals bytes from the next value; `#[serde(default)]`
+  only helps the JSON cache manifests, not the wire — verified empirically). It
+  therefore needs either a parallel negotiated `Metadata`-carrying message or a
+  **major** bump, not a simple minor. Documented as a known non-additive change in
+  `docs/protocol-spec.md` §8.3 and left outstanding.
+- **[DONE — minor 6.4] [P2] Batch / compound requests.** `readdirplus`-style
+  enrichment already folds stat into readdir, but multi-node metadata fetches,
+  `ForgetNodes` batching aside, and speculative opens still cost one RTT each.
+  **Resolved for the metadata case** (the one §2 names) with `GetMetadataBatch` /
+  `MetadataBatch`: one request resolves up to `MAX_METADATA_BATCH` (4096) nodes and
+  returns one positional `BatchedMetadata` per node (per-node failures ride in
+  their slot, not the whole batch), with the reply bounded to one 1 MiB frame.
+  Strictly additive: the variants are appended at the end of their enums so
+  existing Postcard discriminants are unchanged, and emission is gated on
+  `peer_supports_metadata_batch` (minor ≥ 6.4) with a per-node `GetMetadata`
+  fallback against an older same-major daemon. Chosen over a general N-op compound
+  pipeline (which the trailing-raw-bytes framing of `ReadRange`/`WriteRange`/xattr
+  ops complicates) as the tight, safe scope. *Where landed:* `crates/protocol`
+  (`Request::GetMetadataBatch`/`Response::MetadataBatch`/`BatchedMetadata` +
+  `MINOR_METADATA_BATCH`/`MAX_METADATA_BATCH`), `crates/transport-quic`
+  (`set_server_version`/`server_version`), daemon dispatch arm, client-core
+  `get_metadata_batch` + `negotiate`. *Still open:* speculative-open batching and
+  adapter/cache/resilient adoption of `get_metadata_batch` (the hot paths still
+  call single-node `GetMetadata`).
 - **[DONE — minor 6.3] [P2] Frame compression.** Directory views and metadata
   are highly compressible (repeated names, xattr keys). **Resolved** with
   per-frame zstd compression, negotiated as the first optional minor capability:
@@ -157,10 +178,18 @@ about HTTP.
   *Where landed:* `crates/protocol` (`encode_frame`/`parse_frame_header`/
   `decode_frame` + constants), `crates/transport-quic` `write_frame`/`read_frame`,
   daemon `write_frame_parts` + per-request gate, client-core `negotiate`.
-- **[P2] Formal protocol specification.** `docs/protocol.md` exists but a
-  versioned wire spec (frame layout, every `Request`/`Response` variant,
-  error taxonomy, capability flags) would make the flag-day/negotiation work
-  and any third-party client safe.
+- **[DONE — minor 6.4] [P2] Formal protocol specification.** `docs/protocol.md`
+  exists but a versioned wire spec (frame layout, every `Request`/`Response`
+  variant, error taxonomy, capability flags) would make the flag-day/negotiation
+  work and any third-party client safe. **Landed** as `docs/protocol-spec.md`: the
+  normative wire contract at 6.4 — transport parameters, the exact frame layout
+  (prefix/flag/body, Postcard non-self-describing serialization), the `Envelope`,
+  primitives and the `Metadata` field order, every `Request`/`Response` variant in
+  categorized tables, the full `ErrorCode` taxonomy, the capability-negotiation
+  model and predicate table, and — the piece §2 most needed — a **versioning
+  guideline** (§8.2) codifying the append-only/no-reshape Postcard rules that keep
+  a change a compatible minor, plus §8.3 recording the known non-additive changes
+  (`ctime`, server push). `docs/protocol.md` now links to it as the reference.
 
 ---
 
