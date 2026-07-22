@@ -2040,6 +2040,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_metadata_batch_negotiates_and_maps_results() {
+        // End to end through the high-level client: negotiation records the
+        // server's 6.4 version, get_metadata_batch collapses the nodes into one
+        // round trip, and per-node failures surface as individual Err slots.
+        let server = TestServer::start(5_000).await;
+        let client = NetworkFilesystem::authenticate(
+            server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+
+        let bogus = NodeId(uuid::Uuid::from_u128(0xdead_beef));
+        let results = client.get_metadata_batch(&[ROOT_NODE, bogus]).await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().node, ROOT_NODE);
+        assert!(results[1].is_err());
+
+        // Empty input is a no-op that never touches the wire.
+        assert!(client.get_metadata_batch(&[]).await.is_empty());
+
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn full_authentication_pipeline_and_adversarial_edges() {
         let server = TestServer::start(5_000).await;
 

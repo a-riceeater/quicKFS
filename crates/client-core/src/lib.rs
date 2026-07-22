@@ -89,6 +89,19 @@ pub trait RemoteFilesystem: Send + Sync {
         Err(unsupported("filesystem statistics"))
     }
     async fn get_metadata(&self, node: NodeId) -> Result<Metadata>;
+    /// Resolve metadata for several nodes, returning one result per input node in
+    /// order. A per-node failure is reported in its own slot rather than failing
+    /// the whole call, so a caller can still use the nodes that did resolve. The
+    /// default issues one [`Self::get_metadata`] per node; the network
+    /// implementation collapses them into a single `GetMetadataBatch` round trip
+    /// when the server negotiated minor 6.4, and otherwise falls back to this.
+    async fn get_metadata_batch(&self, nodes: &[NodeId]) -> Vec<Result<Metadata>> {
+        let mut results = Vec::with_capacity(nodes.len());
+        for &node in nodes {
+            results.push(self.get_metadata(node).await);
+        }
+        results
+    }
     async fn list_directory(&self, node: NodeId) -> Result<Vec<DirectoryEntry>>;
     async fn list_directory_snapshot(&self, node: NodeId) -> Result<DirectorySnapshot> {
         Ok(DirectorySnapshot {
@@ -357,6 +370,7 @@ impl NetworkFilesystem {
             .0
         {
             Response::HelloAck { version } => {
+                self.transport.set_server_version(version);
                 self.transport
                     .set_compression(peer_supports_frame_compression(version));
                 Ok(())
@@ -538,6 +552,53 @@ impl RemoteFilesystem for NetworkFilesystem {
             Response::Metadata(v) => Ok(v),
             r => Err(response_error(r)),
         }
+    }
+    async fn get_metadata_batch(&self, nodes: &[NodeId]) -> Vec<Result<Metadata>> {
+        // Only batch against a server that negotiated minor 6.4; otherwise fall
+        // back to one request per node (the trait default) so an older same-major
+        // daemon — which never advertised the capability and cannot decode the new
+        // request variant — is never sent one.
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        if !peer_supports_metadata_batch(self.transport.server_version()) {
+            let mut results = Vec::with_capacity(nodes.len());
+            for &node in nodes {
+                results.push(self.get_metadata(node).await);
+            }
+            return results;
+        }
+        let mut results = Vec::with_capacity(nodes.len());
+        // Split into server-bounded batches; each node keeps its input position.
+        for chunk in nodes.chunks(MAX_METADATA_BATCH) {
+            match self
+                .request(Request::GetMetadataBatch {
+                    nodes: chunk.to_vec(),
+                })
+                .await
+            {
+                Ok((Response::MetadataBatch { results: batch }, _))
+                    if batch.len() == chunk.len() =>
+                {
+                    results.extend(batch.into_iter().map(|entry| match entry {
+                        BatchedMetadata::Found(metadata) => Ok(metadata),
+                        BatchedMetadata::Failed(code) => {
+                            Err(ClientError::Server(code, "metadata unavailable".into()))
+                        }
+                    }));
+                }
+                // A malformed reply (wrong variant or a length that does not match
+                // the request count) or a transport error degrades this chunk to
+                // per-node requests, so every node still gets its own true result
+                // instead of a fabricated shared error.
+                _ => {
+                    for &node in chunk {
+                        results.push(self.get_metadata(node).await);
+                    }
+                }
+            }
+        }
+        results
     }
     async fn list_directory(&self, node: NodeId) -> Result<Vec<DirectoryEntry>> {
         Ok(self.list_directory_snapshot(node).await?.entries)
