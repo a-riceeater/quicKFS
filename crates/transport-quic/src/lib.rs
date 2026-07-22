@@ -17,7 +17,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -65,6 +65,11 @@ pub struct QuicClient {
     /// compressed frame. Decoding inbound compressed frames is always supported
     /// and does not consult this.
     compression: AtomicBool,
+    /// The peer's exact wire version, learned from `HelloAck` during negotiation
+    /// (0 until then). Lets the client gate optional minor capabilities beyond
+    /// compression — e.g. [`quickfs_protocol::peer_supports_metadata_batch`] —
+    /// without threading the version through every call site.
+    server_version: AtomicU16,
 }
 impl QuicClient {
     pub async fn connect(
@@ -172,6 +177,7 @@ impl QuicClient {
             connection,
             timeout,
             compression: AtomicBool::new(false),
+            server_version: AtomicU16::new(0),
         })
     }
 
@@ -180,6 +186,18 @@ impl QuicClient {
     /// [`quickfs_protocol::peer_supports_frame_compression`].
     pub fn set_compression(&self, enabled: bool) {
         self.compression.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Record the peer's exact wire version, learned from `HelloAck`. The client
+    /// sets this once during negotiation alongside [`Self::set_compression`].
+    pub fn set_server_version(&self, version: u16) {
+        self.server_version.store(version, Ordering::Relaxed);
+    }
+
+    /// The peer's wire version as learned from `HelloAck`, or 0 before negotiation.
+    /// Used to gate optional minor capabilities the client may emit.
+    pub fn server_version(&self) -> u16 {
+        self.server_version.load(Ordering::Relaxed)
     }
 
     pub fn peer_certificate_fingerprint(&self) -> Result<[u8; 32], TransportError> {
