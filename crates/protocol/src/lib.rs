@@ -1205,7 +1205,10 @@ mod tests {
     fn version_packing_and_compression_negotiation() {
         assert_eq!(version_major(PROTOCOL_VERSION), PROTOCOL_MAJOR);
         assert_eq!(version_minor(PROTOCOL_VERSION), PROTOCOL_MINOR);
-        assert_eq!(make_version(PROTOCOL_MAJOR, PROTOCOL_MINOR), PROTOCOL_VERSION);
+        assert_eq!(
+            make_version(PROTOCOL_MAJOR, PROTOCOL_MINOR),
+            PROTOCOL_VERSION
+        );
         // Same major, minor at/above the compression floor: compress. Below it or
         // a different major: do not.
         assert!(peer_supports_frame_compression(make_version(6, 3)));
