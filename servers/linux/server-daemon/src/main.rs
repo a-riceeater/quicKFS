@@ -909,6 +909,34 @@ async fn handle(
             .await
             .map(Response::Metadata)
             .unwrap_or_else(|error| Response::Error(error.protocol())),
+        Request::GetMetadataBatch { nodes } => {
+            // Additive minor-6.4 capability. Only a 6.4+ client ever sends this
+            // (the request is a new enum variant an older peer cannot encode), so
+            // no version check is needed here — but the batch size is still bounded
+            // so one request cannot trigger unbounded fan-out or a reply that
+            // overflows a single control frame.
+            if nodes.len() > MAX_METADATA_BATCH {
+                Response::Error(ProtocolError {
+                    code: ErrorCode::TooLarge,
+                    message: format!(
+                        "metadata batch of {} exceeds the {MAX_METADATA_BATCH} limit",
+                        nodes.len()
+                    ),
+                })
+            } else {
+                // Resolve each node independently; a per-node failure rides inside
+                // its result rather than failing the batch, so one missing node
+                // does not discard the metadata the client did resolve.
+                let mut results = Vec::with_capacity(nodes.len());
+                for node in nodes {
+                    results.push(match export.metadata(node).await {
+                        Ok(metadata) => BatchedMetadata::Found(metadata),
+                        Err(error) => BatchedMetadata::Failed(error.protocol().code),
+                    });
+                }
+                Response::MetadataBatch { results }
+            }
+        }
         Request::ListDirectory { node } => export
             .list_with_revision(node)
             .await
@@ -1923,6 +1951,90 @@ mod tests {
             "current-minor client must get compressed chunks"
         );
         assert_eq!(new_entries, ENTRIES);
+
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn metadata_batch_resolves_per_node_and_bounds_size() {
+        // Minor 6.4: one GetMetadataBatch resolves several nodes in one round trip,
+        // reports per-node failures in place rather than failing the batch, and
+        // rejects an over-limit request without truncating.
+        let server = TestServer::start(5_000).await;
+        let client = server.pinned_client().await;
+        assert!(matches!(
+            request(
+                &client,
+                Request::Authenticate {
+                    username: "alice".into(),
+                    password: "correct horse battery staple".to_string().into(),
+                },
+            )
+            .await,
+            Response::AuthenticateAck
+        ));
+
+        // Discover a real child node so the batch mixes distinct valid nodes.
+        let child = match request(
+            &client,
+            Request::ListDirectoryView {
+                node: ROOT_NODE,
+                options: DirectoryViewOptions::METADATA_ONLY,
+            },
+        )
+        .await
+        {
+            Response::DirectoryView(view) => view.entries[0].entry.node,
+            other => panic!("unexpected directory-view response: {other:?}"),
+        };
+        assert_ne!(child, ROOT_NODE);
+
+        // Batch of [root, child, bogus]: the two valid nodes resolve, the unknown
+        // node fails in place, and order is preserved.
+        let bogus = NodeId(uuid::Uuid::from_u128(0xdead_beef));
+        match request(
+            &client,
+            Request::GetMetadataBatch {
+                nodes: vec![ROOT_NODE, child, bogus],
+            },
+        )
+        .await
+        {
+            Response::MetadataBatch { results } => {
+                assert_eq!(results.len(), 3);
+                match &results[0] {
+                    BatchedMetadata::Found(m) => assert_eq!(m.node, ROOT_NODE),
+                    other => panic!("root should resolve: {other:?}"),
+                }
+                match &results[1] {
+                    BatchedMetadata::Found(m) => assert_eq!(m.node, child),
+                    other => panic!("child should resolve: {other:?}"),
+                }
+                assert!(matches!(results[2], BatchedMetadata::Failed(_)));
+            }
+            other => panic!("unexpected batch response: {other:?}"),
+        }
+
+        // An over-limit batch is rejected whole (TooLarge), not silently truncated,
+        // and the connection stays usable afterward.
+        match request(
+            &client,
+            Request::GetMetadataBatch {
+                nodes: vec![ROOT_NODE; MAX_METADATA_BATCH + 1],
+            },
+        )
+        .await
+        {
+            Response::Error(ProtocolError {
+                code: ErrorCode::TooLarge,
+                ..
+            }) => {}
+            other => panic!("over-limit batch should be TooLarge: {other:?}"),
+        }
+        assert!(matches!(
+            request(&client, Request::Ping { nonce: 7 }).await,
+            Response::Pong { nonce: 7 }
+        ));
 
         server.stop().await;
     }
