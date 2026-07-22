@@ -21,7 +21,8 @@ pub const PROTOCOL_MAJOR: u16 = 6;
 /// - `6.0` baseline enriched-directory-view protocol.
 /// - `6.1` streamed directory-view pagination (`DirectoryViewStart`/`Chunk`/`End`).
 /// - `6.3` per-frame compression ([`MINOR_FRAME_COMPRESSION`]).
-pub const PROTOCOL_MINOR: u16 = 3;
+/// - `6.4` multi-node metadata batching ([`MINOR_METADATA_BATCH`]).
+pub const PROTOCOL_MINOR: u16 = 4;
 
 /// The wire version word: major in the high byte, minor in the low byte. Carried
 /// in every [`Envelope`] and echoed in `HelloAck` so each side learns the other's
@@ -64,6 +65,32 @@ pub fn peer_supports_frame_compression(peer_version: u16) -> bool {
     version_major(peer_version) == PROTOCOL_MAJOR
         && version_minor(peer_version) >= MINOR_FRAME_COMPRESSION
 }
+
+/// Minor version in which multi-node metadata batching ([`Request::GetMetadataBatch`]
+/// / [`Response::MetadataBatch`]) was introduced. A client only *sends* a batch to
+/// a server whose advertised version is at least this; against an older same-major
+/// server it falls back to one [`Request::GetMetadata`] per node. Like every minor
+/// capability this gates the *emitter*: the request is a new enum variant, so an
+/// older peer never receives (and never has to decode) one.
+pub const MINOR_METADATA_BATCH: u16 = 4;
+
+/// Whether `peer` understands [`Request::GetMetadataBatch`]: same major and a minor
+/// at least [`MINOR_METADATA_BATCH`]. The client checks this against the version it
+/// learned from `HelloAck` before batching; the server needs no such check because
+/// it only ever *receives* the request (and only a 6.4+ client sends one).
+pub fn peer_supports_metadata_batch(peer_version: u16) -> bool {
+    version_major(peer_version) == PROTOCOL_MAJOR
+        && version_minor(peer_version) >= MINOR_METADATA_BATCH
+}
+
+/// Upper bound on the number of nodes one [`Request::GetMetadataBatch`] may name.
+/// Two reasons: the [`Response::MetadataBatch`] must fit one `MAX_FRAME_SIZE`
+/// control frame (a `BatchedMetadata` encodes to well under 160 bytes, so 4096
+/// results stay comfortably below 1 MiB even before compression), and it bounds
+/// the server-side fan-out one request can trigger. A client with more nodes to
+/// resolve splits them across several batches; a server that receives more than
+/// this rejects the request rather than truncating silently.
+pub const MAX_METADATA_BATCH: usize = 4096;
 
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
@@ -575,6 +602,17 @@ pub enum Request {
     Ping {
         nonce: u64,
     },
+    /// Resolve metadata for several nodes in one round trip. Introduced in minor
+    /// 6.4 ([`MINOR_METADATA_BATCH`]) as an additive, negotiated capability: a
+    /// client sends it only to a server advertising 6.4+, and it is **appended at
+    /// the end of this enum** so existing variants keep their postcard
+    /// discriminants and no older peer ever has to decode it. The reply is one
+    /// [`Response::MetadataBatch`] with one [`BatchedMetadata`] per requested node,
+    /// positionally aligned to `nodes`, so a single failed node does not fail the
+    /// whole batch. `nodes` must hold at most [`MAX_METADATA_BATCH`] entries.
+    GetMetadataBatch {
+        nodes: Vec<NodeId>,
+    },
 }
 
 impl Request {
@@ -692,6 +730,25 @@ pub enum Response {
         nonce: u64,
     },
     Error(ProtocolError),
+    /// Reply to [`Request::GetMetadataBatch`] (minor 6.4). One entry per requested
+    /// node, in the same order, so the client can zip results back to its inputs.
+    /// **Appended at the end of this enum** so existing variants keep their
+    /// postcard discriminants. A whole-request failure (e.g. an over-limit batch)
+    /// is still reported as [`Response::Error`]; per-node failures ride inside the
+    /// [`BatchedMetadata`] entries.
+    MetadataBatch {
+        results: Vec<BatchedMetadata>,
+    },
+}
+
+/// One node's result within a [`Response::MetadataBatch`]. A per-node failure is
+/// reported as a bare [`ErrorCode`] (no message string) to keep the aggregate
+/// response bounded; the client reconstructs a `NotFound`/`PermissionDenied`/…
+/// error from it exactly as it would from a single [`Request::GetMetadata`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum BatchedMetadata {
+    Found(Metadata),
+    Failed(ErrorCode),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1148,7 +1205,7 @@ mod tests {
     fn version_packing_and_compression_negotiation() {
         assert_eq!(version_major(PROTOCOL_VERSION), PROTOCOL_MAJOR);
         assert_eq!(version_minor(PROTOCOL_VERSION), PROTOCOL_MINOR);
-        assert_eq!(make_version(6, 3), PROTOCOL_VERSION);
+        assert_eq!(make_version(PROTOCOL_MAJOR, PROTOCOL_MINOR), PROTOCOL_VERSION);
         // Same major, minor at/above the compression floor: compress. Below it or
         // a different major: do not.
         assert!(peer_supports_frame_compression(make_version(6, 3)));
@@ -1156,6 +1213,54 @@ mod tests {
         assert!(!peer_supports_frame_compression(make_version(6, 2)));
         assert!(!peer_supports_frame_compression(make_version(6, 0)));
         assert!(!peer_supports_frame_compression(make_version(7, 3)));
+    }
+
+    #[test]
+    fn metadata_batch_request_and_response_round_trip() {
+        let request = Envelope::new(Request::GetMetadataBatch {
+            nodes: vec![ROOT_NODE, NodeId(Uuid::from_u128(9))],
+        });
+        assert_eq!(decode_request(&encode(&request).unwrap()).unwrap(), request);
+
+        let response = Envelope::new(Response::MetadataBatch {
+            results: vec![
+                BatchedMetadata::Found(sample_metadata(1)),
+                BatchedMetadata::Failed(ErrorCode::NotFound),
+            ],
+        });
+        assert_eq!(
+            decode::<Envelope<Response>>(&encode(&response).unwrap()).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn metadata_batch_negotiation_gates_on_minor() {
+        assert!(peer_supports_metadata_batch(make_version(6, 4)));
+        assert!(peer_supports_metadata_batch(make_version(6, 9)));
+        // The compression floor (6.3) is below the batch floor, so a 6.3 peer must
+        // not be sent a batch even though it is a valid same-major partner.
+        assert!(!peer_supports_metadata_batch(make_version(6, 3)));
+        assert!(!peer_supports_metadata_batch(make_version(6, 0)));
+        assert!(!peer_supports_metadata_batch(make_version(7, 4)));
+    }
+
+    #[test]
+    fn max_metadata_batch_response_fits_one_frame() {
+        // A full batch reply must always encode within MAX_FRAME_SIZE so it never
+        // needs the streaming path that directory views use. Use the largest
+        // plausible per-node encoding (both optional timestamps present).
+        let heavy = Metadata {
+            created_unix_ms: Some(u64::MAX),
+            backup_unix_ms: Some(u64::MAX),
+            ..sample_metadata(u128::MAX)
+        };
+        let results = vec![BatchedMetadata::Found(heavy); MAX_METADATA_BATCH];
+        let frame = encode(&Envelope::new(Response::MetadataBatch { results }));
+        assert!(
+            frame.is_ok(),
+            "a full {MAX_METADATA_BATCH}-node batch reply exceeded MAX_FRAME_SIZE"
+        );
     }
 
     #[test]
