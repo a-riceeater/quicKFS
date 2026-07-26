@@ -2920,4 +2920,234 @@ mod tests {
             "unblocked reads must hold the window"
         );
     }
+
+    // --- next-file (sibling) read-ahead ---------------------------------------
+
+    const SIB_DIR: NodeId = NodeId(Uuid::from_u128(100));
+    const SIB_A: NodeId = NodeId(Uuid::from_u128(101));
+    const SIB_B: NodeId = NodeId(Uuid::from_u128(102));
+    const SIB_FILE_SIZE: u64 = 512 * 1024;
+
+    /// A directory `SIB_DIR` holding two files `SIB_A`, `SIB_B` in order, with
+    /// per-node open/read/close counters so a test can prove that opening one
+    /// file warms the next one's first block exactly once.
+    #[derive(Default)]
+    struct SiblingFs {
+        opens: std::sync::Mutex<HashMap<NodeId, usize>>,
+        reads: std::sync::Mutex<HashMap<NodeId, usize>>,
+        closes: AtomicUsize,
+        handles: std::sync::Mutex<HashMap<FileHandle, NodeId>>,
+    }
+
+    impl SiblingFs {
+        fn count(map: &std::sync::Mutex<HashMap<NodeId, usize>>, node: NodeId) -> usize {
+            map.lock().unwrap().get(&node).copied().unwrap_or(0)
+        }
+        fn opens(&self, node: NodeId) -> usize {
+            Self::count(&self.opens, node)
+        }
+        fn reads(&self, node: NodeId) -> usize {
+            Self::count(&self.reads, node)
+        }
+        fn meta(node: NodeId) -> Metadata {
+            Metadata {
+                node,
+                kind: if node == SIB_DIR {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::File
+                },
+                size: if node == SIB_DIR { 0 } else { SIB_FILE_SIZE },
+                mode: 0o644,
+                allocated_blocks: 0,
+                revision: 5,
+                accessed_unix_ms: 1,
+                modified_unix_ms: 1,
+                created_unix_ms: Some(1),
+                backup_unix_ms: None,
+                link_count: 1,
+                device_major: 0,
+                device_minor: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteFilesystem for SiblingFs {
+        async fn ping(&self, nonce: u64) -> Result<u64> {
+            Ok(nonce)
+        }
+        async fn get_metadata(&self, node: NodeId) -> Result<Metadata> {
+            Ok(Self::meta(node))
+        }
+        async fn list_directory(&self, node: NodeId) -> Result<Vec<DirectoryEntry>> {
+            Ok(self.list_directory_snapshot(node).await?.entries)
+        }
+        async fn list_directory_snapshot(&self, _node: NodeId) -> Result<DirectorySnapshot> {
+            Ok(DirectorySnapshot {
+                revision: 5,
+                entries: vec![
+                    DirectoryEntry {
+                        node: SIB_A,
+                        name: "a.jpg".into(),
+                        kind: NodeKind::File,
+                        metadata: Self::meta(SIB_A),
+                    },
+                    DirectoryEntry {
+                        node: SIB_B,
+                        name: "b.jpg".into(),
+                        kind: NodeKind::File,
+                        metadata: Self::meta(SIB_B),
+                    },
+                ],
+            })
+        }
+        async fn open_file(&self, node: NodeId) -> Result<(FileHandle, u64, u64)> {
+            let opened = self
+                .open_file_with_options(node, FileOpenOptions::READ_ONLY)
+                .await?;
+            Ok((opened.handle, opened.revision, opened.size))
+        }
+        async fn open_file_with_options(
+            &self,
+            node: NodeId,
+            _options: FileOpenOptions,
+        ) -> Result<OpenedFile> {
+            *self.opens.lock().unwrap().entry(node).or_insert(0) += 1;
+            let handle = FileHandle(Uuid::new_v4());
+            self.handles.lock().unwrap().insert(handle, node);
+            Ok(OpenedFile {
+                handle,
+                revision: 5,
+                size: SIB_FILE_SIZE,
+            })
+        }
+        async fn read_range(
+            &self,
+            handle: FileHandle,
+            offset: u64,
+            length: u64,
+        ) -> Result<Vec<u8>> {
+            Ok(self
+                .read_range_versioned(handle, offset, length)
+                .await?
+                .data)
+        }
+        async fn read_range_versioned(
+            &self,
+            handle: FileHandle,
+            offset: u64,
+            length: u64,
+        ) -> Result<RangeRead> {
+            let node = self.handles.lock().unwrap().get(&handle).copied();
+            if let Some(node) = node {
+                *self.reads.lock().unwrap().entry(node).or_insert(0) += 1;
+            }
+            let end = offset.saturating_add(length).min(SIB_FILE_SIZE);
+            let len = end.saturating_sub(offset) as usize;
+            Ok(RangeRead {
+                revision: 5,
+                data: vec![0u8; len],
+            })
+        }
+        async fn close_file(&self, _handle: FileHandle) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Spin the runtime until `predicate` holds or a bounded number of yields is
+    /// exhausted, so a fire-and-forget warm task has a chance to run without a
+    /// fixed sleep. Returns whether the predicate became true.
+    async fn eventually(mut predicate: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if predicate() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        predicate()
+    }
+
+    #[tokio::test]
+    async fn opening_a_file_warms_the_next_sibling_first_block() {
+        let inner = Arc::new(SiblingFs::default());
+        let cache = Arc::new(MemoryCache::default());
+        let policy = CachePolicy {
+            block_size: 1024 * 1024,
+            read_ahead_max_bytes: 64 * 1024 * 1024,
+        };
+        let fs = CachedFilesystem::new(inner.clone(), cache, policy).unwrap();
+
+        // Listing the directory records A -> B as the next-file chain.
+        fs.list_directory_view(SIB_DIR, DirectoryViewOptions::METADATA_ONLY)
+            .await
+            .unwrap();
+
+        // Opening A speculatively opens B, reads its first block, and closes it.
+        let opened_a = fs
+            .open_file_with_options(SIB_A, FileOpenOptions::READ_ONLY)
+            .await
+            .unwrap();
+        assert!(
+            eventually(|| inner.reads(SIB_B) >= 1).await,
+            "opening A should warm B's first block"
+        );
+        assert_eq!(
+            inner.opens(SIB_B),
+            1,
+            "B warmed with exactly one speculative open"
+        );
+        assert_eq!(
+            inner.reads(SIB_A),
+            0,
+            "warming A's sibling must not read A itself"
+        );
+        assert!(
+            eventually(|| inner.closes.load(Ordering::SeqCst) >= 1).await,
+            "the speculative handle for B must be released"
+        );
+
+        // The real read of B's first block is now served from cache: no second
+        // read reaches the inner filesystem for B.
+        let opened_b = fs.open_file(SIB_B).await.unwrap();
+        let data = fs.read_range(opened_b.0, 0, SIB_FILE_SIZE).await.unwrap();
+        assert_eq!(data.len() as u64, SIB_FILE_SIZE);
+        assert_eq!(
+            inner.reads(SIB_B),
+            1,
+            "B's first block came from the warm, not a new read"
+        );
+
+        fs.close_file(opened_a.handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_file_prefetch_is_off_when_read_ahead_disabled() {
+        let inner = Arc::new(SiblingFs::default());
+        let cache = Arc::new(MemoryCache::default());
+        let policy = CachePolicy {
+            block_size: 1024 * 1024,
+            read_ahead_max_bytes: 0,
+        };
+        let fs = CachedFilesystem::new(inner.clone(), cache, policy).unwrap();
+
+        fs.list_directory_view(SIB_DIR, DirectoryViewOptions::METADATA_ONLY)
+            .await
+            .unwrap();
+        let opened = fs.open_file(SIB_A).await.unwrap();
+
+        // Give any (incorrectly-spawned) warm task ample opportunity to run.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            inner.opens(SIB_B),
+            0,
+            "no sibling warming when read-ahead is disabled"
+        );
+        assert_eq!(inner.reads(SIB_B), 0);
+
+        fs.close_file(opened.0).await.unwrap();
+    }
 }
