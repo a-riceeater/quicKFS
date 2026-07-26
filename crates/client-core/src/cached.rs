@@ -709,14 +709,23 @@ impl Fetcher {
 }
 
 /// Speculatively warm the first block of `node` (a next-file read-ahead target).
-/// Any error is swallowed — this is a best-effort hint, never a correctness path.
-/// Bytes can never be stale: the block is keyed by the revision the speculative
-/// open returns and [`Fetcher::fetch_block`] re-verifies it, so a file that
-/// changed after listing simply warms its current revision (or the warm is
-/// discarded), exactly like the per-handle prefetcher.
+///
+/// This is a best-effort hint that is **provably unable to affect a real read**.
+/// It deliberately does *not* go through the shared single-flight fetch map: a
+/// demand read for the same block therefore never coalesces with this
+/// speculative fetch, so a speculative failure (a transient server error, or an
+/// error tied to the throwaway speculative handle) can never propagate to a
+/// viewer's own read and turn its image into a failed-to-load placeholder. The
+/// only effect the warm can have is to populate the cache with correct bytes; on
+/// any error it stores nothing and returns. Bytes can never be stale: the block
+/// is keyed by, and re-verified against, the revision the speculative open
+/// returns, exactly like an ordinary read fill, so a file changed since it was
+/// listed simply warms its current revision or is discarded. The negligible cost
+/// of not coalescing is that a real read racing the warm may fetch the same
+/// ≤ 1 MiB block once more — bounded and far cheaper than the risk of a shared
+/// failure.
 async fn warm_sibling_first_block(
     inner: &dyn RemoteFilesystem,
-    fetcher: &Fetcher,
     cache: &dyn FilesystemCache,
     node: NodeId,
 ) {
@@ -740,23 +749,42 @@ async fn warm_sibling_first_block(
             return;
         }
     }
-    // The speculative open yields the authoritative revision/size. Warm the first
-    // block through the shared single-flight fetcher (so a real read arriving
-    // meanwhile coalesces instead of duplicating the fetch), then release the
-    // handle. The block size matches the small-read granularity a viewer's first
-    // read or mmap page-in uses, so it is a genuine cache hit and small images
-    // are warmed whole.
+    // The speculative open yields the authoritative revision/size. Read the first
+    // block directly (out-of-band, never registered in the single-flight map) and
+    // cache it only on a clean, revision-matching, non-empty read; the block size
+    // matches the small-read granularity a viewer's first read or mmap page-in
+    // uses, so it is a genuine cache hit and small images are warmed whole. Always
+    // release the speculative handle.
     let Ok((handle, revision, size)) = inner.open_file(node).await else {
         return;
     };
     if size > 0 {
         let length = SMALL_READ_AHEAD_BLOCK_SIZE.min(size);
-        let block0 = RangeKey {
-            file: RevisionKey { node, revision },
-            offset: 0,
-            length,
-        };
-        let _ = fetcher.fetch_block(handle, revision, block0).await;
+        match inner.read_range_versioned(handle, 0, length).await {
+            Ok(read) if read.revision == revision => {
+                let actual = read.data.len() as u64;
+                if actual > 0 && actual <= length {
+                    RangeCache::store_readthrough(
+                        cache,
+                        RangeKey {
+                            file: RevisionKey { node, revision },
+                            offset: 0,
+                            length: actual,
+                        },
+                        read.data,
+                    )
+                    .await;
+                }
+            }
+            _ => {
+                if prefetch_debug() {
+                    eprintln!(
+                        "[prefetch] sibling warm of {} did not cache a block",
+                        node.0
+                    );
+                }
+            }
+        }
     }
     let _ = inner.close_file(handle).await;
 }
@@ -986,13 +1014,18 @@ impl CachedFilesystem {
             self.sibling_warming.lock().await.remove(&next);
             return;
         };
+        if prefetch_debug() {
+            eprintln!(
+                "[prefetch] sibling warm scheduled: {} -> {}",
+                node.0, next.0
+            );
+        }
         let inner = Arc::clone(&self.inner);
-        let fetcher = Arc::clone(&self.fetcher);
         let cache = Arc::clone(&self.cache);
         let warming = Arc::clone(&self.sibling_warming);
         tokio::spawn(async move {
             let _slot = slot;
-            warm_sibling_first_block(inner.as_ref(), &fetcher, cache.as_ref(), next).await;
+            warm_sibling_first_block(inner.as_ref(), cache.as_ref(), next).await;
             warming.lock().await.remove(&next);
         });
     }
