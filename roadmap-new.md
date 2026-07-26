@@ -221,6 +221,21 @@ about HTTP.
   per-handle and reset each open; the first file after a fresh mount ramps
   from cold while the connection is also cold. A connection-level warmth signal
   could let a new handle start with a larger initial window.
+- **[DONE] Next-file (cross-file) read-ahead.** The per-handle window only
+  accelerated access *within* one file, so browsing a directory of media (the
+  Finder/Preview "next image") paid a full cold open+read RTT on every file.
+  **Landed** a cross-file warm: `client-core/src/cached.rs` records each file's
+  forward file-neighbour from enriched directory views (`next_sibling`, bounded)
+  and, on a read-capable `open`, warms the successor's first block (≤ 1 MiB, the
+  small-read/mmap granularity so it is a genuine hit; sub-1 MiB files warm whole)
+  via a speculative open+read+close through the shared single-flight fetcher.
+  Strictly bounded: one file ahead per open, non-blocking admission on a 2-slot
+  pool so demand never queues behind it, an in-flight dedup set, revision-keyed
+  bytes (never stale), and off with `--read-ahead-max-bytes 0`. Complements the
+  cross-handle/warmth idea above (still open) and the "media apps that seek"
+  motivation of the random-read gap. *Where:* `spawn_sibling_prefetch` /
+  `warm_sibling_first_block` in `cached.rs`; see `docs/caching.md` "Next-file
+  read-ahead".
 
 ---
 
