@@ -177,6 +177,16 @@ fn prefetch_debug() -> bool {
     *ON.get_or_init(|| std::env::var_os("QUICKFS_PREFETCH_DEBUG").is_some())
 }
 
+/// Whether next-file (sibling) read-ahead is enabled. On by default; setting
+/// `QUICKFS_DISABLE_NEXT_FILE_PREFETCH` turns off *only* the cross-file "next
+/// image" warm while leaving within-file sequential read-ahead untouched. This is
+/// the clean A/B lever for isolating the next-file feature — unlike
+/// `--read-ahead-max-bytes 0`, which disables all speculation.
+fn next_file_prefetch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QUICKFS_DISABLE_NEXT_FILE_PREFETCH").is_none())
+}
+
 pub trait FilesystemCache:
     MetadataCache + DirectoryCache + RangeCache + FilesystemStateCache + NodeCacheInvalidation
 {
@@ -970,7 +980,7 @@ impl CachedFilesystem {
     /// stored, so a directory or symlink following a file is never speculatively
     /// opened. Skipped entirely when read-ahead is disabled.
     async fn record_siblings(&self, entries: &[DirectoryViewEntry]) {
-        if self.policy.read_ahead_max_bytes == 0 {
+        if self.policy.read_ahead_max_bytes == 0 || !next_file_prefetch_enabled() {
             return;
         }
         let mut map = self.next_sibling.write().await;
@@ -998,7 +1008,7 @@ impl CachedFilesystem {
     /// file ahead per open means browsing forward naturally keeps the next item
     /// primed without ever launching a burst of speculative opens.
     async fn spawn_sibling_prefetch(&self, node: NodeId) {
-        if self.policy.read_ahead_max_bytes == 0 {
+        if self.policy.read_ahead_max_bytes == 0 || !next_file_prefetch_enabled() {
             return;
         }
         let Some(next) = self.next_sibling.read().await.get(&node).copied() else {
