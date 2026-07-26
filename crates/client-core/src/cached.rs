@@ -14,8 +14,8 @@ use quickfs_cache::{
 use quickfs_protocol::{
     AttributeChanges, DirectoryEntry, DirectoryView, DirectoryViewEntry, DirectoryViewOptions,
     ErrorCode, FileAccess, FileHandle, FileLock, FileOpenOptions, FilesystemCapabilities,
-    FilesystemStats, Metadata, Name, NodeId, ROOT_NODE, RenameMode, SafeIoctl, SeekWhence,
-    SpecialNodeKind, XattrSetMode,
+    FilesystemStats, Metadata, Name, NodeId, NodeKind, ROOT_NODE, RenameMode, SafeIoctl,
+    SeekWhence, SpecialNodeKind, XattrSetMode,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -145,6 +145,24 @@ const PREFETCH_MAX_CONCURRENT_FETCHES: usize = 8;
 /// phase timeout plus reconnect budget so it only fires when the fetch is
 /// genuinely wedged rather than slow.
 const PREFETCH_FETCH_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Most speculative *next-file* (sibling) opens in flight at once across the
+/// whole mount. Distinct from the per-file block prefetcher's slots: warming the
+/// next file costs a speculative open + first-block read + close, so this is kept
+/// deliberately tiny. It hides the latency of navigating to the next item in a
+/// directory — the Finder/Preview "next image" — without letting a directory of
+/// files launch a wall of speculative opens that competes with demand reads or
+/// drains the server's bounded open-handle pool. Admission is non-blocking
+/// (`try_acquire`), so an interactive open never waits on it.
+const SIBLING_PREFETCH_MAX_CONCURRENT: usize = 2;
+
+/// Cap on the child→next-file-sibling map, which records the forward file
+/// neighbour of each file in a listed directory so an `open` can warm the next
+/// one. Bounded so crawling many large directories cannot grow it without limit;
+/// on overflow it is cleared (cheap and rare — the next directory listing
+/// repopulates what is needed, and the 30 s view lifetime already bounds
+/// relevance).
+const MAX_TRACKED_SIBLINGS: usize = 131072;
 
 /// How many times a demand read refreshes its revision snapshot and retries
 /// after observing that the remote file moved past the handle's recorded
@@ -690,6 +708,59 @@ impl Fetcher {
     }
 }
 
+/// Speculatively warm the first block of `node` (a next-file read-ahead target).
+/// Any error is swallowed — this is a best-effort hint, never a correctness path.
+/// Bytes can never be stale: the block is keyed by the revision the speculative
+/// open returns and [`Fetcher::fetch_block`] re-verifies it, so a file that
+/// changed after listing simply warms its current revision (or the warm is
+/// discarded), exactly like the per-handle prefetcher.
+async fn warm_sibling_first_block(
+    inner: &dyn RemoteFilesystem,
+    fetcher: &Fetcher,
+    cache: &dyn FilesystemCache,
+    node: NodeId,
+) {
+    // If this file's revision is already known and its first block is cached,
+    // there is nothing to warm — skip the speculative open entirely so repeated
+    // navigation does not re-open an already-primed file.
+    if let Some(metadata) = MetadataCache::get(cache, node).await {
+        let length = SMALL_READ_AHEAD_BLOCK_SIZE.min(metadata.size);
+        if length == 0 {
+            return;
+        }
+        let block0 = RangeKey {
+            file: RevisionKey {
+                node,
+                revision: metadata.revision,
+            },
+            offset: 0,
+            length,
+        };
+        if RangeCache::get(cache, block0).await.is_some() {
+            return;
+        }
+    }
+    // The speculative open yields the authoritative revision/size. Warm the first
+    // block through the shared single-flight fetcher (so a real read arriving
+    // meanwhile coalesces instead of duplicating the fetch), then release the
+    // handle. The block size matches the small-read granularity a viewer's first
+    // read or mmap page-in uses, so it is a genuine cache hit and small images
+    // are warmed whole.
+    let Ok((handle, revision, size)) = inner.open_file(node).await else {
+        return;
+    };
+    if size > 0 {
+        let length = SMALL_READ_AHEAD_BLOCK_SIZE.min(size);
+        let block0 = RangeKey {
+            file: RevisionKey { node, revision },
+            offset: 0,
+            length,
+        };
+        let _ = fetcher.fetch_block(handle, revision, block0).await;
+    }
+    let _ = inner.close_file(handle).await;
+}
+
 /// Adds a revision-keyed read-through/offline cache without weakening remote
 /// write, fsync, or lock semantics. Offline access is intentionally read-only.
 pub struct CachedFilesystem {
@@ -701,6 +772,18 @@ pub struct CachedFilesystem {
     refreshing_directories: Arc<Mutex<HashSet<NodeId>>>,
     fetcher: Arc<Fetcher>,
     directory_parents: RwLock<HashMap<NodeId, NodeId>>,
+    /// Maps each file node to the next file in its directory's order, populated
+    /// from enriched directory views. Drives next-file ("next image") read-ahead:
+    /// opening a file warms the first block of its successor so navigating to it
+    /// is a cache hit instead of a cold open+read. See
+    /// [`Self::spawn_sibling_prefetch`].
+    next_sibling: RwLock<HashMap<NodeId, NodeId>>,
+    /// Non-blocking admission for speculative next-file opens, so an interactive
+    /// open never queues behind sibling warming.
+    sibling_prefetch_slots: Arc<Semaphore>,
+    /// Successors currently being warmed, so concurrent opens do not launch
+    /// duplicate speculative opens of the same next file.
+    sibling_warming: Arc<Mutex<HashSet<NodeId>>>,
 }
 
 impl CachedFilesystem {
@@ -746,6 +829,9 @@ impl CachedFilesystem {
             refreshing_directories: Arc::new(Mutex::new(HashSet::new())),
             fetcher,
             directory_parents: RwLock::new(HashMap::from([(ROOT_NODE, ROOT_NODE)])),
+            next_sibling: RwLock::new(HashMap::new()),
+            sibling_prefetch_slots: Arc::new(Semaphore::new(SIBLING_PREFETCH_MAX_CONCURRENT)),
+            sibling_warming: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -848,6 +934,66 @@ impl CachedFilesystem {
                 }
             }
             refreshing.lock().await.remove(&node);
+        });
+    }
+
+    /// Record, for a freshly listed directory, each file's forward file
+    /// neighbour so an `open` can warm the next one. Only file→file pairs are
+    /// stored, so a directory or symlink following a file is never speculatively
+    /// opened. Skipped entirely when read-ahead is disabled.
+    async fn record_siblings(&self, entries: &[DirectoryViewEntry]) {
+        if self.policy.read_ahead_max_bytes == 0 {
+            return;
+        }
+        let mut map = self.next_sibling.write().await;
+        // Soft cap: clear before repopulating so the map stays bounded to roughly
+        // one large directory's worth rather than growing across a crawl.
+        if map.len() >= MAX_TRACKED_SIBLINGS {
+            map.clear();
+        }
+        for pair in entries.windows(2) {
+            let current = &pair[0].entry;
+            let next = &pair[1].entry;
+            if current.kind == NodeKind::File && next.kind == NodeKind::File {
+                map.insert(current.node, next.node);
+            }
+        }
+    }
+
+    /// Warm the first block of `node`'s next-file sibling so navigating to it —
+    /// the Finder/Preview "next image" — is a cache hit rather than a cold
+    /// open+read. Fire-and-forget and strictly bounded: it warms only the
+    /// immediate successor, only its first block (≤ 1 MiB), and only if a
+    /// non-blocking speculative-open slot is free, so it never delays, queues
+    /// behind, or starves a demand read, and holds at most
+    /// [`SIBLING_PREFETCH_MAX_CONCURRENT`] transient extra handles. Warming one
+    /// file ahead per open means browsing forward naturally keeps the next item
+    /// primed without ever launching a burst of speculative opens.
+    async fn spawn_sibling_prefetch(&self, node: NodeId) {
+        if self.policy.read_ahead_max_bytes == 0 {
+            return;
+        }
+        let Some(next) = self.next_sibling.read().await.get(&node).copied() else {
+            return;
+        };
+        // Dedup concurrent warms of the same successor.
+        if !self.sibling_warming.lock().await.insert(next) {
+            return;
+        }
+        // Non-blocking admission: an interactive open must never wait on
+        // speculation. If every slot is busy, skip this warm rather than queue.
+        let Ok(slot) = Arc::clone(&self.sibling_prefetch_slots).try_acquire_owned() else {
+            self.sibling_warming.lock().await.remove(&next);
+            return;
+        };
+        let inner = Arc::clone(&self.inner);
+        let fetcher = Arc::clone(&self.fetcher);
+        let cache = Arc::clone(&self.cache);
+        let warming = Arc::clone(&self.sibling_warming);
+        tokio::spawn(async move {
+            let _slot = slot;
+            warm_sibling_first_block(inner.as_ref(), &fetcher, cache.as_ref(), next).await;
+            warming.lock().await.remove(&next);
         });
     }
 
@@ -1270,6 +1416,7 @@ impl RemoteFilesystem for CachedFilesystem {
                     .write()
                     .await
                     .insert(node, view.parent.node);
+                self.record_siblings(&view.entries).await;
                 Ok(view)
             }
             Err(error) if is_offline(&error) => {
@@ -1315,15 +1462,24 @@ impl RemoteFilesystem for CachedFilesystem {
         options: FileOpenOptions,
     ) -> Result<OpenedFile> {
         match self.inner.open_file_with_options(node, options).await {
-            Ok(opened) => Ok(self
-                .remember_handle(
-                    node,
-                    Some(opened.handle),
-                    opened.revision,
-                    opened.size,
-                    options,
-                )
-                .await),
+            Ok(opened) => {
+                let remembered = self
+                    .remember_handle(
+                        node,
+                        Some(opened.handle),
+                        opened.revision,
+                        opened.size,
+                        options,
+                    )
+                    .await;
+                // Warm the next file in this one's directory so navigating to it
+                // (the Finder/Preview "next image") is a cache hit. Read-capable
+                // opens only — a write/copy flow should not speculate forward.
+                if options.access.can_read() {
+                    self.spawn_sibling_prefetch(node).await;
+                }
+                Ok(remembered)
+            }
             Err(error)
                 if is_offline(&error)
                     && options.access == FileAccess::ReadOnly
