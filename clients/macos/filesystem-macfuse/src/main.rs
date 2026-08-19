@@ -51,8 +51,8 @@ mod macos {
     use quickfs_cache::{CacheNamespace, NonBlockingPersistentCache};
     use quickfs_client_core::{
         AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, MAX_CLIENT_READ_SIZE,
-        ReconnectPolicy, RemoteFilesystem, ResilientFilesystem, ServerTrust,
-        load_trusted_server_pin,
+        ReconnectPolicy, RemoteFilesystem, ResilientFilesystem, ResilientFilesystemOptions,
+        ServerTrust, load_trusted_server_pin,
     };
     use quickfs_filesystem_macfuse::{Adapter, MacFuseBackend, MountConfig, mount};
     use quickfs_transport_quic::load_certificates;
@@ -64,6 +64,11 @@ mod macos {
     };
     use tokio::runtime::Builder;
     use zeroize::Zeroizing;
+
+    // Let the resilient layer deliver its typed timeout (especially
+    // AmbiguousMutation) before the callback bridge's last-resort guard fires.
+    // This is an internal scheduling margin, not a second timeout setting.
+    const DEADLINE_ERROR_DELIVERY_GRACE: Duration = Duration::from_millis(100);
 
     #[derive(Clone, Copy, Debug, Default, ValueEnum)]
     enum Backend {
@@ -135,6 +140,7 @@ mod macos {
         /// scans and 16 MiB reads can legitimately exceed ten seconds.
         #[arg(long, default_value_t = 60_000)]
         timeout_ms: u64,
+        /// Hard end-to-end budget for one resilient operation and its callback.
         #[arg(long, default_value_t = 120_000)]
         callback_timeout_ms: u64,
         #[arg(long, default_value_t = 3)]
@@ -183,6 +189,7 @@ mod macos {
             .ok_or_else(|| anyhow::anyhow!("--username or QUICKFS_USERNAME is required"))?;
         let trust = server_trust(&cli)?;
         let transport_timeout = Duration::from_millis(cli.timeout_ms);
+        let operation_deadline = Duration::from_millis(cli.callback_timeout_ms);
         let runtime = Arc::new(
             Builder::new_multi_thread()
                 .enable_all()
@@ -215,10 +222,13 @@ mod macos {
         let resilient = runtime
             .block_on(ResilientFilesystem::connect_authenticated(
                 connection,
-                ReconnectPolicy {
-                    attempts: cli.reconnect_attempts,
-                    initial_backoff: Duration::from_millis(cli.reconnect_initial_backoff_ms),
-                    maximum_backoff: Duration::from_millis(cli.reconnect_max_backoff_ms),
+                ResilientFilesystemOptions {
+                    reconnect: ReconnectPolicy {
+                        attempts: cli.reconnect_attempts,
+                        initial_backoff: Duration::from_millis(cli.reconnect_initial_backoff_ms),
+                        maximum_backoff: Duration::from_millis(cli.reconnect_max_backoff_ms),
+                    },
+                    operation_deadline,
                 },
             ))
             .context("username/password authentication failed")?;
@@ -264,7 +274,7 @@ mod macos {
         let remote: Arc<dyn RemoteFilesystem> = Arc::new(filesystem);
         let adapter = Adapter::with_runtime(
             remote,
-            Duration::from_millis(cli.callback_timeout_ms),
+            operation_deadline.saturating_add(DEADLINE_ERROR_DELIVERY_GRACE),
             runtime,
         );
         let mount_config = MountConfig {

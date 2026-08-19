@@ -21,9 +21,13 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+tokio::task_local! {
+    static OPERATION_GENERATION: Arc<AtomicU64>;
+}
 
 /// Connection details retained in zeroizing process memory so a mounted
 /// filesystem can authenticate a replacement QUIC connection.
@@ -70,6 +74,23 @@ impl Default for ReconnectPolicy {
             attempts: 3,
             initial_backoff: Duration::from_millis(100),
             maximum_backoff: Duration::from_secs(2),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResilientFilesystemOptions {
+    pub reconnect: ReconnectPolicy,
+    /// Hard deadline for one logical filesystem operation, including all
+    /// reconnect, authentication, handle-recovery, and retry work.
+    pub operation_deadline: Duration,
+}
+
+impl Default for ResilientFilesystemOptions {
+    fn default() -> Self {
+        Self {
+            reconnect: ReconnectPolicy::default(),
+            operation_deadline: Duration::from_secs(120),
         }
     }
 }
@@ -130,53 +151,76 @@ struct HandleState {
 pub struct ResilientFilesystem {
     connector: Arc<dyn RemoteFilesystemConnector>,
     policy: ReconnectPolicy,
-    connection: RwLock<ConnectionSlot>,
-    reconnect: Mutex<ReconnectState>,
-    failed_generation: AtomicU64,
+    operation_deadline: Duration,
+    connection: Arc<RwLock<ConnectionSlot>>,
+    reconnect: Arc<Mutex<ReconnectState>>,
+    reconnect_notify: Arc<Notify>,
+    failed_generation: Arc<AtomicU64>,
     server_epoch: Option<Uuid>,
     handles: RwLock<HashMap<FileHandle, HandleState>>,
 }
 
 #[derive(Default)]
 struct ReconnectState {
+    in_progress: Option<u64>,
     /// A failed reconnect batch is shared by all operations that were queued
     /// behind it. Without this short cooldown, every queued FUSE request runs
     /// another complete reconnect batch serially while the server is offline.
-    last_failure: Option<(u64, Instant)>,
+    last_failure: Option<(u64, Instant, ReconnectFailure)>,
+}
+
+#[derive(Clone, Copy)]
+enum ReconnectFailure {
+    Offline,
+    EpochChanged,
+}
+
+impl ReconnectFailure {
+    fn error(self) -> ClientError {
+        match self {
+            Self::Offline => ClientError::Offline,
+            Self::EpochChanged => ClientError::Server(
+                quickfs_protocol::ErrorCode::Conflict,
+                "server epoch changed; existing inode and cache state is stale".into(),
+            ),
+        }
+    }
 }
 
 impl ResilientFilesystem {
     pub async fn connect_authenticated(
         config: AuthenticatedConnectionConfig,
-        policy: ReconnectPolicy,
+        options: ResilientFilesystemOptions,
     ) -> Result<Self> {
         let connector: Arc<dyn RemoteFilesystemConnector> =
             Arc::new(AuthenticatedConnector { config });
         let initial = connector.connect().await?;
-        Self::new(initial, connector, policy).await
+        Self::new(initial, connector, options).await
     }
 
     pub async fn new(
         initial: Arc<dyn RemoteFilesystem>,
         connector: Arc<dyn RemoteFilesystemConnector>,
-        policy: ReconnectPolicy,
+        options: ResilientFilesystemOptions,
     ) -> Result<Self> {
-        if policy.attempts == 0 {
+        if options.reconnect.attempts == 0 || options.operation_deadline.is_zero() {
             return Err(ClientError::Server(
                 quickfs_protocol::ErrorCode::InvalidRequest,
-                "reconnect attempts must be greater than zero".into(),
+                "reconnect attempts and operation deadline must be greater than zero".into(),
             ));
         }
         let server_epoch = capability_epoch(initial.as_ref()).await?;
         Ok(Self {
             connector,
-            policy,
-            connection: RwLock::new(ConnectionSlot {
+            policy: options.reconnect,
+            operation_deadline: options.operation_deadline,
+            connection: Arc::new(RwLock::new(ConnectionSlot {
                 generation: 1,
                 filesystem: initial,
-            }),
-            reconnect: Mutex::new(ReconnectState::default()),
-            failed_generation: AtomicU64::new(0),
+            })),
+            reconnect: Arc::new(Mutex::new(ReconnectState::default())),
+            reconnect_notify: Arc::new(Notify::new()),
+            failed_generation: Arc::new(AtomicU64::new(0)),
             server_epoch,
             handles: RwLock::new(HashMap::new()),
         })
@@ -184,68 +228,150 @@ impl ResilientFilesystem {
 
     async fn healthy_connection(&self) -> Result<ConnectionSlot> {
         let current = self.connection.read().await.clone();
-        if self.failed_generation.load(Ordering::Acquire) == current.generation {
+        let slot = if self.failed_generation.load(Ordering::Acquire) == current.generation {
             self.reconnect_after(current.generation).await
         } else {
             Ok(current)
-        }
+        }?;
+        Self::observe_generation(slot.generation);
+        Ok(slot)
+    }
+
+    fn observe_generation(generation: u64) {
+        let _ = OPERATION_GENERATION.try_with(|observed| {
+            observed.store(generation, Ordering::Release);
+        });
     }
 
     fn mark_failed(&self, generation: u64) {
-        self.failed_generation.store(generation, Ordering::Release);
+        self.failed_generation
+            .fetch_max(generation, Ordering::AcqRel);
     }
 
     async fn reconnect_after(&self, failed_generation: u64) -> Result<ConnectionSlot> {
-        let mut reconnect = self.reconnect.lock().await;
-        let current = self.connection.read().await.clone();
-        if current.generation != failed_generation
-            || self.failed_generation.load(Ordering::Acquire) != failed_generation
-        {
-            return Ok(current);
-        }
-        if reconnect
-            .last_failure
-            .is_some_and(|(generation, failed_at)| {
-                generation == failed_generation && failed_at.elapsed() < self.policy.maximum_backoff
-            })
-        {
-            return Err(ClientError::Offline);
-        }
+        loop {
+            let notified = self.reconnect_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-        let mut backoff = self.policy.initial_backoff;
-        for attempt in 0..self.policy.attempts {
-            match self.connector.connect().await {
-                Ok(filesystem) => {
-                    let epoch = capability_epoch(filesystem.as_ref()).await?;
-                    if self.server_epoch.is_some() && epoch != self.server_epoch {
-                        return Err(ClientError::Server(
-                            quickfs_protocol::ErrorCode::Conflict,
-                            "server epoch changed; existing inode and cache state is stale".into(),
-                        ));
+            let current = self.connection.read().await.clone();
+            if current.generation != failed_generation
+                || self.failed_generation.load(Ordering::Acquire) != failed_generation
+            {
+                Self::observe_generation(current.generation);
+                return Ok(current);
+            }
+
+            let mut reconnect = self.reconnect.lock().await;
+            if let Some((generation, failed_at, failure)) = reconnect.last_failure
+                && generation == failed_generation
+                && failed_at.elapsed() < self.policy.maximum_backoff
+            {
+                return Err(failure.error());
+            }
+            if reconnect.in_progress == Some(failed_generation) {
+                drop(reconnect);
+                notified.await;
+                continue;
+            }
+
+            reconnect.in_progress = Some(failed_generation);
+            drop(reconnect);
+            self.spawn_reconnect(failed_generation);
+            notified.await;
+        }
+    }
+
+    fn spawn_reconnect(&self, failed_generation: u64) {
+        let connector = self.connector.clone();
+        let policy = self.policy;
+        let connection = self.connection.clone();
+        let reconnect = self.reconnect.clone();
+        let reconnect_notify = self.reconnect_notify.clone();
+        let failed = self.failed_generation.clone();
+        let expected_epoch = self.server_epoch;
+        tokio::spawn(async move {
+            let mut backoff = policy.initial_backoff;
+            let mut outcome = Err(ReconnectFailure::Offline);
+            for attempt in 0..policy.attempts {
+                if let Ok(filesystem) = connector.connect().await {
+                    match capability_epoch(filesystem.as_ref()).await {
+                        Ok(epoch) if expected_epoch.is_none() || epoch == expected_epoch => {
+                            outcome = Ok(filesystem);
+                            break;
+                        }
+                        Ok(_) => {
+                            outcome = Err(ReconnectFailure::EpochChanged);
+                            break;
+                        }
+                        Err(_) => {}
                     }
-                    let slot = ConnectionSlot {
-                        generation: failed_generation.saturating_add(1),
-                        filesystem,
-                    };
-                    *self.connection.write().await = slot.clone();
-                    self.failed_generation.store(0, Ordering::Release);
-                    reconnect.last_failure = None;
-                    return Ok(slot);
                 }
-                Err(_) if attempt + 1 < self.policy.attempts => {
+                if attempt + 1 < policy.attempts {
                     tokio::time::sleep(backoff).await;
                     backoff = backoff
                         .checked_mul(2)
-                        .unwrap_or(self.policy.maximum_backoff)
-                        .min(self.policy.maximum_backoff);
-                }
-                Err(_) => {
-                    reconnect.last_failure = Some((failed_generation, Instant::now()));
-                    return Err(ClientError::Offline);
+                        .unwrap_or(policy.maximum_backoff)
+                        .min(policy.maximum_backoff);
                 }
             }
+
+            let mut state = reconnect.lock().await;
+            match outcome {
+                Ok(filesystem) => {
+                    let mut current = connection.write().await;
+                    if current.generation == failed_generation
+                        && failed.load(Ordering::Acquire) == failed_generation
+                    {
+                        *current = ConnectionSlot {
+                            generation: failed_generation.saturating_add(1),
+                            filesystem,
+                        };
+                        failed.store(0, Ordering::Release);
+                    }
+                    state.last_failure = None;
+                }
+                Err(failure) => {
+                    state.last_failure = Some((failed_generation, Instant::now(), failure));
+                }
+            }
+            state.in_progress = None;
+            drop(state);
+            reconnect_notify.notify_waiters();
+        });
+    }
+
+    async fn operation<T>(
+        &self,
+        mutation: bool,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        if OPERATION_GENERATION.try_with(|_| ()).is_ok() {
+            return future.await;
         }
-        Err(ClientError::Offline)
+
+        let generation = Arc::new(AtomicU64::new(0));
+        OPERATION_GENERATION
+            .scope(generation.clone(), async {
+                match tokio::time::timeout(self.operation_deadline, future).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let generation = generation.load(Ordering::Acquire);
+                        if generation != 0 {
+                            self.mark_failed(generation);
+                        }
+                        if mutation {
+                            Err(ClientError::AmbiguousMutation)
+                        } else {
+                            Err(ClientError::Server(
+                                quickfs_protocol::ErrorCode::Timeout,
+                                "resilient operation deadline exceeded".into(),
+                            ))
+                        }
+                    }
+                }
+            })
+            .await
     }
 
     async fn safe_call<T, F, Fut>(&self, operation: F) -> Result<T>
@@ -253,19 +379,22 @@ impl ResilientFilesystem {
         F: Fn(Arc<dyn RemoteFilesystem>) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let first = self.healthy_connection().await?;
-        match operation(first.filesystem.clone()).await {
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(first.generation);
-                let replacement = self.reconnect_after(first.generation).await?;
-                let result = operation(replacement.filesystem).await;
-                if matches!(result, Err(ClientError::Transport(_))) {
-                    self.mark_failed(replacement.generation);
+        self.operation(false, async {
+            let first = self.healthy_connection().await?;
+            match operation(first.filesystem.clone()).await {
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(first.generation);
+                    let replacement = self.reconnect_after(first.generation).await?;
+                    let result = operation(replacement.filesystem).await;
+                    if matches!(result, Err(ClientError::Transport(_))) {
+                        self.mark_failed(replacement.generation);
+                    }
+                    result
                 }
-                result
+                result => result,
             }
-            result => result,
-        }
+        })
+        .await
     }
 
     async fn mutation_call<T, F, Fut>(&self, operation: F) -> Result<T>
@@ -273,14 +402,17 @@ impl ResilientFilesystem {
         F: FnOnce(Arc<dyn RemoteFilesystem>) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let slot = self.healthy_connection().await?;
-        match operation(slot.filesystem).await {
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                Err(ClientError::AmbiguousMutation)
+        self.operation(true, async {
+            let slot = self.healthy_connection().await?;
+            match operation(slot.filesystem).await {
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    Err(ClientError::AmbiguousMutation)
+                }
+                result => result,
             }
-            result => result,
-        }
+        })
+        .await
     }
 
     async fn open_remote(
@@ -288,25 +420,28 @@ impl ResilientFilesystem {
         node: NodeId,
         options: FileOpenOptions,
     ) -> Result<(ConnectionSlot, OpenedFile)> {
-        let slot = self.healthy_connection().await?;
-        let result = slot.filesystem.open_file_with_options(node, options).await;
-        match result {
-            Ok(opened) => Ok((slot, opened)),
-            Err(ClientError::Transport(_)) if !options.truncate => {
-                self.mark_failed(slot.generation);
-                let replacement = self.reconnect_after(slot.generation).await?;
-                let opened = replacement
-                    .filesystem
-                    .open_file_with_options(node, options)
-                    .await?;
-                Ok((replacement, opened))
+        self.operation(options.truncate, async {
+            let slot = self.healthy_connection().await?;
+            let result = slot.filesystem.open_file_with_options(node, options).await;
+            match result {
+                Ok(opened) => Ok((slot, opened)),
+                Err(ClientError::Transport(_)) if !options.truncate => {
+                    self.mark_failed(slot.generation);
+                    let replacement = self.reconnect_after(slot.generation).await?;
+                    let opened = replacement
+                        .filesystem
+                        .open_file_with_options(node, options)
+                        .await?;
+                    Ok((replacement, opened))
+                }
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    Err(ClientError::AmbiguousMutation)
+                }
+                Err(error) => Err(error),
             }
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                Err(ClientError::AmbiguousMutation)
-            }
-            Err(error) => Err(error),
-        }
+        })
+        .await
     }
 
     async fn remember_open(
@@ -501,26 +636,29 @@ impl RemoteFilesystem for ResilientFilesystem {
         mode: u32,
         options: FileOpenOptions,
     ) -> Result<CreatedFile> {
-        let slot = self.healthy_connection().await?;
-        let created = match slot
-            .filesystem
-            .create_file(parent, name, mode, options)
-            .await
-        {
-            Ok(created) => created,
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                return Err(ClientError::AmbiguousMutation);
-            }
-            Err(error) => return Err(error),
-        };
-        let opened = self
-            .remember_open(created.metadata.node, options, slot, created.opened)
-            .await;
-        Ok(CreatedFile {
-            metadata: created.metadata,
-            opened,
+        self.operation(true, async {
+            let slot = self.healthy_connection().await?;
+            let created = match slot
+                .filesystem
+                .create_file(parent, name, mode, options)
+                .await
+            {
+                Ok(created) => created,
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    return Err(ClientError::AmbiguousMutation);
+                }
+                Err(error) => return Err(error),
+            };
+            let opened = self
+                .remember_open(created.metadata.node, options, slot, created.opened)
+                .await;
+            Ok(CreatedFile {
+                metadata: created.metadata,
+                opened,
+            })
         })
+        .await
     }
 
     async fn create_directory(&self, parent: NodeId, name: Name, mode: u32) -> Result<Metadata> {
@@ -607,30 +745,33 @@ impl RemoteFilesystem for ResilientFilesystem {
         handle: Option<FileHandle>,
         changes: AttributeChanges,
     ) -> Result<Metadata> {
-        let mapped = if let Some(logical) = handle {
-            Some(self.remote_handle(logical).await?.1)
-        } else {
-            None
-        };
-        let _mutation = match &mapped {
-            Some(state) => Some(state.mutation.lock().await),
-            None => None,
-        };
-        let remote_handle = mapped.as_ref().map(|state| state.remote);
-        let metadata = self
-            .mutation_call(move |filesystem| async move {
-                filesystem
-                    .set_attributes(node, remote_handle, changes)
-                    .await
-            })
-            .await?;
-        if let Some(logical) = handle
-            && let Some(state) = self.handles.write().await.get_mut(&logical)
-        {
-            state.revision = metadata.revision;
-            state.size = metadata.size;
-        }
-        Ok(metadata)
+        self.operation(true, async {
+            let mapped = if let Some(logical) = handle {
+                Some(self.remote_handle(logical).await?.1)
+            } else {
+                None
+            };
+            let _mutation = match &mapped {
+                Some(state) => Some(state.mutation.lock().await),
+                None => None,
+            };
+            let remote_handle = mapped.as_ref().map(|state| state.remote);
+            let metadata = self
+                .mutation_call(move |filesystem| async move {
+                    filesystem
+                        .set_attributes(node, remote_handle, changes)
+                        .await
+                })
+                .await?;
+            if let Some(logical) = handle
+                && let Some(state) = self.handles.write().await.get_mut(&logical)
+            {
+                state.revision = metadata.revision;
+                state.size = metadata.size;
+            }
+            Ok(metadata)
+        })
+        .await
     }
 
     async fn read_range(&self, handle: FileHandle, offset: u64, length: u64) -> Result<Vec<u8>> {
@@ -646,39 +787,42 @@ impl RemoteFilesystem for ResilientFilesystem {
         offset: u64,
         length: u64,
     ) -> Result<RangeRead> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        match slot
-            .filesystem
-            .read_range_versioned(state.remote, offset, length)
-            .await
-        {
-            // A read observing a revision the handle has not seen yet is not
-            // an error: another actor updated the file while it was open
-            // (macOS does this routinely — Finder stamps a fresh copy's
-            // timestamps, bumping the revision). Adopt the newer revision so
-            // the handle keeps serving reads; the caller sees which revision
-            // the bytes belong to via `RangeRead::revision`.
-            Ok(read) => {
-                if read.revision != state.revision {
-                    self.adopt_revision(handle, read.revision).await;
+        self.operation(false, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            match slot
+                .filesystem
+                .read_range_versioned(state.remote, offset, length)
+                .await
+            {
+                // A read observing a revision the handle has not seen yet is not
+                // an error: another actor updated the file while it was open
+                // (macOS does this routinely — Finder stamps a fresh copy's
+                // timestamps, bumping the revision). Adopt the newer revision so
+                // the handle keeps serving reads; the caller sees which revision
+                // the bytes belong to via `RangeRead::revision`.
+                Ok(read) => {
+                    if read.revision != state.revision {
+                        self.adopt_revision(handle, read.revision).await;
+                    }
+                    Ok(read)
                 }
-                Ok(read)
-            }
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                let (_, reopened) = self.remote_handle(handle).await?;
-                let replacement = self.healthy_connection().await?;
-                let read = replacement
-                    .filesystem
-                    .read_range_versioned(reopened.remote, offset, length)
-                    .await?;
-                if read.revision != reopened.revision {
-                    self.adopt_revision(handle, read.revision).await;
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    let (_, reopened) = self.remote_handle(handle).await?;
+                    let replacement = self.healthy_connection().await?;
+                    let read = replacement
+                        .filesystem
+                        .read_range_versioned(reopened.remote, offset, length)
+                        .await?;
+                    if read.revision != reopened.revision {
+                        self.adopt_revision(handle, read.revision).await;
+                    }
+                    Ok(read)
                 }
-                Ok(read)
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
+        })
+        .await
     }
 
     async fn write_range(
@@ -687,48 +831,57 @@ impl RemoteFilesystem for ResilientFilesystem {
         offset: u64,
         data: &[u8],
     ) -> Result<WriteResult> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        let _mutation = state.mutation.lock().await;
-        match slot
-            .filesystem
-            .write_range(state.remote, offset, data)
-            .await
-        {
-            Ok(result) => {
-                self.update_written_handle(handle, state.remote, slot.generation, result)
-                    .await;
-                Ok(result)
+        self.operation(true, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            let _mutation = state.mutation.lock().await;
+            match slot
+                .filesystem
+                .write_range(state.remote, offset, data)
+                .await
+            {
+                Ok(result) => {
+                    self.update_written_handle(handle, state.remote, slot.generation, result)
+                        .await;
+                    Ok(result)
+                }
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    Err(ClientError::AmbiguousMutation)
+                }
+                Err(error) => Err(error),
             }
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                Err(ClientError::AmbiguousMutation)
-            }
-            Err(error) => Err(error),
-        }
+        })
+        .await
     }
 
     async fn flush_file(&self, handle: FileHandle, lock_owner: Option<u64>) -> Result<()> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        let _mutation = state.mutation.lock().await;
-        match slot.filesystem.flush_file(state.remote, lock_owner).await {
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                Err(ClientError::AmbiguousMutation)
+        self.operation(true, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            let _mutation = state.mutation.lock().await;
+            match slot.filesystem.flush_file(state.remote, lock_owner).await {
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    Err(ClientError::AmbiguousMutation)
+                }
+                result => result,
             }
-            result => result,
-        }
+        })
+        .await
     }
 
     async fn sync_file(&self, handle: FileHandle, data_only: bool) -> Result<()> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        let _mutation = state.mutation.lock().await;
-        match slot.filesystem.sync_file(state.remote, data_only).await {
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                Err(ClientError::AmbiguousMutation)
+        self.operation(true, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            let _mutation = state.mutation.lock().await;
+            match slot.filesystem.sync_file(state.remote, data_only).await {
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    Err(ClientError::AmbiguousMutation)
+                }
+                result => result,
             }
-            result => result,
-        }
+        })
+        .await
     }
 
     async fn sync_directory(&self, node: NodeId) -> Result<()> {
@@ -742,24 +895,27 @@ impl RemoteFilesystem for ResilientFilesystem {
         offset: u64,
         length: u64,
     ) -> Result<WriteResult> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        let _mutation = state.mutation.lock().await;
-        match slot
-            .filesystem
-            .allocate_file(state.remote, offset, length)
-            .await
-        {
-            Ok(result) => {
-                self.update_written_handle(handle, state.remote, slot.generation, result)
-                    .await;
-                Ok(result)
+        self.operation(true, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            let _mutation = state.mutation.lock().await;
+            match slot
+                .filesystem
+                .allocate_file(state.remote, offset, length)
+                .await
+            {
+                Ok(result) => {
+                    self.update_written_handle(handle, state.remote, slot.generation, result)
+                        .await;
+                    Ok(result)
+                }
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    Err(ClientError::AmbiguousMutation)
+                }
+                Err(error) => Err(error),
             }
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                Err(ClientError::AmbiguousMutation)
-            }
-            Err(error) => Err(error),
-        }
+        })
+        .await
     }
 
     async fn get_xattr(
@@ -813,75 +969,84 @@ impl RemoteFilesystem for ResilientFilesystem {
         output_offset: u64,
         length: u64,
     ) -> Result<WriteResult> {
-        let (input_slot, input_state) = self.remote_handle(input).await?;
-        let (output_slot, output_state) = self.remote_handle(output).await?;
-        if input_slot.generation != output_slot.generation {
-            return Err(ClientError::StaleRevision);
-        }
-        let _mutation = output_state.mutation.lock().await;
-        match input_slot
-            .filesystem
-            .copy_file_range(
-                input_state.remote,
-                input_offset,
-                output_state.remote,
-                output_offset,
-                length,
-            )
-            .await
-        {
-            Ok(result) => {
-                self.update_written_handle(
-                    output,
+        self.operation(true, async {
+            let (input_slot, input_state) = self.remote_handle(input).await?;
+            let (output_slot, output_state) = self.remote_handle(output).await?;
+            if input_slot.generation != output_slot.generation {
+                return Err(ClientError::StaleRevision);
+            }
+            let _mutation = output_state.mutation.lock().await;
+            match input_slot
+                .filesystem
+                .copy_file_range(
+                    input_state.remote,
+                    input_offset,
                     output_state.remote,
-                    output_slot.generation,
-                    result,
+                    output_offset,
+                    length,
                 )
-                .await;
-                Ok(result)
+                .await
+            {
+                Ok(result) => {
+                    self.update_written_handle(
+                        output,
+                        output_state.remote,
+                        output_slot.generation,
+                        result,
+                    )
+                    .await;
+                    Ok(result)
+                }
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(output_slot.generation);
+                    Err(ClientError::AmbiguousMutation)
+                }
+                Err(error) => Err(error),
             }
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(output_slot.generation);
-                Err(ClientError::AmbiguousMutation)
-            }
-            Err(error) => Err(error),
-        }
+        })
+        .await
     }
 
     async fn seek_file(&self, handle: FileHandle, offset: u64, whence: SeekWhence) -> Result<u64> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        match slot
-            .filesystem
-            .seek_file(state.remote, offset, whence)
-            .await
-        {
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                let (_, reopened) = self.remote_handle(handle).await?;
-                self.healthy_connection()
-                    .await?
-                    .filesystem
-                    .seek_file(reopened.remote, offset, whence)
-                    .await
+        self.operation(false, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            match slot
+                .filesystem
+                .seek_file(state.remote, offset, whence)
+                .await
+            {
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    let (_, reopened) = self.remote_handle(handle).await?;
+                    self.healthy_connection()
+                        .await?
+                        .filesystem
+                        .seek_file(reopened.remote, offset, whence)
+                        .await
+                }
+                result => result,
             }
-            result => result,
-        }
+        })
+        .await
     }
 
     async fn safe_ioctl(&self, handle: FileHandle, operation: SafeIoctl) -> Result<u64> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        match slot.filesystem.safe_ioctl(state.remote, operation).await {
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                let (_, reopened) = self.remote_handle(handle).await?;
-                self.healthy_connection()
-                    .await?
-                    .filesystem
-                    .safe_ioctl(reopened.remote, operation)
-                    .await
+        self.operation(false, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            match slot.filesystem.safe_ioctl(state.remote, operation).await {
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    let (_, reopened) = self.remote_handle(handle).await?;
+                    self.healthy_connection()
+                        .await?
+                        .filesystem
+                        .safe_ioctl(reopened.remote, operation)
+                        .await
+                }
+                result => result,
             }
-            result => result,
-        }
+        })
+        .await
     }
 
     async fn map_block(&self, node: NodeId, block_size: u32, block: u64) -> Result<u64> {
@@ -921,68 +1086,77 @@ impl RemoteFilesystem for ResilientFilesystem {
     }
 
     async fn get_lock(&self, handle: FileHandle, lock: FileLock) -> Result<Option<FileLock>> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        match slot.filesystem.get_lock(state.remote, lock).await {
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                let (_, reopened) = self.remote_handle(handle).await?;
-                self.healthy_connection()
-                    .await?
-                    .filesystem
-                    .get_lock(reopened.remote, lock)
-                    .await
+        self.operation(false, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            match slot.filesystem.get_lock(state.remote, lock).await {
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    let (_, reopened) = self.remote_handle(handle).await?;
+                    self.healthy_connection()
+                        .await?
+                        .filesystem
+                        .get_lock(reopened.remote, lock)
+                        .await
+                }
+                result => result,
             }
-            result => result,
-        }
+        })
+        .await
     }
 
     async fn set_lock(&self, handle: FileHandle, lock: FileLock, wait: bool) -> Result<()> {
-        let (slot, state) = self.remote_handle(handle).await?;
-        match slot.filesystem.set_lock(state.remote, lock, wait).await {
-            Ok(()) => {
-                let mut handles = self.handles.write().await;
-                if let Some(current) = handles.get_mut(&handle) {
-                    current.lock_history.push(lock);
-                    if lock.kind == LockKind::Unlock && current.lock_history.len() > 4_096 {
-                        current.lock_history.clear();
+        self.operation(true, async {
+            let (slot, state) = self.remote_handle(handle).await?;
+            match slot.filesystem.set_lock(state.remote, lock, wait).await {
+                Ok(()) => {
+                    let mut handles = self.handles.write().await;
+                    if let Some(current) = handles.get_mut(&handle) {
+                        current.lock_history.push(lock);
+                        if lock.kind == LockKind::Unlock && current.lock_history.len() > 4_096 {
+                            current.lock_history.clear();
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    Err(ClientError::AmbiguousMutation)
+                }
+                Err(error) => Err(error),
             }
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                Err(ClientError::AmbiguousMutation)
-            }
-            Err(error) => Err(error),
-        }
+        })
+        .await
     }
 
     async fn close_file(&self, handle: FileHandle) -> Result<()> {
-        let mutation = self
-            .handles
-            .read()
-            .await
-            .get(&handle)
-            .map(|state| state.mutation.clone())
-            .ok_or_else(invalid_handle)?;
-        let _mutation = mutation.lock().await;
-        let state = self
-            .handles
-            .write()
-            .await
-            .remove(&handle)
-            .ok_or_else(invalid_handle)?;
-        let slot = self.connection.read().await.clone();
-        if state.generation != slot.generation {
-            return Ok(());
-        }
-        match slot.filesystem.close_file(state.remote).await {
-            Err(ClientError::Transport(_)) => {
-                self.mark_failed(slot.generation);
-                Ok(())
+        self.operation(false, async {
+            let mutation = self
+                .handles
+                .read()
+                .await
+                .get(&handle)
+                .map(|state| state.mutation.clone())
+                .ok_or_else(invalid_handle)?;
+            let _mutation = mutation.lock().await;
+            let state = self
+                .handles
+                .write()
+                .await
+                .remove(&handle)
+                .ok_or_else(invalid_handle)?;
+            let slot = self.connection.read().await.clone();
+            if state.generation != slot.generation {
+                return Ok(());
             }
-            result => result,
-        }
+            match slot.filesystem.close_file(state.remote).await {
+                Err(ClientError::Transport(_)) => {
+                    self.mark_failed(slot.generation);
+                    Ok(())
+                }
+                result => result,
+            }
+        })
+        .await
     }
 }
 
@@ -1006,6 +1180,8 @@ mod tests {
         fail_ping: AtomicBool,
         fail_read: AtomicBool,
         fail_write: AtomicBool,
+        ping_delay_ms: AtomicU64,
+        write_delay_ms: AtomicU64,
         opens: AtomicUsize,
         locks: Mutex<Vec<FileLock>>,
     }
@@ -1019,6 +1195,8 @@ mod tests {
                 fail_ping: AtomicBool::new(false),
                 fail_read: AtomicBool::new(false),
                 fail_write: AtomicBool::new(false),
+                ping_delay_ms: AtomicU64::new(0),
+                write_delay_ms: AtomicU64::new(0),
                 opens: AtomicUsize::new(0),
                 locks: Mutex::new(Vec::new()),
             }
@@ -1032,6 +1210,10 @@ mod tests {
     #[async_trait]
     impl RemoteFilesystem for ScriptedFilesystem {
         async fn ping(&self, nonce: u64) -> Result<u64> {
+            tokio::time::sleep(Duration::from_millis(
+                self.ping_delay_ms.load(Ordering::SeqCst),
+            ))
+            .await;
             if self.fail_ping.swap(false, Ordering::SeqCst) {
                 Err(Self::transport_failure())
             } else {
@@ -1156,6 +1338,10 @@ mod tests {
             _offset: u64,
             data: &[u8],
         ) -> Result<WriteResult> {
+            tokio::time::sleep(Duration::from_millis(
+                self.write_delay_ms.load(Ordering::SeqCst),
+            ))
+            .await;
             if self.fail_write.swap(false, Ordering::SeqCst) {
                 return Err(Self::transport_failure());
             }
@@ -1179,12 +1365,16 @@ mod tests {
     struct QueueConnector {
         filesystems: Mutex<VecDeque<Arc<dyn RemoteFilesystem>>>,
         calls: AtomicUsize,
+        delay: Duration,
+        started: Notify,
     }
 
     #[async_trait]
     impl RemoteFilesystemConnector for QueueConnector {
         async fn connect(&self) -> Result<Arc<dyn RemoteFilesystem>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            tokio::time::sleep(self.delay).await;
             self.filesystems
                 .lock()
                 .await
@@ -1197,15 +1387,165 @@ mod tests {
         Arc::new(QueueConnector {
             filesystems: Mutex::new(VecDeque::from([filesystem])),
             calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            started: Notify::new(),
         })
     }
 
-    fn test_policy() -> ReconnectPolicy {
-        ReconnectPolicy {
-            attempts: 1,
-            initial_backoff: Duration::ZERO,
-            maximum_backoff: Duration::ZERO,
+    fn test_options() -> ResilientFilesystemOptions {
+        ResilientFilesystemOptions {
+            reconnect: ReconnectPolicy {
+                attempts: 1,
+                initial_backoff: Duration::ZERO,
+                maximum_backoff: Duration::ZERO,
+            },
+            operation_deadline: Duration::from_secs(1),
         }
+    }
+
+    fn deadline_options(deadline: Duration) -> ResilientFilesystemOptions {
+        ResilientFilesystemOptions {
+            operation_deadline: deadline,
+            ..test_options()
+        }
+    }
+
+    fn is_operation_timeout(result: &Result<u64>) -> bool {
+        matches!(
+            result,
+            Err(ClientError::Server(ErrorCode::Timeout, message))
+                if message == "resilient operation deadline exceeded"
+        )
+    }
+
+    #[tokio::test]
+    async fn normal_operation_completes_before_deadline() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        first.ping_delay_ms.store(5, Ordering::SeqCst);
+        let filesystem = ResilientFilesystem::new(
+            first.clone(),
+            connector(first),
+            deadline_options(Duration::from_millis(80)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(filesystem.ping(17).await.unwrap(), 17);
+    }
+
+    #[tokio::test]
+    async fn blocked_operation_returns_at_deadline() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        first.ping_delay_ms.store(500, Ordering::SeqCst);
+        let filesystem = ResilientFilesystem::new(
+            first.clone(),
+            connector(first),
+            deadline_options(Duration::from_millis(35)),
+        )
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        let result = filesystem.ping(1).await;
+        let elapsed = started.elapsed();
+        assert!(is_operation_timeout(&result));
+        assert!(elapsed >= Duration::from_millis(25), "elapsed: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(150), "elapsed: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_reset_operation_deadline() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        first.fail_ping.store(true, Ordering::SeqCst);
+        first.ping_delay_ms.store(30, Ordering::SeqCst);
+        let replacement = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        replacement.ping_delay_ms.store(30, Ordering::SeqCst);
+        let filesystem = ResilientFilesystem::new(
+            first,
+            connector(replacement),
+            deadline_options(Duration::from_millis(45)),
+        )
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        let result = filesystem.ping(3).await;
+        let elapsed = started.elapsed();
+        assert!(is_operation_timeout(&result));
+        assert!(elapsed < Duration::from_millis(120), "elapsed: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn timed_out_waiter_does_not_cancel_shared_reconnect() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        first.fail_ping.store(true, Ordering::SeqCst);
+        first.ping_delay_ms.store(20, Ordering::SeqCst);
+        let replacement = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        let connector = Arc::new(QueueConnector {
+            filesystems: Mutex::new(VecDeque::from([replacement as Arc<dyn RemoteFilesystem>])),
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_millis(35),
+            started: Notify::new(),
+        });
+        let filesystem = Arc::new(
+            ResilientFilesystem::new(
+                first,
+                connector.clone(),
+                deadline_options(Duration::from_millis(45)),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let first_waiter = {
+            let filesystem = filesystem.clone();
+            tokio::spawn(async move { filesystem.ping(1).await })
+        };
+        connector.started.notified().await;
+        let second_result = filesystem.ping(2).await;
+        let first_result = first_waiter.await.unwrap();
+
+        assert!(is_operation_timeout(&first_result));
+        assert_eq!(second_result.unwrap(), 2);
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn timed_out_mutation_is_ambiguous_and_not_retried() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        first.write_delay_ms.store(500, Ordering::SeqCst);
+        let replacement = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        let connector = connector(replacement);
+        let filesystem = ResilientFilesystem::new(
+            first,
+            connector.clone(),
+            deadline_options(Duration::from_millis(35)),
+        )
+        .await
+        .unwrap();
+        let handle = filesystem
+            .open_file_with_options(
+                FILE_NODE,
+                FileOpenOptions {
+                    access: quickfs_protocol::FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .await
+            .unwrap()
+            .handle;
+
+        assert!(matches!(
+            filesystem.write_range(handle, 0, b"x").await,
+            Err(ClientError::AmbiguousMutation)
+        ));
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1215,7 +1555,7 @@ mod tests {
         first.fail_ping.store(true, Ordering::SeqCst);
         let second = Arc::new(ScriptedFilesystem::new(epoch, 1));
         let connector = connector(second);
-        let filesystem = ResilientFilesystem::new(first, connector.clone(), test_policy())
+        let filesystem = ResilientFilesystem::new(first, connector.clone(), test_options())
             .await
             .unwrap();
 
@@ -1230,14 +1570,19 @@ mod tests {
         let connector = Arc::new(QueueConnector {
             filesystems: Mutex::new(VecDeque::new()),
             calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            started: Notify::new(),
         });
         let filesystem = ResilientFilesystem::new(
             first,
             connector.clone(),
-            ReconnectPolicy {
-                attempts: 1,
-                initial_backoff: Duration::ZERO,
-                maximum_backoff: Duration::from_secs(1),
+            ResilientFilesystemOptions {
+                reconnect: ReconnectPolicy {
+                    attempts: 1,
+                    initial_backoff: Duration::ZERO,
+                    maximum_backoff: Duration::from_secs(1),
+                },
+                operation_deadline: Duration::from_secs(1),
             },
         )
         .await
@@ -1260,7 +1605,7 @@ mod tests {
         first.fail_read.store(true, Ordering::SeqCst);
         let second = Arc::new(ScriptedFilesystem::new(epoch, 3));
         let connector = connector(second.clone());
-        let filesystem = ResilientFilesystem::new(first, connector, test_policy())
+        let filesystem = ResilientFilesystem::new(first, connector, test_options())
             .await
             .unwrap();
         let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
@@ -1280,7 +1625,7 @@ mod tests {
         let first = Arc::new(ScriptedFilesystem::new(epoch, 3));
         first.fail_read.store(true, Ordering::SeqCst);
         let second = Arc::new(ScriptedFilesystem::new(epoch, 4));
-        let filesystem = ResilientFilesystem::new(first, connector(second), test_policy())
+        let filesystem = ResilientFilesystem::new(first, connector(second), test_options())
             .await
             .unwrap();
         let handle = filesystem.open_file(FILE_NODE).await.unwrap().0;
@@ -1299,7 +1644,7 @@ mod tests {
         let first = Arc::new(ScriptedFilesystem::new(epoch, 3));
         first.fail_read.store(true, Ordering::SeqCst);
         let second = Arc::new(ScriptedFilesystem::new(epoch, 4));
-        let filesystem = ResilientFilesystem::new(first, connector(second), test_policy())
+        let filesystem = ResilientFilesystem::new(first, connector(second), test_options())
             .await
             .unwrap();
         let handle = filesystem
@@ -1328,7 +1673,7 @@ mod tests {
         first.fail_write.store(true, Ordering::SeqCst);
         let replacement = Arc::new(ScriptedFilesystem::new(epoch, 8));
         let connector = connector(replacement);
-        let filesystem = ResilientFilesystem::new(first, connector.clone(), test_policy())
+        let filesystem = ResilientFilesystem::new(first, connector.clone(), test_options())
             .await
             .unwrap();
         let options = FileOpenOptions {
@@ -1354,10 +1699,13 @@ mod tests {
         let epoch = Uuid::new_v4();
         let first = Arc::new(ScriptedFilesystem::new(epoch, 8));
         let replacement = Arc::new(ScriptedFilesystem::new(epoch, 8));
-        let filesystem =
-            ResilientFilesystem::new(first.clone(), connector(replacement.clone()), test_policy())
-                .await
-                .unwrap();
+        let filesystem = ResilientFilesystem::new(
+            first.clone(),
+            connector(replacement.clone()),
+            test_options(),
+        )
+        .await
+        .unwrap();
         let handle = filesystem
             .open_file_with_options(
                 FILE_NODE,

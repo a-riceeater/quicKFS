@@ -235,7 +235,7 @@ target/debug/quickfs-mount "$HOME/Volumes/quickfs" \
   --username alice
 ```
 
-The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, and keeps one shared Tokio runtime around an authenticated reconnecting `RemoteFilesystem`. Protocol v6 publishes each directory from one enriched request containing directory/parent metadata, all child metadata, complete xattr names, and bounded small xattr values; Finder's follow-up probes are served locally. Finder and media applications can use ordinary read/write namespace operations, xattrs/resource forks, hardlinks, locks, random byte ranges, sparse seek, volume rename, and backup time. Server-side copy, `readdirplus`, and `exchangedata` callbacks are capability-gated because current macFUSE/macOS combinations do not necessarily expose those optional messages; see [filesystem semantics](filesystem-semantics.md). Press Control+C in the mount terminal to unmount. Graceful macFUSE unmount gets three seconds before forced local detach starts; an independent watchdog terminates the mount process at eight seconds if a macOS unmount syscall wedges, so server availability is not part of unmount:
+The positional mountpoint must already be a directory. The process verifies the selected server trust policy before asking for the password, reconnects under that same policy, and keeps one shared Tokio runtime around an authenticated reconnecting `RemoteFilesystem`. Every operation through that resilient layer has one absolute budget set by `--callback-timeout-ms`; the budget includes its initial request, reconnect backoff and authentication, handle recovery, and any safe retry. It does not restart between phases. Protocol v6 publishes each directory from one enriched request containing directory/parent metadata, all child metadata, complete xattr names, and bounded small xattr values; Finder's follow-up probes are served locally. Finder and media applications can use ordinary read/write namespace operations, xattrs/resource forks, hardlinks, locks, random byte ranges, sparse seek, volume rename, and backup time. Server-side copy, `readdirplus`, and `exchangedata` callbacks are capability-gated because current macFUSE/macOS combinations do not necessarily expose those optional messages; see [filesystem semantics](filesystem-semantics.md). Press Control+C in the mount terminal to unmount. Graceful macFUSE unmount gets three seconds before forced local detach starts; an independent watchdog terminates the mount process at eight seconds if a macOS unmount syscall wedges, so server availability is not part of unmount:
 
 ```sh
 umount "$HOME/Volumes/quickfs"
@@ -251,13 +251,15 @@ umount "$HOME/Volumes/quickfs"
 | `--cache-max-bytes <BYTES>` | `QUICKFS_CACHE_MAX_BYTES` | `21474836480` | Hard payload budget for the persistent cache. |
 | `--cache-block-kib <KiB>` | — | `16384` | Sequential/copy read-ahead block size, clamped to the negotiated limit. Requests below 1 MiB use at most 1 MiB read-ahead. |
 | `--timeout-ms <MS>` | — | `60000` | Maximum idle wait for one connection/transport phase. |
-| `--callback-timeout-ms <MS>` | — | `120000` | Maximum time a macFUSE callback waits for its complete remote operation. |
+| `--callback-timeout-ms <MS>` | — | `120000` | One hard end-to-end budget for the resilient remote operation, including reconnect, reauthentication, handle recovery, and safe retry. The callback bridge adds only a fixed 100 ms internal margin to deliver the typed result. |
 | `--reconnect-attempts <COUNT>` | — | `3` | Bounded authenticated reconnect attempts. |
 | `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Use the operating-system public/managed roots. |
 | `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Use an explicit enterprise-CA bundle. |
 | `--volume-name <NAME>` | — | `quicKFS` | Volume label shown by macOS. |
 
 Without a CA option, the mount reads the same private exact-pin database created by `quickfs-client-cli pair` or `trust import`. `--trust-system-roots` and `--ca-cert` are mutually exclusive. The mount reports read/write only when both server and account gates allow it. Cached data remains readable after a disconnect, but write opens/mutations fail closed and the server must be online to start a mount.
+
+When the end-to-end budget expires, a read-only/idempotent operation returns a timeout (`ETIMEDOUT` at macFUSE). A mutation whose result may already have taken effect returns the existing ambiguous-mutation error (`EIO`) and is never replayed. The fixed 100 ms callback margin is not additional remote-work time; it prevents the callback guard from racing the resilient layer's typed error. Timing out one waiter does not cancel the shared bounded reconnect batch; that reconnect may still restore service for another operation with time left in its own budget.
 
 ## Logging and limitations
 

@@ -62,17 +62,18 @@ about HTTP.
 - **[P0] Root-cause the connection wedge.** Under sustained load a QUIC
   connection has been observed to wedge and compound reconnect/retry timeouts
   into a multi-minute outage for in-flight requests (seen once during mmap
-  validation). Speculative fetches now deadline at 120 s so the fetch-slot
-  pool recovers, but the **demand read path still waits out the full reconnect
-  ladder**. Suspects to isolate: client keep-alive (`CLIENT_KEEP_ALIVE_INTERVAL
+  validation). Speculative fetches and demand operations now have a 120 s
+  end-to-end default ceiling, limiting impact while the underlying wedge is
+  investigated. Suspects to isolate: client keep-alive (`CLIENT_KEEP_ALIVE_INTERVAL
   = 10 s`) vs server idle policy (`FILESYSTEM_IDLE_TIMEOUT_MILLIS = 5 min`) vs
   Wi-Fi/NIC power-save vs quinn congestion state after loss.
   *Where:* `crates/transport-quic/src/lib.rs`, `crates/client-core/src/resilient.rs`.
-- **[P1] Demand path should not block on the full reconnect ladder.** Reconnect
-  is single-flight with `initial_backoff 100 ms → maximum_backoff 2 s`, but a
-  wedged (not-yet-dead) connection can keep demand reads hanging. Add a hard
-  per-request ceiling that abandons a wedged connection and forces a fresh one,
-  rather than waiting for QUIC's own idle timeout to notice.
+- **[DONE] [P1] Demand path should not block on the full reconnect ladder.** Every
+  `ResilientFilesystem` operation has one absolute deadline covering the initial
+  request, single-flight reconnect/backoff, reauthentication, handle recovery,
+  and safe retry. Expiry marks the observed connection generation unhealthy;
+  the timed-out waiter returns without cancelling a reconnect still useful to
+  other callers. The mount uses `--callback-timeout-ms` for this same budget.
   *Where:* `ResilientFilesystem` in `resilient.rs`.
 - **[P1] Single connection = single congestion controller.** Commit
   `be60fc63` is described as "parallel connections," but the client actually

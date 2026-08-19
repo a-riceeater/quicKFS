@@ -13,6 +13,7 @@ mod trust;
 pub use cached::{CachePolicy, CachedFilesystem, FilesystemCache};
 pub use resilient::{
     AuthenticatedConnectionConfig, ReconnectPolicy, RemoteFilesystemConnector, ResilientFilesystem,
+    ResilientFilesystemOptions,
 };
 pub use trust::{ServerTrust, TrustStoreError, load_trusted_server_pin};
 

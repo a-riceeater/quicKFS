@@ -2,6 +2,7 @@
 /certs/
 /.quickfs/
 /.quickfs-client/
+/shared/
 .DS_Store
 *.log
 /a.md
