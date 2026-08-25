@@ -4122,17 +4122,12 @@ fn copy_range_server(
             ) {
                 Ok(0) => break,
                 Ok(written) => copied = copied.saturating_add(written as u64),
-                Err(error)
-                    if matches!(
-                        error,
-                        rustix::io::Errno::XDEV
-                            | rustix::io::Errno::INVAL
-                            | rustix::io::Errno::NOSYS
-                            | rustix::io::Errno::OPNOTSUPP
-                    ) =>
-                {
-                    break;
-                }
+                Err(
+                    rustix::io::Errno::XDEV
+                    | rustix::io::Errno::INVAL
+                    | rustix::io::Errno::NOSYS
+                    | rustix::io::Errno::OPNOTSUPP,
+                ) => break,
                 Err(error) => return Err(std::io::Error::from(error).into()),
             }
         }
@@ -4141,7 +4136,7 @@ fn copy_range_server(
         }
         let remaining = amount - copied;
         copy_range_buffered(input, source, output, destination, remaining)?;
-        return Ok(amount);
+        Ok(amount)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]

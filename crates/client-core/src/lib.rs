@@ -1192,80 +1192,6 @@ pub async fn resolve_path(fs: &dyn RemoteFilesystem, path: &str) -> Result<NodeI
     Ok(node)
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_body_length_is_bounded_by_request_and_client_limit() {
-        // Honest replies: at most what was asked for.
-        assert_eq!(validated_raw_body_length(0, 0, 16).unwrap(), 0);
-        assert_eq!(validated_raw_body_length(7, 16, 16).unwrap(), 7);
-        // A reply declaring more bytes than requested is hostile or broken and
-        // must be rejected before allocation.
-        assert!(matches!(
-            validated_raw_body_length(17, 16, MAX_CLIENT_READ_SIZE),
-            Err(ClientError::UnexpectedResponse)
-        ));
-        // Even a huge requested value cannot exceed the client-wide limit.
-        assert!(matches!(
-            validated_raw_body_length(u64::MAX, u64::MAX, MAX_CLIENT_READ_SIZE),
-            Err(ClientError::UnexpectedResponse)
-        ));
-    }
-
-    fn view_entry(index: u128) -> DirectoryViewEntry {
-        let node = NodeId(Uuid::from_u128(index));
-        DirectoryViewEntry {
-            entry: DirectoryEntry {
-                node,
-                name: format!("entry-{index}").into(),
-                kind: NodeKind::File,
-                metadata: Metadata {
-                    node,
-                    kind: NodeKind::File,
-                    size: 0,
-                    mode: 0o644,
-                    allocated_blocks: 0,
-                    revision: 1,
-                    accessed_unix_ms: 0,
-                    modified_unix_ms: 0,
-                    created_unix_ms: None,
-                    backup_unix_ms: None,
-                    link_count: 1,
-                    device_major: 0,
-                    device_minor: 0,
-                },
-            },
-            xattrs: None,
-        }
-    }
-
-    #[test]
-    fn streamed_directory_chunks_must_make_progress_and_stay_bounded() {
-        let mut entries = Vec::new();
-        // Normal chunks append.
-        accept_directory_view_chunk(&mut entries, vec![view_entry(1), view_entry(2)]).unwrap();
-        assert_eq!(entries.len(), 2);
-        // An empty chunk is rejected: accepting them would let a hostile server
-        // stream frames forever without ever reaching the entry ceiling.
-        assert!(matches!(
-            accept_directory_view_chunk(&mut entries, Vec::new()),
-            Err(ClientError::UnexpectedResponse)
-        ));
-        // A chunk that would push the reassembled view past the protocol
-        // ceiling is rejected before it is buffered, and the ceiling itself is
-        // exactly `MAX_DIRECTORY_ENTRIES`.
-        assert!(directory_view_chunk_acceptable(
-            MAX_DIRECTORY_ENTRIES - 1,
-            1
-        ));
-        assert!(!directory_view_chunk_acceptable(MAX_DIRECTORY_ENTRIES, 1));
-        assert!(!directory_view_chunk_acceptable(usize::MAX, usize::MAX));
-    }
-}
-
 pub struct DelayedFilesystem<T> {
     inner: T,
     delay: std::time::Duration,
@@ -1527,5 +1453,79 @@ impl<T: RemoteFilesystem> RemoteFilesystem for DelayedFilesystem<T> {
     async fn close_file(&self, h: FileHandle) -> Result<()> {
         self.wait().await;
         self.inner.close_file(h).await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_body_length_is_bounded_by_request_and_client_limit() {
+        // Honest replies: at most what was asked for.
+        assert_eq!(validated_raw_body_length(0, 0, 16).unwrap(), 0);
+        assert_eq!(validated_raw_body_length(7, 16, 16).unwrap(), 7);
+        // A reply declaring more bytes than requested is hostile or broken and
+        // must be rejected before allocation.
+        assert!(matches!(
+            validated_raw_body_length(17, 16, MAX_CLIENT_READ_SIZE),
+            Err(ClientError::UnexpectedResponse)
+        ));
+        // Even a huge requested value cannot exceed the client-wide limit.
+        assert!(matches!(
+            validated_raw_body_length(u64::MAX, u64::MAX, MAX_CLIENT_READ_SIZE),
+            Err(ClientError::UnexpectedResponse)
+        ));
+    }
+
+    fn view_entry(index: u128) -> DirectoryViewEntry {
+        let node = NodeId(Uuid::from_u128(index));
+        DirectoryViewEntry {
+            entry: DirectoryEntry {
+                node,
+                name: format!("entry-{index}").into(),
+                kind: NodeKind::File,
+                metadata: Metadata {
+                    node,
+                    kind: NodeKind::File,
+                    size: 0,
+                    mode: 0o644,
+                    allocated_blocks: 0,
+                    revision: 1,
+                    accessed_unix_ms: 0,
+                    modified_unix_ms: 0,
+                    created_unix_ms: None,
+                    backup_unix_ms: None,
+                    link_count: 1,
+                    device_major: 0,
+                    device_minor: 0,
+                },
+            },
+            xattrs: None,
+        }
+    }
+
+    #[test]
+    fn streamed_directory_chunks_must_make_progress_and_stay_bounded() {
+        let mut entries = Vec::new();
+        // Normal chunks append.
+        accept_directory_view_chunk(&mut entries, vec![view_entry(1), view_entry(2)]).unwrap();
+        assert_eq!(entries.len(), 2);
+        // An empty chunk is rejected: accepting them would let a hostile server
+        // stream frames forever without ever reaching the entry ceiling.
+        assert!(matches!(
+            accept_directory_view_chunk(&mut entries, Vec::new()),
+            Err(ClientError::UnexpectedResponse)
+        ));
+        // A chunk that would push the reassembled view past the protocol
+        // ceiling is rejected before it is buffered, and the ceiling itself is
+        // exactly `MAX_DIRECTORY_ENTRIES`.
+        assert!(directory_view_chunk_acceptable(
+            MAX_DIRECTORY_ENTRIES - 1,
+            1
+        ));
+        assert!(!directory_view_chunk_acceptable(MAX_DIRECTORY_ENTRIES, 1));
+        assert!(!directory_view_chunk_acceptable(usize::MAX, usize::MAX));
     }
 }
