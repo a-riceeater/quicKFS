@@ -50,7 +50,9 @@ pub const MAX_FUSE_XATTR_SIZE: u64 = 64 * 1024 * 1024;
 // eliminate, and can make a second `ls` slower than the first.
 const DISCOVERED_METADATA_TTL: Duration = Duration::from_secs(30);
 const DISCOVERED_DIRECTORY_TTL: Duration = Duration::from_secs(30);
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
 const RELEASED_DIRECTORY_ENTRY_RETENTION: Duration = Duration::from_secs(5);
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
 const MOUNT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -186,6 +188,7 @@ impl PendingWrite {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
 struct DirectoryHandleRecord {
     inode: u64,
     listing: Arc<DirectoryListing>,
@@ -206,6 +209,7 @@ struct CachedDirectory {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
 struct CachedXattrs {
     revision: u64,
     names: Vec<Name>,
@@ -245,6 +249,7 @@ pub struct Adapter {
     runtime: Arc<Runtime>,
 }
 
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
 impl Adapter {
     /// Construct an adapter for tests or non-network implementations. Native
     /// mounts should use [`Self::with_runtime`] so authentication and callbacks
@@ -2569,6 +2574,7 @@ fn validate_io_range(offset: u64, length: u64) -> Result<(), AdapterError> {
     validate_range(offset, length)
 }
 
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
 fn validate_allocation_range(offset: u64, length: u64) -> Result<(), AdapterError> {
     if length == 0 {
         return Err(AdapterError::InvalidRange);
@@ -2583,6 +2589,7 @@ fn validate_range(offset: u64, length: u64) -> Result<(), AdapterError> {
         .ok_or(AdapterError::InvalidRange)
 }
 
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
 fn no_attribute_error() -> AdapterError {
     ClientError::Server(
         quickfs_protocol::ErrorCode::NoAttribute,
