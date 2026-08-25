@@ -246,8 +246,11 @@ immediately for in-flight sessions (covered by
   (documented), and live-session revocation is not implemented.
 - The non-Unix daemon build is a development stub: most filesystem operations
   fail closed with `NotSupported`.
-- `cargo audit` was not run in this environment (tool not installed); the
-  scheduled RustSec CI workflow covers it.
+- `cargo audit` reports no vulnerabilities. It does report 17 informational
+  warnings — the unmaintained GTK3/`unic-*`/`proc-macro-error` families and one
+  `glib` unsoundness advisory — all transitive dependencies of the Tauri v1 GUI
+  client, not of the daemon or the core client path. Retiring them means moving
+  the GUI off Tauri v1, which is out of scope for this pass.
 
 ## Protocol-breaking fixes deferred to a future major
 
