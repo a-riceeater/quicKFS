@@ -197,6 +197,10 @@ struct Serve {
     request_timeout_ms: u64,
     #[arg(long, default_value_t = 128)]
     max_concurrent_requests: usize,
+    /// Concurrent request tasks one connection may occupy. Keeps a single
+    /// slow or hostile client from holding every global request slot.
+    #[arg(long, default_value_t = 64)]
+    max_concurrent_requests_per_connection: usize,
     #[arg(long, default_value_t = 128 * 1024 * 1024)]
     max_in_flight_read_bytes: usize,
     /// Aggregate memory reserved for write request bodies across all clients.
@@ -499,6 +503,7 @@ where
                 let read_permits = read_permits.clone();
                 let write_permits = write_permits.clone();
                 let connection_write_budget = c.max_in_flight_write_bytes_per_connection;
+                let connection_request_budget = c.max_concurrent_requests_per_connection;
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     match incoming.await {
@@ -508,6 +513,8 @@ where
                             let session = Arc::new(export.session());
                             let connection_write_permits =
                                 Arc::new(Semaphore::new(connection_write_budget));
+                            let connection_request_permits =
+                                Arc::new(Semaphore::new(connection_request_budget));
                             let request_context = Arc::new(RequestContext {
                                 export: session.clone(),
                                 auth_root,
@@ -530,6 +537,23 @@ where
                                         break;
                                     }
                                 };
+                                // The per-connection slot is claimed before a
+                                // global slot so one saturated or hostile
+                                // connection cannot occupy every global request
+                                // permit and starve other clients.
+                                let connection_slot = match tokio::time::timeout(
+                                    request_timeout,
+                                    connection_request_permits.clone().acquire_owned(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(permit)) => permit,
+                                    Ok(Err(_)) => break,
+                                    Err(_) => {
+                                        tracing::warn!(%peer_ip, "connection request capacity wait timed out");
+                                        continue;
+                                    }
+                                };
                                 let permit = match tokio::time::timeout(
                                     request_timeout,
                                     permits.clone().acquire_owned(),
@@ -545,7 +569,7 @@ where
                                 };
                                 let request_context = request_context.clone();
                                 request_tasks.spawn(async move {
-                                    let _permit = permit;
+                                    let _permit = (connection_slot, permit);
                                     match tokio::time::timeout(
                                         request_timeout,
                                         handle(send, recv, request_context),
@@ -606,6 +630,9 @@ fn validate_configuration(c: &Serve) -> Result<()> {
     if c.max_concurrent_requests == 0 {
         bail!("maximum concurrent requests must be greater than zero");
     }
+    if c.max_concurrent_requests_per_connection == 0 {
+        bail!("maximum concurrent requests per connection must be greater than zero");
+    }
     if c.max_in_flight_read_bytes == 0 {
         bail!("maximum in-flight read bytes must be greater than zero");
     }
@@ -635,6 +662,7 @@ fn validate_configuration(c: &Serve) -> Result<()> {
         || c.max_total_known_nodes > Semaphore::MAX_PERMITS
         || c.max_directory_entry_tasks > Semaphore::MAX_PERMITS
         || c.max_concurrent_requests > Semaphore::MAX_PERMITS
+        || c.max_concurrent_requests_per_connection > Semaphore::MAX_PERMITS
         || c.max_concurrent_connections > Semaphore::MAX_PERMITS
         || c.max_concurrent_auth > Semaphore::MAX_PERMITS
         || c.max_in_flight_read_bytes > Semaphore::MAX_PERMITS
@@ -1826,6 +1854,7 @@ mod tests {
             max_directory_entry_tasks: 8,
             request_timeout_ms: timeout,
             max_concurrent_requests: 32,
+            max_concurrent_requests_per_connection: 32,
             max_in_flight_read_bytes: 16 * 1024 * 1024,
             max_in_flight_write_bytes: 16 * 1024 * 1024,
             max_in_flight_write_bytes_per_connection: 16 * 1024 * 1024,
@@ -2078,6 +2107,61 @@ mod tests {
         assert!(client.get_metadata_batch(&[]).await.is_empty());
 
         server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_connection_cannot_hold_every_global_request_slot() {
+        // Two global request slots, but one per connection: a client that
+        // stalls two request streams mid-frame may pin at most its single
+        // per-connection slot, so another connection's request always finds a
+        // free global slot instead of waiting behind the stalled peer.
+        let state = tempfile::tempdir().unwrap();
+        let export = tempfile::tempdir().unwrap();
+        initialize(state.path(), vec!["localhost".into()]).unwrap();
+        let active_identity = StatePaths::resolve(state.path().to_path_buf()).unwrap();
+        let certificates = load_certificates(&active_identity.certificate).unwrap();
+        let fingerprint = certificate_fingerprint(certificates[0].as_ref());
+        let mut config = test_configuration(state.path(), export.path(), 30_000);
+        config.max_concurrent_requests = 2;
+        config.max_concurrent_requests_per_connection = 1;
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let task = tokio::spawn(serve_until(
+            config,
+            async move {
+                let _ = stop_rx.await;
+            },
+            Some(ready_tx),
+        ));
+        let address = ready_rx.await.unwrap();
+
+        let stalled =
+            QuicClient::connect_pinned(address, "localhost", fingerprint, Duration::from_secs(5))
+                .await
+                .unwrap();
+        // Two streams that declare a frame and never deliver its body. Without
+        // the per-connection cap these would occupy both global slots for the
+        // whole request timeout.
+        let (mut first_send, _first_recv) = stalled.stream().await.unwrap();
+        first_send.write_all(&100u32.to_be_bytes()).await.unwrap();
+        let (mut second_send, _second_recv) = stalled.stream().await.unwrap();
+        second_send.write_all(&100u32.to_be_bytes()).await.unwrap();
+        // Let the server accept both stalled streams before the probe.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let healthy =
+            QuicClient::connect_pinned(address, "localhost", fingerprint, Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert!(matches!(
+            request(&healthy, Request::Ping { nonce: 3 }).await,
+            Response::Pong { nonce: 3 }
+        ));
+
+        healthy.close();
+        stalled.close();
+        let _ = stop_tx.send(());
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
