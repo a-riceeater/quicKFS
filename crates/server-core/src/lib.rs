@@ -3845,12 +3845,29 @@ fn to_metadata(node: NodeId, metadata: &std::fs::Metadata) -> Metadata {
             .ok()
             .and_then(system_time_millis)
             .unwrap_or(0),
-        created_unix_ms: metadata.created().ok().and_then(system_time_millis),
+        created_unix_ms: metadata_created_unix_ms(metadata),
         backup_unix_ms: None,
         link_count: metadata_link_count(metadata),
         device_major: metadata_device(metadata).0,
         device_minor: metadata_device(metadata).1,
     }
+}
+
+/// Creation time as served over the wire. The descriptor-relative stat path
+/// (`to_metadata_from_stat`) can only surface a birth time where the platform
+/// `stat` structure carries one (Apple targets), so the `std::fs::Metadata`
+/// path must report the same answer on every platform — otherwise the same
+/// node's metadata would flicker between `Some` and `None` depending on which
+/// request produced it (observed on Linux, where `std` reads statx' birthtime
+/// but `struct stat` has none).
+fn metadata_created_unix_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    {
+        let _ = metadata;
+        None
+    }
+    #[cfg(any(not(unix), target_vendor = "apple"))]
+    metadata.created().ok().and_then(system_time_millis)
 }
 
 #[cfg(unix)]
@@ -4657,10 +4674,9 @@ mod tests {
         assert_eq!(changed.allocated_blocks, on_disk.blocks());
         assert!(changed.accessed_unix_ms.abs_diff(accessed_unix_ms) <= 1_000);
         assert!(changed.modified_unix_ms.abs_diff(modified_unix_ms) <= 1_000);
-        assert_eq!(
-            changed.created_unix_ms,
-            on_disk.created().ok().and_then(system_time_millis)
-        );
+        // The served creation time follows one platform rule regardless of
+        // which request produced the metadata (see `metadata_created_unix_ms`).
+        assert_eq!(changed.created_unix_ms, metadata_created_unix_ms(&on_disk));
         assert_eq!(session.metadata(created.node).await.unwrap(), changed);
 
         session.sync(handle, false).await.unwrap();
@@ -5276,7 +5292,11 @@ mod tests {
             )
             .await
             .unwrap();
-        session
+        // ext4 stores every xattr of an inode within one filesystem block, so a
+        // value past the inline-projection threshold may be rejected with
+        // `NoSpace` there; the over-threshold exclusion is asserted only where
+        // the backing filesystem can hold the value (e.g. APFS, XFS, btrfs).
+        let large_value_stored = match session
             .set_xattr(
                 file.node,
                 &large_name,
@@ -5285,7 +5305,11 @@ mod tests {
                 0,
             )
             .await
-            .unwrap();
+        {
+            Ok(()) => true,
+            Err(ServerError::NoSpace) => false,
+            Err(error) => panic!("unexpected xattr write failure: {error}"),
+        };
 
         let view = session
             .directory_view(ROOT_NODE, DirectoryViewOptions::NATIVE)
@@ -5300,7 +5324,6 @@ mod tests {
             .unwrap();
         let xattrs = file.xattrs.as_ref().unwrap();
         assert!(xattrs.names.contains(&small_name));
-        assert!(xattrs.names.contains(&large_name));
         assert_eq!(
             xattrs
                 .inline_values
@@ -5310,12 +5333,15 @@ mod tests {
                 .value,
             b"0x20"
         );
-        assert!(
-            xattrs
-                .inline_values
-                .iter()
-                .all(|value| value.name != large_name)
-        );
+        if large_value_stored {
+            assert!(xattrs.names.contains(&large_name));
+            assert!(
+                xattrs
+                    .inline_values
+                    .iter()
+                    .all(|value| value.name != large_name)
+            );
+        }
 
         let nested = session
             .directory_view(folder.node, DirectoryViewOptions::NATIVE)
