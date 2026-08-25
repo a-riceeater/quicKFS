@@ -574,10 +574,7 @@ async fn capability_epoch(filesystem: &dyn RemoteFilesystem) -> Result<Option<Uu
 fn apply_lock_to_history(history: &mut Vec<FileLock>, lock: FileLock) {
     let mut next = Vec::with_capacity(history.len() + 2);
     for existing in history.drain(..) {
-        if existing.owner != lock.owner
-            || existing.start > lock.end
-            || lock.start > existing.end
-        {
+        if existing.owner != lock.owner || existing.start > lock.end || lock.start > existing.end {
             next.push(existing);
             continue;
         }
@@ -1823,7 +1820,11 @@ mod tests {
         // records linger and nothing outside the range is dropped with them.
         apply_lock_to_history(&mut history, history_lock(1, 0, 15, LockKind::Unlock));
         assert_eq!(history.len(), 2);
-        assert!(history.iter().all(|lock| lock.owner != 1 || lock.start == 20));
+        assert!(
+            history
+                .iter()
+                .all(|lock| lock.owner != 1 || lock.start == 20)
+        );
     }
 
     /// After an unlock, a reconnect must replay exactly the locks still held —
@@ -1859,10 +1860,14 @@ mod tests {
         filesystem.set_lock(handle, released, false).await.unwrap();
         filesystem.set_lock(handle, kept, false).await.unwrap();
         filesystem
-            .set_lock(handle, FileLock {
-                kind: LockKind::Unlock,
-                ..released
-            }, false)
+            .set_lock(
+                handle,
+                FileLock {
+                    kind: LockKind::Unlock,
+                    ..released
+                },
+                false,
+            )
             .await
             .unwrap();
 

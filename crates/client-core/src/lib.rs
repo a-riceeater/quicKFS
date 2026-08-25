@@ -868,7 +868,8 @@ impl RemoteFilesystem for NetworkFilesystem {
                 revision,
                 length: response_length,
             } => {
-                let size = validated_raw_body_length(response_length, length, MAX_CLIENT_READ_SIZE)?;
+                let size =
+                    validated_raw_body_length(response_length, length, MAX_CLIENT_READ_SIZE)?;
                 let mut recv = recv.ok_or(ClientError::UnexpectedResponse)?;
                 let mut data = vec![0; size];
                 self.transport.receive_exact(&mut recv, &mut data).await?;
@@ -989,7 +990,8 @@ impl RemoteFilesystem for NetworkFilesystem {
                 // by what was requested before allocating, exactly like the
                 // file-read path, so a hostile server cannot force an
                 // arbitrary-size allocation.
-                let size = validated_raw_body_length(response_length, length, MAX_CLIENT_READ_SIZE)?;
+                let size =
+                    validated_raw_body_length(response_length, length, MAX_CLIENT_READ_SIZE)?;
                 let mut data = vec![0_u8; size];
                 let mut recv = recv.ok_or(ClientError::UnexpectedResponse)?;
                 self.transport.receive_exact(&mut recv, &mut data).await?;

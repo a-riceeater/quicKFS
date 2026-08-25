@@ -4458,9 +4458,10 @@ mod tests {
         std::fs::write(export_root.join("b"), b"b").unwrap();
         let state = root.path().join("export-state.json");
 
-        let first = Export::new_persistent_with_writes(&export_root, &state, Limits::default(), true)
-            .await
-            .unwrap();
+        let first =
+            Export::new_persistent_with_writes(&export_root, &state, Limits::default(), true)
+                .await
+                .unwrap();
         let session = first.session();
         let nodes: Vec<NodeId> = session
             .list(ROOT_NODE)
@@ -4472,9 +4473,10 @@ mod tests {
         drop(session);
         drop(first);
 
-        let second = Export::new_persistent_with_writes(&export_root, &state, Limits::default(), true)
-            .await
-            .unwrap();
+        let second =
+            Export::new_persistent_with_writes(&export_root, &state, Limits::default(), true)
+                .await
+                .unwrap();
         let fresh = second.session();
         let results = fresh.metadata_batch(&nodes).await;
         assert_eq!(results.len(), nodes.len());
