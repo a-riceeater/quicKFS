@@ -41,6 +41,10 @@ use std::{
 };
 
 const MAX_LOCK_RECORDS: usize = 65_536;
+/// Advisory-lock records one connection may hold. Prevents a single
+/// authenticated session from filling the export-wide lock table and denying
+/// lock service to every other connection.
+const MAX_SESSION_LOCK_RECORDS: usize = 8_192;
 /// Export-wide bound on concurrent node-discovery walks. A discovery walk
 /// visits up to `max_total_known_nodes` directory entries, so unbounded
 /// concurrency would let requests naming unknown node IDs saturate the
@@ -3666,6 +3670,18 @@ fn replace_owner_range(
     if next.len() > MAX_LOCK_RECORDS {
         return Err(ServerError::TooManyLocks);
     }
+    // Bound one connection's share of the lock table separately, so a single
+    // session cannot fill the export-wide table and deny lock service to every
+    // other connection.
+    if insert
+        && next
+            .iter()
+            .filter(|record| record.session == session)
+            .count()
+            > MAX_SESSION_LOCK_RECORDS
+    {
+        return Err(ServerError::TooManyLocks);
+    }
     *locks = next;
     Ok(())
 }
@@ -4465,6 +4481,56 @@ mod tests {
         for (node, result) in nodes.iter().zip(&results) {
             assert_eq!(result.as_ref().unwrap().node, *node);
         }
+    }
+
+    #[test]
+    fn session_lock_records_are_bounded_below_the_global_table() {
+        // One session may not fill the export-wide lock table: its record
+        // count is capped separately, while another session can still insert.
+        let identity = FileIdentity {
+            device: 1,
+            inode: 1,
+        };
+        let greedy = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut locks: Vec<LockRecord> = (0..MAX_SESSION_LOCK_RECORDS)
+            .map(|index| LockRecord {
+                identity,
+                session: greedy,
+                lock: FileLock {
+                    owner: 1,
+                    start: (index as u64) * 2,
+                    end: (index as u64) * 2,
+                    kind: LockKind::Write,
+                    pid: 7,
+                },
+            })
+            .collect();
+        let beyond = FileLock {
+            owner: 1,
+            start: u64::MAX - 1,
+            end: u64::MAX - 1,
+            kind: LockKind::Write,
+            pid: 7,
+        };
+        assert!(matches!(
+            replace_owner_range(&mut locks, identity, greedy, beyond, true),
+            Err(ServerError::TooManyLocks)
+        ));
+        assert_eq!(locks.len(), MAX_SESSION_LOCK_RECORDS);
+        // A different session still has room under the global cap.
+        assert!(replace_owner_range(&mut locks, identity, other, beyond, true).is_ok());
+        assert_eq!(locks.len(), MAX_SESSION_LOCK_RECORDS + 1);
+        // Unlocking never trips the cap, so a saturated session can shrink.
+        let unlock = FileLock {
+            owner: 1,
+            start: 0,
+            end: 0,
+            kind: LockKind::Unlock,
+            pid: 7,
+        };
+        assert!(replace_owner_range(&mut locks, identity, greedy, unlock, false).is_ok());
+        assert_eq!(locks.len(), MAX_SESSION_LOCK_RECORDS);
     }
 
     #[tokio::test]
