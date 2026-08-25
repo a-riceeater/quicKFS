@@ -24,3 +24,6 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
