@@ -785,41 +785,52 @@ async fn handle(
             pairing_id,
             client_nonce,
             client_proof,
-        } => match load_pairing(&auth_root, pairing_id) {
-            Ok(secret)
-                if secret.verify_client_proof(
-                    pairing_id,
-                    &fingerprint,
-                    &client_nonce,
-                    client_proof.as_bytes(),
-                ) =>
-            {
-                match secret.server_proof(pairing_id, &fingerprint, &client_nonce) {
-                    Ok(proof) => match consume_pairing(&auth_root, pairing_id) {
-                        Ok(()) => Response::PairingProof {
-                            certificate_fingerprint: fingerprint,
-                            proof: proof.into(),
-                        },
-                        Err(error) => {
-                            tracing::warn!(%error, %peer_ip, "failed to consume pairing record");
-                            authentication_error("pairing session is unavailable")
+        } => {
+            // Pairing attempts share the per-source authentication limiter so
+            // an unauthenticated peer cannot probe pairing records (each probe
+            // costs server disk and HMAC work) faster than it could try
+            // passwords.
+            if !auth_limiter.lock().await.allow(peer_ip) {
+                tracing::warn!(%peer_ip, "pairing rate limit exceeded");
+                authentication_error("pairing rate limit exceeded; retry later")
+            } else {
+                match load_pairing(&auth_root, pairing_id) {
+                    Ok(secret)
+                        if secret.verify_client_proof(
+                            pairing_id,
+                            &fingerprint,
+                            &client_nonce,
+                            client_proof.as_bytes(),
+                        ) =>
+                    {
+                        match secret.server_proof(pairing_id, &fingerprint, &client_nonce) {
+                            Ok(proof) => match consume_pairing(&auth_root, pairing_id) {
+                                Ok(()) => Response::PairingProof {
+                                    certificate_fingerprint: fingerprint,
+                                    proof: proof.into(),
+                                },
+                                Err(error) => {
+                                    tracing::warn!(%error, %peer_ip, "failed to consume pairing record");
+                                    authentication_error("pairing session is unavailable")
+                                }
+                            },
+                            Err(error) => {
+                                tracing::error!(%error, "failed to create pairing proof");
+                                internal_error()
+                            }
                         }
-                    },
+                    }
+                    Ok(_) => authentication_error("pairing code was not accepted"),
                     Err(error) => {
-                        tracing::error!(%error, "failed to create pairing proof");
-                        internal_error()
+                        tracing::warn!(%error, %peer_ip, "pairing request rejected");
+                        Response::Error(ProtocolError {
+                            code: ErrorCode::Unauthenticated,
+                            message: "pairing session is unavailable".into(),
+                        })
                     }
                 }
             }
-            Ok(_) => authentication_error("pairing code was not accepted"),
-            Err(error) => {
-                tracing::warn!(%error, %peer_ip, "pairing request rejected");
-                Response::Error(ProtocolError {
-                    code: ErrorCode::Unauthenticated,
-                    message: "pairing session is unavailable".into(),
-                })
-            }
-        },
+        }
         Request::Authenticate {
             username,
             mut password,
@@ -2067,6 +2078,47 @@ mod tests {
         assert!(client.get_metadata_batch(&[]).await.is_empty());
 
         server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pairing_attempts_share_the_authentication_rate_limit() {
+        let state = tempfile::tempdir().unwrap();
+        let export = tempfile::tempdir().unwrap();
+        initialize(state.path(), vec!["localhost".into()]).unwrap();
+        let mut config = test_configuration(state.path(), export.path(), 5_000);
+        config.auth_attempts_per_minute = 1;
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let task = tokio::spawn(serve_until(
+            config,
+            async move {
+                let _ = stop_rx.await;
+            },
+            Some(ready_tx),
+        ));
+        let address = ready_rx.await.unwrap();
+
+        let pairing = create_pairing(state.path(), Duration::from_secs(60)).unwrap();
+        let client = PairingClient::connect(address, "localhost", Duration::from_secs(5))
+            .await
+            .unwrap();
+        // The first (wrong-code) attempt consumes the only slot in the window.
+        assert!(
+            verify_pairing(&client, pairing.id, "AAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .await
+                .is_err()
+        );
+        // The second attempt is refused by the shared limiter before any
+        // pairing record is touched, even though its code is correct.
+        match verify_pairing(&client, pairing.id, &pairing.code).await {
+            Err(ClientError::Server(ErrorCode::Unauthenticated, message)) => {
+                assert!(message.contains("rate limit"), "unexpected: {message}");
+            }
+            other => panic!("expected a rate-limit rejection: {other:?}"),
+        }
+        client.close();
+        let _ = stop_tx.send(());
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
