@@ -332,6 +332,37 @@ fn unsupported(operation: &str) -> ClientError {
         format!("server does not support {operation}"),
     )
 }
+
+/// Validate the raw-body byte count a response declares before allocating it.
+/// The peer controls this value, so a response may never declare more bytes
+/// than the request asked for or than the client-wide safety limit permits;
+/// otherwise a hostile or broken server could force an arbitrary allocation.
+fn validated_raw_body_length(declared: u64, requested: u64, maximum: u64) -> Result<usize> {
+    if declared > requested || declared > maximum {
+        return Err(ClientError::UnexpectedResponse);
+    }
+    usize::try_from(declared).map_err(|_| ClientError::UnexpectedResponse)
+}
+
+/// Append one streamed directory-view chunk to the reassembled entry list.
+/// An empty chunk is rejected: the server never emits one, and accepting them
+/// would let a hostile server stream chunks forever without ever tripping the
+/// `MAX_DIRECTORY_ENTRIES` ceiling. Requiring progress on every frame bounds
+/// the whole stream at `MAX_DIRECTORY_ENTRIES` frames.
+fn accept_directory_view_chunk(
+    entries: &mut Vec<DirectoryViewEntry>,
+    chunk: Vec<DirectoryViewEntry>,
+) -> Result<()> {
+    if !directory_view_chunk_acceptable(entries.len(), chunk.len()) {
+        return Err(ClientError::UnexpectedResponse);
+    }
+    entries.extend(chunk);
+    Ok(())
+}
+
+fn directory_view_chunk_acceptable(buffered: usize, chunk: usize) -> bool {
+    chunk != 0 && buffered.saturating_add(chunk) <= MAX_DIRECTORY_ENTRIES
+}
 pub struct NetworkFilesystem {
     transport: Arc<QuicClient>,
 }
@@ -446,10 +477,7 @@ impl NetworkFilesystem {
             }
             match frame.message {
                 Response::DirectoryViewChunk { entries: chunk } => {
-                    if entries.len().saturating_add(chunk.len()) > MAX_DIRECTORY_ENTRIES {
-                        return Err(ClientError::UnexpectedResponse);
-                    }
-                    entries.extend(chunk);
+                    accept_directory_view_chunk(&mut entries, chunk)?;
                 }
                 Response::DirectoryViewEnd => break,
                 response => return Err(response_error(response)),
@@ -840,13 +868,8 @@ impl RemoteFilesystem for NetworkFilesystem {
                 revision,
                 length: response_length,
             } => {
-                if response_length > length || response_length > MAX_CLIENT_READ_SIZE {
-                    return Err(ClientError::UnexpectedResponse);
-                }
+                let size = validated_raw_body_length(response_length, length, MAX_CLIENT_READ_SIZE)?;
                 let mut recv = recv.ok_or(ClientError::UnexpectedResponse)?;
-                let size: usize = response_length
-                    .try_into()
-                    .map_err(|_| ClientError::UnexpectedResponse)?;
                 let mut data = vec![0; size];
                 self.transport.receive_exact(&mut recv, &mut data).await?;
                 Ok(RangeRead { revision, data })
@@ -958,9 +981,15 @@ impl RemoteFilesystem for NetworkFilesystem {
             })
             .await?;
         match response {
-            Response::XattrData { length, total_size } => {
-                let size =
-                    usize::try_from(length).map_err(|_| ClientError::ReadTooLarge(length))?;
+            Response::XattrData {
+                length: response_length,
+                total_size,
+            } => {
+                // The response's declared byte count is peer-controlled: cap it
+                // by what was requested before allocating, exactly like the
+                // file-read path, so a hostile server cannot force an
+                // arbitrary-size allocation.
+                let size = validated_raw_body_length(response_length, length, MAX_CLIENT_READ_SIZE)?;
                 let mut data = vec![0_u8; size];
                 let mut recv = recv.ok_or(ClientError::UnexpectedResponse)?;
                 self.transport.receive_exact(&mut recv, &mut data).await?;
@@ -1159,6 +1188,80 @@ pub async fn resolve_path(fs: &dyn RemoteFilesystem, path: &str) -> Result<NodeI
             .node;
     }
     Ok(node)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_body_length_is_bounded_by_request_and_client_limit() {
+        // Honest replies: at most what was asked for.
+        assert_eq!(validated_raw_body_length(0, 0, 16).unwrap(), 0);
+        assert_eq!(validated_raw_body_length(7, 16, 16).unwrap(), 7);
+        // A reply declaring more bytes than requested is hostile or broken and
+        // must be rejected before allocation.
+        assert!(matches!(
+            validated_raw_body_length(17, 16, MAX_CLIENT_READ_SIZE),
+            Err(ClientError::UnexpectedResponse)
+        ));
+        // Even a huge requested value cannot exceed the client-wide limit.
+        assert!(matches!(
+            validated_raw_body_length(u64::MAX, u64::MAX, MAX_CLIENT_READ_SIZE),
+            Err(ClientError::UnexpectedResponse)
+        ));
+    }
+
+    fn view_entry(index: u128) -> DirectoryViewEntry {
+        let node = NodeId(Uuid::from_u128(index));
+        DirectoryViewEntry {
+            entry: DirectoryEntry {
+                node,
+                name: format!("entry-{index}").into(),
+                kind: NodeKind::File,
+                metadata: Metadata {
+                    node,
+                    kind: NodeKind::File,
+                    size: 0,
+                    mode: 0o644,
+                    allocated_blocks: 0,
+                    revision: 1,
+                    accessed_unix_ms: 0,
+                    modified_unix_ms: 0,
+                    created_unix_ms: None,
+                    backup_unix_ms: None,
+                    link_count: 1,
+                    device_major: 0,
+                    device_minor: 0,
+                },
+            },
+            xattrs: None,
+        }
+    }
+
+    #[test]
+    fn streamed_directory_chunks_must_make_progress_and_stay_bounded() {
+        let mut entries = Vec::new();
+        // Normal chunks append.
+        accept_directory_view_chunk(&mut entries, vec![view_entry(1), view_entry(2)]).unwrap();
+        assert_eq!(entries.len(), 2);
+        // An empty chunk is rejected: accepting them would let a hostile server
+        // stream frames forever without ever reaching the entry ceiling.
+        assert!(matches!(
+            accept_directory_view_chunk(&mut entries, Vec::new()),
+            Err(ClientError::UnexpectedResponse)
+        ));
+        // A chunk that would push the reassembled view past the protocol
+        // ceiling is rejected before it is buffered, and the ceiling itself is
+        // exactly `MAX_DIRECTORY_ENTRIES`.
+        assert!(directory_view_chunk_acceptable(
+            MAX_DIRECTORY_ENTRIES - 1,
+            1
+        ));
+        assert!(!directory_view_chunk_acceptable(MAX_DIRECTORY_ENTRIES, 1));
+        assert!(!directory_view_chunk_acceptable(usize::MAX, usize::MAX));
+    }
 }
 
 pub struct DelayedFilesystem<T> {
