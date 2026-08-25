@@ -22,6 +22,7 @@ use std::{
 use tokio::sync::{
     Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore,
 };
+#[cfg(unix)]
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -40,6 +41,11 @@ use std::{
 };
 
 const MAX_LOCK_RECORDS: usize = 65_536;
+/// Export-wide bound on concurrent node-discovery walks. A discovery walk
+/// visits up to `max_total_known_nodes` directory entries, so unbounded
+/// concurrency would let requests naming unknown node IDs saturate the
+/// blocking pool and the backing disk.
+const MAX_CONCURRENT_DISCOVERY_WALKS: usize = 4;
 const MAX_FORGET_NODES: usize = 65_536;
 const MAX_SYMLINK_TARGET_SIZE: usize = 16 * 1024;
 const MAX_XATTR_SIZE: usize = 64 * 1024 * 1024;
@@ -265,6 +271,7 @@ struct ExportShared {
     handle_permits: Arc<Semaphore>,
     node_permits: Arc<Semaphore>,
     directory_entry_permits: Arc<Semaphore>,
+    discovery_permits: Arc<Semaphore>,
     nodes: Mutex<NodeRegistry>,
     locks: Mutex<Vec<LockRecord>>,
     lock_notify: Notify,
@@ -412,6 +419,7 @@ impl Export {
                     limits.max_total_known_nodes.saturating_sub(1),
                 )),
                 directory_entry_permits: Arc::new(Semaphore::new(limits.max_directory_entry_tasks)),
+                discovery_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DISCOVERY_WALKS)),
                 nodes: Mutex::new(NodeRegistry {
                     by_node: HashMap::from([(ROOT_NODE, root_node)]),
                     by_identity: HashMap::from([(root_identity, ROOT_NODE)]),
@@ -574,12 +582,20 @@ impl ExportSession {
     }
 
     pub async fn metadata(&self, node: NodeId) -> Result<Metadata, ServerError> {
-        let snapshot = self.node_snapshot(node)?;
+        let snapshot = self.node_snapshot(node).await?;
+        self.snapshot_metadata(node, &snapshot)
+    }
+
+    fn snapshot_metadata(
+        &self,
+        node: NodeId,
+        snapshot: &NodeSnapshot,
+    ) -> Result<Metadata, ServerError> {
         #[cfg(unix)]
         {
-            if let Some(stat) = self.path_stat(&snapshot)? {
+            if let Some(stat) = self.path_stat(snapshot)? {
                 let mut metadata = to_metadata_from_stat(node, &stat)?;
-                metadata.backup_unix_ms = self.read_backup_time(&snapshot).ok().flatten();
+                metadata.backup_unix_ms = self.read_backup_time(snapshot).ok().flatten();
                 self.enrich_resource_fork_revision(node, &mut metadata);
                 return Ok(metadata);
             }
@@ -587,7 +603,7 @@ impl ExportSession {
         }
         #[cfg(not(unix))]
         {
-            let path = self.absolute_snapshot_path(&snapshot)?;
+            let path = self.absolute_snapshot_path(snapshot)?;
             Ok(to_metadata(node, &std::fs::symlink_metadata(path)?))
         }
     }
@@ -746,7 +762,7 @@ impl ExportSession {
         ),
         ServerError,
     > {
-        let snapshot = self.node_snapshot(node)?;
+        let snapshot = self.node_snapshot(node).await?;
         let root = self.export.shared.root_file.try_clone()?;
         let prepared = blocking(move || prepare_directory_scan(&root, &snapshot)).await?;
         let node_key = self.export.shared.node_key;
@@ -814,7 +830,7 @@ impl ExportSession {
     ) -> Result<(DirectoryRevision, Vec<DirectoryEntry>), ServerError> {
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot_blocking(node)?;
             let (directory, relative, before) = self.open_snapshot(
                 &snapshot,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -876,21 +892,19 @@ impl ExportSession {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ServerError::TooManyHandles)?;
-        let snapshot = self.node_snapshot(node)?;
+        let snapshot = self.node_snapshot(node).await?;
         #[cfg(unix)]
         let flags = open_flags(options.access, options.append);
         #[cfg(unix)]
         let (file, _, _metadata) = self.open_snapshot(&snapshot, flags, Some(NodeKind::File))?;
         #[cfg(not(unix))]
-        let (file, metadata) = {
+        let file = {
             let path = self.absolute_snapshot_path(&snapshot)?;
-            let file = std::fs::OpenOptions::new()
+            std::fs::OpenOptions::new()
                 .read(options.access.can_read())
                 .write(options.access.can_write())
                 .append(options.append)
-                .open(path)?;
-            let metadata = file.metadata()?;
-            (file, metadata)
+                .open(path)?
         };
         if options.truncate {
             file.set_len(0)?;
@@ -931,7 +945,7 @@ impl ExportSession {
         #[cfg(unix)]
         {
             let name = OsStr::from_bytes(name);
-            let parent_snapshot = self.node_snapshot(parent)?;
+            let parent_snapshot = self.node_snapshot(parent).await?;
             let (directory, parent_path, _) = self.open_snapshot(
                 &parent_snapshot,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -1001,7 +1015,7 @@ impl ExportSession {
         #[cfg(unix)]
         {
             let name = OsStr::from_bytes(name);
-            let parent_snapshot = self.node_snapshot(parent)?;
+            let parent_snapshot = self.node_snapshot(parent).await?;
             let (directory, parent_path, _) = self.open_snapshot(
                 &parent_snapshot,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -1045,7 +1059,7 @@ impl ExportSession {
         #[cfg(unix)]
         {
             let name = OsStr::from_bytes(name);
-            let parent_snapshot = self.node_snapshot(parent)?;
+            let parent_snapshot = self.node_snapshot(parent).await?;
             let (directory, parent_path, _) = self.open_snapshot(
                 &parent_snapshot,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -1078,8 +1092,8 @@ impl ExportSession {
         validate_name(new_name)?;
         #[cfg(unix)]
         {
-            let source = self.node_snapshot(node)?;
-            let new_parent = self.node_snapshot(new_parent)?;
+            let source = self.node_snapshot(node).await?;
+            let new_parent = self.node_snapshot(new_parent).await?;
             let (new_directory, new_parent_path, _) = self.open_snapshot(
                 &new_parent,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -1136,7 +1150,7 @@ impl ExportSession {
         let (session_permit, global_permit) = self.reserve_node()?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            let parent_snapshot = self.node_snapshot(parent)?;
+            let parent_snapshot = self.node_snapshot(parent).await?;
             let (directory, parent_path, _) = self.open_snapshot(
                 &parent_snapshot,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -1196,7 +1210,7 @@ impl ExportSession {
         #[cfg(unix)]
         {
             let name = OsStr::from_bytes(name);
-            let parent_snapshot = self.node_snapshot(parent)?;
+            let parent_snapshot = self.node_snapshot(parent).await?;
             let (parent_file, parent_path, _) = self.open_snapshot(
                 &parent_snapshot,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -1254,8 +1268,8 @@ impl ExportSession {
         {
             let name = OsStr::from_bytes(name);
             let new_name = OsStr::from_bytes(new_name);
-            let old_parent_snapshot = self.node_snapshot(parent)?;
-            let new_parent_snapshot = self.node_snapshot(new_parent)?;
+            let old_parent_snapshot = self.node_snapshot(parent).await?;
+            let new_parent_snapshot = self.node_snapshot(new_parent).await?;
             let (old_directory, old_parent_path, _) = self.open_snapshot(
                 &old_parent_snapshot,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -1316,7 +1330,7 @@ impl ExportSession {
     pub async fn read_link(&self, node: NodeId) -> Result<Vec<u8>, ServerError> {
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             for path in &snapshot.paths {
                 let Ok(stat) = secure_lstat(&self.export.shared.root_file, path) else {
                     continue;
@@ -1355,14 +1369,14 @@ impl ExportSession {
         if is_resource_fork(name)
             && let Some(path) = self.resource_fork_path(node)
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let operation = self.content_operation(snapshot.identity)?;
             let _guard = operation.read().await;
             return blocking(move || read_resource_fork_range(&path, offset, length)).await;
         }
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let operation = self.content_operation(snapshot.identity)?;
             let _guard = operation.read().await;
             let file = self.open_xattr_file(&snapshot)?;
@@ -1388,7 +1402,7 @@ impl ExportSession {
     pub async fn list_xattrs(&self, node: NodeId) -> Result<Vec<Name>, ServerError> {
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let operation = self.content_operation(snapshot.identity)?;
             let _guard = operation.read().await;
             let file = self.open_xattr_file(&snapshot)?;
@@ -1428,14 +1442,14 @@ impl ExportSession {
         if is_resource_fork(name)
             && let Some(path) = self.resource_fork_path(node)
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let operation = self.content_operation(snapshot.identity)?;
             let _guard = operation.write().await;
             return blocking(move || write_resource_fork(&path, &value, mode, position)).await;
         }
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let operation = self.content_operation(snapshot.identity)?;
             let _guard = operation.write().await;
             let file = self.open_xattr_file(&snapshot)?;
@@ -1489,14 +1503,14 @@ impl ExportSession {
         if is_resource_fork(name)
             && let Some(path) = self.resource_fork_path(node)
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let operation = self.content_operation(snapshot.identity)?;
             let _guard = operation.write().await;
             return blocking(move || remove_resource_fork(&path)).await;
         }
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let operation = self.content_operation(snapshot.identity)?;
             let _guard = operation.write().await;
             let file = self.open_xattr_file(&snapshot)?;
@@ -1565,7 +1579,7 @@ impl ExportSession {
 
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let flags = if changes.size.is_some() {
                 OFlags::WRONLY
             } else {
@@ -1698,7 +1712,7 @@ impl ExportSession {
     pub async fn sync_directory(&self, node: NodeId) -> Result<(), ServerError> {
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let (directory, _, _) = self.open_snapshot(
                 &snapshot,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -1749,7 +1763,10 @@ impl ExportSession {
         })
         .await;
         #[cfg(not(unix))]
-        Err(ServerError::NotSupported)
+        {
+            let _ = opened_for_task;
+            Err(ServerError::NotSupported)
+        }
     }
 
     pub async fn copy_file_range(
@@ -1858,7 +1875,7 @@ impl ExportSession {
             .ok_or_else(|| ServerError::InvalidRequest("block offset overflow".into()))?;
         #[cfg(unix)]
         {
-            let snapshot = self.node_snapshot(node)?;
+            let snapshot = self.node_snapshot(node).await?;
             let operation = self.content_operation(snapshot.identity)?;
             let _guard = operation.read().await;
             let (file, _, _) =
@@ -1922,8 +1939,8 @@ impl ExportSession {
             if left.node == right.node {
                 return Ok(());
             }
-            let left_snapshot = self.node_snapshot(left.node)?;
-            let right_snapshot = self.node_snapshot(right.node)?;
+            let left_snapshot = self.node_snapshot(left.node).await?;
+            let right_snapshot = self.node_snapshot(right.node).await?;
             let left_resource_fork = self.resource_fork_path(left.node);
             let right_resource_fork = self.resource_fork_path(right.node);
             let left_gate = self.content_operation(left_snapshot.identity)?;
@@ -2094,13 +2111,32 @@ impl ExportSession {
         Ok(operation)
     }
 
-    fn node_snapshot(&self, node: NodeId) -> Result<NodeSnapshot, ServerError> {
-        if !lock_mutex(&self.export.shared.nodes)?
-            .by_node
-            .contains_key(&node)
-        {
-            self.discover_node(node)?;
+    async fn node_snapshot(&self, node: NodeId) -> Result<NodeSnapshot, ServerError> {
+        if !self.node_known(node)? {
+            self.discover_node(node).await?;
         }
+        self.snapshot_known(node)
+    }
+
+    /// `node_snapshot` for callers already running on a blocking worker. The
+    /// discovery walk, when needed, runs inline instead of being handed to the
+    /// blocking pool.
+    #[cfg(unix)]
+    fn node_snapshot_blocking(&self, node: NodeId) -> Result<NodeSnapshot, ServerError> {
+        if !self.node_known(node)? {
+            self.discover_node_blocking(node)?;
+        }
+        self.snapshot_known(node)
+    }
+
+    fn node_known(&self, node: NodeId) -> Result<bool, ServerError> {
+        Ok(lock_mutex(&self.export.shared.nodes)?
+            .by_node
+            .contains_key(&node))
+    }
+
+    /// Snapshot an already-registered node without attempting discovery.
+    fn snapshot_known(&self, node: NodeId) -> Result<NodeSnapshot, ServerError> {
         let snapshot = {
             let nodes = lock_mutex(&self.export.shared.nodes)?;
             let known = nodes.by_node.get(&node).ok_or(ServerError::InvalidNode)?;
@@ -2113,71 +2149,114 @@ impl ExportSession {
         Ok(snapshot)
     }
 
-    fn discover_node(&self, requested: NodeId) -> Result<(), ServerError> {
+    fn discovery_context(&self) -> Result<DiscoveryContext, ServerError> {
+        Ok(DiscoveryContext {
+            #[cfg(unix)]
+            root: self.export.shared.root_file.try_clone()?,
+            #[cfg(not(unix))]
+            root: self.export.shared.root.clone(),
+            node_key: self.export.shared.node_key,
+            visit_limit: self.export.shared.limits.max_total_known_nodes,
+        })
+    }
+
+    /// Locate one unknown node by walking the export on the blocking pool. The
+    /// walk visits up to `max_total_known_nodes` entries, so it must never run
+    /// on an async runtime worker: a synchronous walk there cannot be timed
+    /// out and can stall every connection the runtime serves.
+    async fn discover_node(&self, requested: NodeId) -> Result<(), ServerError> {
         if requested == ROOT_NODE {
             return Ok(());
         }
-        let mut pending = vec![PathBuf::new()];
-        let mut visited = 0usize;
-        while let Some(relative) = pending.pop() {
-            #[cfg(unix)]
-            let directory = open_directory(&self.export.shared.root_file, &relative)?;
-            #[cfg(unix)]
-            let entries = rustix::fs::Dir::read_from(&directory)
-                .map_err(std::io::Error::from)?
-                .map(|entry| {
-                    let entry = entry.map_err(std::io::Error::from)?;
-                    let name = entry.file_name().to_bytes().to_vec();
-                    let stat = rustix::fs::statat(
-                        &directory,
-                        OsStr::from_bytes(&name),
-                        AtFlags::SYMLINK_NOFOLLOW,
-                    )
-                    .map_err(std::io::Error::from)?;
-                    Ok::<_, std::io::Error>((OsString::from_vec(name), stat))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            #[cfg(not(unix))]
-            let entries = std::fs::read_dir(self.export.shared.root.join(&relative))?
-                .map(|entry| {
-                    let entry = entry?;
-                    let metadata = std::fs::symlink_metadata(entry.path())?;
-                    Ok::<_, std::io::Error>((entry.file_name(), metadata))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+        let _walk_permit = self
+            .export
+            .shared
+            .discovery_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ServerError::StateUnavailable)?;
+        let context = self.discovery_context()?;
+        let targets = HashSet::from([requested]);
+        let found = blocking(move || discover_targets(&context, &targets)).await?;
+        self.remember_discovered(requested, found.get(&requested).cloned())
+    }
 
-            for (name, metadata_or_stat) in entries {
-                if name.as_os_str().as_bytes() == b"." || name.as_os_str().as_bytes() == b".." {
-                    continue;
-                }
-                visited = visited.saturating_add(1);
-                if visited > self.export.shared.limits.max_total_known_nodes {
-                    return Err(ServerError::TooManyNodes);
-                }
-                let child = relative.join(name);
-                #[cfg(unix)]
-                let file_identity = identity_from_stat(&metadata_or_stat);
-                #[cfg(not(unix))]
-                let file_identity = identity(&metadata_or_stat);
-                if stable_node_id(self.export.shared.node_key, file_identity) == requested {
-                    let remembered = self.remember(file_identity, child)?;
-                    return if remembered == requested {
-                        Ok(())
-                    } else {
-                        Err(ServerError::StateUnavailable)
-                    };
-                }
-                #[cfg(unix)]
-                let is_directory =
-                    node_kind_from_mode(metadata_or_stat.st_mode)? == NodeKind::Directory;
-                #[cfg(not(unix))]
-                let is_directory = metadata_or_stat.is_dir();
-                if is_directory {
-                    pending.push(child);
-                }
+    #[cfg(unix)]
+    fn discover_node_blocking(&self, requested: NodeId) -> Result<(), ServerError> {
+        if requested == ROOT_NODE {
+            return Ok(());
+        }
+        let _walk_permit = self
+            .export
+            .shared
+            .discovery_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ServerError::Busy)?;
+        let context = self.discovery_context()?;
+        let targets = HashSet::from([requested]);
+        let found = discover_targets(&context, &targets)?;
+        self.remember_discovered(requested, found.get(&requested).cloned())
+    }
+
+    fn remember_discovered(
+        &self,
+        requested: NodeId,
+        found: Option<(FileIdentity, PathBuf)>,
+    ) -> Result<(), ServerError> {
+        let Some((identity, path)) = found else {
+            return Err(ServerError::InvalidNode);
+        };
+        let remembered = self.remember(identity, path)?;
+        if remembered == requested {
+            Ok(())
+        } else {
+            Err(ServerError::StateUnavailable)
+        }
+    }
+
+    /// Resolve metadata for several nodes with at most one discovery walk.
+    /// Returns one positional result per requested node. Without this, a batch
+    /// naming N unknown node IDs would trigger N complete export walks from a
+    /// single request — an amplification a hostile client could use to pin the
+    /// backing store — while a batch of known nodes pays no walk at all.
+    pub async fn metadata_batch(&self, nodes: &[NodeId]) -> Vec<Result<Metadata, ServerError>> {
+        let mut unknown = HashSet::new();
+        for &node in nodes {
+            if node != ROOT_NODE && matches!(self.node_known(node), Ok(false)) {
+                unknown.insert(node);
             }
         }
-        Err(ServerError::InvalidNode)
+        if !unknown.is_empty()
+            && let Ok(_walk_permit) = self
+                .export
+                .shared
+                .discovery_permits
+                .clone()
+                .acquire_owned()
+                .await
+            && let Ok(context) = self.discovery_context()
+            && let Ok(found) = blocking(move || discover_targets(&context, &unknown)).await
+        {
+            for (node, (identity, path)) in found {
+                // Best effort: a node that cannot be remembered (capacity) is
+                // reported per-slot as unresolvable below rather than failing
+                // the whole batch.
+                let _ = self.remember_discovered(node, Some((identity, path)));
+            }
+        }
+        let mut results = Vec::with_capacity(nodes.len());
+        for &node in nodes {
+            // Discovery already ran once for the whole batch; resolve each
+            // node against the registry only, so a still-unknown node cannot
+            // trigger another walk.
+            results.push(
+                self.snapshot_known(node)
+                    .and_then(|snapshot| self.snapshot_metadata(node, &snapshot)),
+            );
+        }
+        results
     }
 
     fn reserve_node(&self) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), ServerError> {
@@ -2696,6 +2775,89 @@ fn stable_node_id(key: [u8; 32], identity: FileIdentity) -> NodeId {
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     NodeId(Uuid::from_bytes(bytes))
+}
+
+/// The immutable inputs a node-discovery walk needs, cloned out of the export
+/// so the walk can run on a blocking worker without borrowing session state.
+struct DiscoveryContext {
+    #[cfg(unix)]
+    root: StdFile,
+    #[cfg(not(unix))]
+    root: PathBuf,
+    node_key: [u8; 32],
+    visit_limit: usize,
+}
+
+/// Walk the export beneath the root descriptor looking for the backing
+/// identities of `targets`. Visits at most `visit_limit` entries, never
+/// follows symlinks, and stops early once every target is resolved. This is
+/// blocking filesystem work: callers on an async runtime must dispatch it via
+/// [`blocking`].
+fn discover_targets(
+    context: &DiscoveryContext,
+    targets: &HashSet<NodeId>,
+) -> Result<HashMap<NodeId, (FileIdentity, PathBuf)>, ServerError> {
+    let mut found = HashMap::new();
+    let mut pending = vec![PathBuf::new()];
+    let mut visited = 0usize;
+    while let Some(relative) = pending.pop() {
+        #[cfg(unix)]
+        let directory = open_directory(&context.root, &relative)?;
+        #[cfg(unix)]
+        let entries = rustix::fs::Dir::read_from(&directory)
+            .map_err(std::io::Error::from)?
+            .map(|entry| {
+                let entry = entry.map_err(std::io::Error::from)?;
+                let name = entry.file_name().to_bytes().to_vec();
+                let stat = rustix::fs::statat(
+                    &directory,
+                    OsStr::from_bytes(&name),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .map_err(std::io::Error::from)?;
+                Ok::<_, std::io::Error>((OsString::from_vec(name), stat))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(not(unix))]
+        let entries = std::fs::read_dir(context.root.join(&relative))?
+            .map(|entry| {
+                let entry = entry?;
+                let metadata = std::fs::symlink_metadata(entry.path())?;
+                Ok::<_, std::io::Error>((entry.file_name(), metadata))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (name, metadata_or_stat) in entries {
+            if name.as_os_str() == "." || name.as_os_str() == ".." {
+                continue;
+            }
+            visited = visited.saturating_add(1);
+            if visited > context.visit_limit {
+                return Err(ServerError::TooManyNodes);
+            }
+            let child = relative.join(&name);
+            #[cfg(unix)]
+            let file_identity = identity_from_stat(&metadata_or_stat);
+            #[cfg(not(unix))]
+            let file_identity = identity(&metadata_or_stat);
+            let node = stable_node_id(context.node_key, file_identity);
+            if targets.contains(&node) {
+                found.insert(node, (file_identity, child.clone()));
+                if found.len() == targets.len() {
+                    return Ok(found);
+                }
+            }
+            #[cfg(unix)]
+            let is_directory =
+                node_kind_from_mode(metadata_or_stat.st_mode)? == NodeKind::Directory;
+            #[cfg(not(unix))]
+            let is_directory = metadata_or_stat.is_dir();
+            if is_directory {
+                pending.push(child);
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn export_marker(root: &Path, root_identity: FileIdentity) -> String {
@@ -3393,6 +3555,20 @@ fn read_fd_backup_time(file: &StdFile) -> Result<Option<u64>, ServerError> {
     }
 }
 
+#[cfg(not(unix))]
+fn write_backup_time(_file: &StdFile, value: Option<u64>) -> Result<(), ServerError> {
+    if value.is_some() {
+        Err(ServerError::NotSupported)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn read_fd_backup_time(_file: &StdFile) -> Result<Option<u64>, ServerError> {
+    Ok(None)
+}
+
 fn validate_symlink_target(target: &[u8]) -> Result<(), ServerError> {
     if target.is_empty() || target.len() > MAX_SYMLINK_TARGET_SIZE || target.contains(&0) {
         return Err(ServerError::InvalidRequest(
@@ -3772,22 +3948,30 @@ fn metadata_allocated_blocks(metadata: &std::fs::Metadata) -> u64 {
 fn node_kind(metadata: &std::fs::Metadata) -> NodeKind {
     let file_type = metadata.file_type();
     if file_type.is_dir() {
-        NodeKind::Directory
-    } else if file_type.is_file() {
-        NodeKind::File
-    } else if file_type.is_symlink() {
-        NodeKind::Symlink
-    } else if file_type.is_fifo() {
-        NodeKind::NamedPipe
-    } else if file_type.is_char_device() {
-        NodeKind::CharacterDevice
-    } else if file_type.is_block_device() {
-        NodeKind::BlockDevice
-    } else if file_type.is_socket() {
-        NodeKind::Socket
-    } else {
-        NodeKind::Symlink
+        return NodeKind::Directory;
     }
+    if file_type.is_file() {
+        return NodeKind::File;
+    }
+    if file_type.is_symlink() {
+        return NodeKind::Symlink;
+    }
+    #[cfg(unix)]
+    {
+        if file_type.is_fifo() {
+            return NodeKind::NamedPipe;
+        }
+        if file_type.is_char_device() {
+            return NodeKind::CharacterDevice;
+        }
+        if file_type.is_block_device() {
+            return NodeKind::BlockDevice;
+        }
+        if file_type.is_socket() {
+            return NodeKind::Socket;
+        }
+    }
+    NodeKind::Symlink
 }
 
 fn read_consistent(
@@ -3836,6 +4020,18 @@ fn read_consistent(
         return Err(ServerError::Conflict);
     }
     Ok((after_revision, data))
+}
+
+#[cfg(not(unix))]
+fn write_all_at(
+    _file: &StdFile,
+    _offset: u64,
+    _data: &[u8],
+    _append: bool,
+) -> Result<(), ServerError> {
+    // Mirrors `read_all_at`: positioned I/O helpers are unsupported on the
+    // development-only non-Unix build and fail closed.
+    Err(ServerError::NotSupported)
 }
 
 #[cfg(unix)]
@@ -4206,6 +4402,68 @@ mod tests {
             access: FileAccess::ReadWrite,
             truncate: false,
             append: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_batch_resolves_positionally_with_one_bounded_walk() {
+        // A batch mixing known, duplicate, and unknown node IDs must return one
+        // positional result per input. Unknown IDs are resolved by at most one
+        // discovery walk for the whole batch — the walk either finds them or
+        // they fail in place — and can never fail the whole request.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("known"), b"data").unwrap();
+        let export = Export::new(directory.path(), Limits::default())
+            .await
+            .unwrap();
+        let session = export.session();
+        let bogus_a = NodeId(Uuid::from_u128(0xdead_beef));
+        let bogus_b = NodeId(Uuid::from_u128(0xfeed_face));
+        let results = session
+            .metadata_batch(&[ROOT_NODE, bogus_a, ROOT_NODE, bogus_b])
+            .await;
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].as_ref().unwrap().node, ROOT_NODE);
+        assert!(matches!(results[1], Err(ServerError::InvalidNode)));
+        assert_eq!(results[2].as_ref().unwrap().node, ROOT_NODE);
+        assert!(matches!(results[3], Err(ServerError::InvalidNode)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_batch_discovers_unknown_nodes_from_a_fresh_registry() {
+        // Persistent node IDs survive a registry restart: a batch naming nodes
+        // the new export has never seen must locate them with a discovery walk
+        // and resolve every slot.
+        let root = tempfile::tempdir().unwrap();
+        let export_root = root.path().join("export");
+        std::fs::create_dir(&export_root).unwrap();
+        std::fs::write(export_root.join("a"), b"a").unwrap();
+        std::fs::write(export_root.join("b"), b"b").unwrap();
+        let state = root.path().join("export-state.json");
+
+        let first = Export::new_persistent_with_writes(&export_root, &state, Limits::default(), true)
+            .await
+            .unwrap();
+        let session = first.session();
+        let nodes: Vec<NodeId> = session
+            .list(ROOT_NODE)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.node)
+            .collect();
+        drop(session);
+        drop(first);
+
+        let second = Export::new_persistent_with_writes(&export_root, &state, Limits::default(), true)
+            .await
+            .unwrap();
+        let fresh = second.session();
+        let results = fresh.metadata_batch(&nodes).await;
+        assert_eq!(results.len(), nodes.len());
+        for (node, result) in nodes.iter().zip(&results) {
+            assert_eq!(result.as_ref().unwrap().node, *node);
         }
     }
 

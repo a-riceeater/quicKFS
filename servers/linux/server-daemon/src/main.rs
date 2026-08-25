@@ -924,16 +924,20 @@ async fn handle(
                     ),
                 })
             } else {
-                // Resolve each node independently; a per-node failure rides inside
-                // its result rather than failing the batch, so one missing node
-                // does not discard the metadata the client did resolve.
-                let mut results = Vec::with_capacity(nodes.len());
-                for node in nodes {
-                    results.push(match export.metadata(node).await {
+                // Resolve the whole batch through the export's batch path: it
+                // performs at most one discovery walk for every unknown node in
+                // the request (instead of one full-export walk per unknown node)
+                // and reports each per-node failure inside its own slot, so one
+                // missing node does not discard the metadata that did resolve.
+                let results = export
+                    .metadata_batch(&nodes)
+                    .await
+                    .into_iter()
+                    .map(|result| match result {
                         Ok(metadata) => BatchedMetadata::Found(metadata),
                         Err(error) => BatchedMetadata::Failed(error.protocol().code),
-                    });
-                }
+                    })
+                    .collect();
                 Response::MetadataBatch { results }
             }
         }
