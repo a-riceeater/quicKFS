@@ -562,6 +562,44 @@ async fn capability_epoch(filesystem: &dyn RemoteFilesystem) -> Result<Option<Uu
     }
 }
 
+/// Fold one acknowledged lock operation into a handle's replayable lock state.
+///
+/// The history holds the handle's *current* advisory-lock set — disjoint
+/// per-owner ranges mirroring how the server replaces an owner's overlapping
+/// range — rather than an append-only log. This keeps replay after reconnect
+/// exact (an unlock genuinely removes its range, a partial unlock splits the
+/// surviving range) and keeps memory bounded by the number of ranges the
+/// server itself was willing to accept, instead of growing with every
+/// operation and eventually discarding still-held locks.
+fn apply_lock_to_history(history: &mut Vec<FileLock>, lock: FileLock) {
+    let mut next = Vec::with_capacity(history.len() + 2);
+    for existing in history.drain(..) {
+        if existing.owner != lock.owner
+            || existing.start > lock.end
+            || lock.start > existing.end
+        {
+            next.push(existing);
+            continue;
+        }
+        if existing.start < lock.start {
+            next.push(FileLock {
+                end: lock.start - 1,
+                ..existing
+            });
+        }
+        if existing.end > lock.end {
+            next.push(FileLock {
+                start: lock.end.saturating_add(1),
+                ..existing
+            });
+        }
+    }
+    if lock.kind != LockKind::Unlock {
+        next.push(lock);
+    }
+    *history = next;
+}
+
 fn invalid_handle() -> ClientError {
     ClientError::Server(
         quickfs_protocol::ErrorCode::InvalidHandle,
@@ -1111,10 +1149,7 @@ impl RemoteFilesystem for ResilientFilesystem {
                 Ok(()) => {
                     let mut handles = self.handles.write().await;
                     if let Some(current) = handles.get_mut(&handle) {
-                        current.lock_history.push(lock);
-                        if lock.kind == LockKind::Unlock && current.lock_history.len() > 4_096 {
-                            current.lock_history.clear();
-                        }
+                        apply_lock_to_history(&mut current.lock_history, lock);
                     }
                     Ok(())
                 }
@@ -1733,6 +1768,108 @@ mod tests {
         assert_eq!(filesystem.read_range(handle, 0, 2).await.unwrap(), b"01");
         assert_eq!(replacement.opens.load(Ordering::SeqCst), 1);
         assert_eq!(*replacement.locks.lock().await, [lock]);
+    }
+
+    fn history_lock(owner: u64, start: u64, end: u64, kind: LockKind) -> FileLock {
+        FileLock {
+            owner,
+            start,
+            end,
+            kind,
+            pid: 42,
+        }
+    }
+
+    #[test]
+    fn lock_history_compacts_instead_of_growing_or_discarding() {
+        let mut history = Vec::new();
+        // Two disjoint locks for one owner, one for another owner.
+        apply_lock_to_history(&mut history, history_lock(1, 0, 9, LockKind::Write));
+        apply_lock_to_history(&mut history, history_lock(1, 20, 29, LockKind::Write));
+        apply_lock_to_history(&mut history, history_lock(2, 0, 9, LockKind::Read));
+        assert_eq!(history.len(), 3);
+
+        // Re-locking an overlapping range replaces it rather than appending, so
+        // the history mirrors the server's current lock state.
+        apply_lock_to_history(&mut history, history_lock(1, 0, 9, LockKind::Read));
+        assert_eq!(history.len(), 3);
+        assert!(
+            history
+                .iter()
+                .any(|lock| lock.owner == 1 && lock.start == 0 && lock.kind == LockKind::Read)
+        );
+
+        // A partial unlock splits the surviving range; the other owner's
+        // overlapping lock is untouched.
+        apply_lock_to_history(&mut history, history_lock(1, 3, 5, LockKind::Unlock));
+        let owner_one: Vec<_> = history.iter().filter(|lock| lock.owner == 1).collect();
+        assert!(
+            owner_one
+                .iter()
+                .any(|lock| lock.start == 0 && lock.end == 2)
+        );
+        assert!(
+            owner_one
+                .iter()
+                .any(|lock| lock.start == 6 && lock.end == 9)
+        );
+        assert!(
+            history
+                .iter()
+                .any(|lock| lock.owner == 2 && lock.start == 0 && lock.end == 9)
+        );
+
+        // A full unlock of the split ranges genuinely removes them: no dead
+        // records linger and nothing outside the range is dropped with them.
+        apply_lock_to_history(&mut history, history_lock(1, 0, 15, LockKind::Unlock));
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|lock| lock.owner != 1 || lock.start == 20));
+    }
+
+    /// After an unlock, a reconnect must replay exactly the locks still held —
+    /// the unlocked range must not resurface and the held locks must not be
+    /// silently discarded (the old history was cleared wholesale once it grew
+    /// past a threshold, losing held locks from replay).
+    #[tokio::test]
+    async fn reconnect_replays_only_locks_still_held_after_unlock() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 8));
+        let replacement = Arc::new(ScriptedFilesystem::new(epoch, 8));
+        let filesystem = ResilientFilesystem::new(
+            first.clone(),
+            connector(replacement.clone()),
+            test_options(),
+        )
+        .await
+        .unwrap();
+        let handle = filesystem
+            .open_file_with_options(
+                FILE_NODE,
+                FileOpenOptions {
+                    access: quickfs_protocol::FileAccess::ReadWrite,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .await
+            .unwrap()
+            .handle;
+        let released = history_lock(9, 0, 99, LockKind::Write);
+        let kept = history_lock(9, 200, 299, LockKind::Write);
+        filesystem.set_lock(handle, released, false).await.unwrap();
+        filesystem.set_lock(handle, kept, false).await.unwrap();
+        filesystem
+            .set_lock(handle, FileLock {
+                kind: LockKind::Unlock,
+                ..released
+            }, false)
+            .await
+            .unwrap();
+
+        first.fail_ping.store(true, Ordering::SeqCst);
+        assert_eq!(filesystem.ping(5).await.unwrap(), 5);
+        assert_eq!(filesystem.read_range(handle, 0, 2).await.unwrap(), b"01");
+        assert_eq!(*replacement.locks.lock().await, [kept]);
     }
 
     #[test]
