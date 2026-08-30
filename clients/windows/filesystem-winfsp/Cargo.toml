@@ -1,0 +1,33 @@
+[package]
+name="quickfs-filesystem-winfsp"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+publish.workspace=true
+[dependencies]
+thiserror.workspace=true
+tokio.workspace=true
+quickfs-client-core={path="../../../crates/client-core"}
+quickfs-fs-adapter={path="../../../crates/fs-adapter"}
+quickfs-protocol={path="../../../crates/protocol"}
+[target.'cfg(windows)'.dependencies]
+widestring.workspace=true
+winfsp_wrs.workspace=true
+# Only the raw `PVOID` type and the `FileContextKind` contract; see src/handle.rs.
+winfsp_wrs_sys="0.4"
+quickfs-windows-support={path="../../../crates/windows-support"}
+# One module, `src/handle.rs`, needs `unsafe` to hand WinFsp a file context that
+# can legitimately be absent — see its documentation. The crate keeps
+# `#![deny(unsafe_code)]` and grants the exception in that one file, which a
+# workspace-level `forbid` cannot express.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[dev-dependencies]
+async-trait.workspace=true
+tempfile.workspace=true
+uuid.workspace=true

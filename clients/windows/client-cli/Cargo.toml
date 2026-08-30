@@ -1,0 +1,37 @@
+[package]
+name="quickfs-windows-cli"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+publish.workspace=true
+[dependencies]
+anyhow.workspace=true
+clap.workspace=true
+hex.workspace=true
+rpassword.workspace=true
+tokio.workspace=true
+uuid.workspace=true
+zeroize.workspace=true
+quickfs-cache={path="../../../crates/cache"}
+quickfs-client-core={path="../../../crates/client-core"}
+quickfs-protocol={path="../../../crates/protocol"}
+quickfs-transport-quic={path="../../../crates/transport-quic"}
+[target.'cfg(windows)'.dependencies]
+quickfs-filesystem-winfsp={path="../filesystem-winfsp"}
+quickfs-windows-support={path="../../../crates/windows-support"}
+winfsp_wrs.workspace=true
+[lints]
+workspace=true
+
+[dev-dependencies]
+tempfile.workspace=true
+
+[[bin]]
+name="quickfs"
+path="src/main.rs"
+
+# Delay-load the WinFsp DLL so `quickfs.exe` starts — and can print an
+# actionable message — on a machine where WinFsp is not installed, instead of
+# failing to launch at all with a loader error the user cannot interpret.
+[package.metadata.winfsp]
+delay-load = true

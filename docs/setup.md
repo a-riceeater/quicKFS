@@ -36,7 +36,7 @@ rustc --version
 cargo --version
 ```
 
-Both versions must be at least 1.88. `command -v cargo` should normally report `$HOME/.cargo/bin/cargo`. Normal workspace builds and tests do not require an installed macFUSE runtime. Running the GUI, client CLI, or native mount on macOS does: each process checks at startup and stops with an installation link when it is absent. Install macFUSE from the [official website](https://macfuse.io/), install `pkgconf` for native development, and complete any system-extension approval requested by macOS:
+Both versions must be at least 1.88. On Windows, install the Visual Studio Build Tools for the MSVC linker, and [WinFsp](https://winfsp.dev/rel/) to mount — see the [Windows client guide](windows.md) for what each WinFsp feature is needed for and how to build against an unpacked SDK when WinFsp cannot be installed. `command -v cargo` should normally report `$HOME/.cargo/bin/cargo`. Normal workspace builds and tests do not require an installed macFUSE runtime. Running the GUI, client CLI, or native mount on macOS does: each process checks at startup and stops with an installation link when it is absent. Install macFUSE from the [official website](https://macfuse.io/), install `pkgconf` for native development, and complete any system-extension approval requested by macOS:
 
 ```sh
 brew install pkgconf
@@ -194,6 +194,37 @@ umount "$HOME/Volumes/quickfs"
 ```
 
 For enterprise CA or platform-root deployments, pass the same `--ca-cert` or `--trust-system-roots` option used by the diagnostic client. See the [usage reference](usage.md#macos-quickfs-mount) for all mount options.
+
+## Mount the export in Explorer on Windows
+
+Install [WinFsp](https://winfsp.dev/rel/) first — the **Core** feature to mount,
+plus **Developer** if the same machine builds the client. Then pair and mount
+with the same address, server name, state directory, and user the CLI uses:
+
+```powershell
+cargo build --release -p quickfs-windows-cli
+
+target\release\quickfs.exe pair 127.0.0.1:4433 --pairing-id <id>
+target\release\quickfs.exe mount 127.0.0.1:4433 Q: --username alice
+```
+
+Enter the account password at the hidden prompt. As on macOS, the mount verifies
+the server before that prompt, reconnects and verifies it again before
+transmitting the password, then retains one shared runtime around an
+authenticated reconnecting filesystem and persistent read cache. Open `Q:` in
+Explorer. The volume is writable only when both the daemon and account gates
+above are enabled; otherwise it mounts read-only.
+
+The trust database is shared with the macOS client, so a pin established by
+either is understood by the other. On Windows it is protected by an owner-only
+DACL rather than Unix modes, and a store another account could reach is refused
+rather than read.
+
+Keep the window running. When finished, press Control+C there, or run
+`quickfs unmount Q:` from another window. For enterprise CA or platform-root
+deployments, pass the same `--ca-cert` or `--trust-system-roots` option. See the
+[usage reference](usage.md#windows-quickfs) for every option and the
+[Windows client guide](windows.md) for the platform limitations.
 
 ## Enterprise setup without per-client pairing
 

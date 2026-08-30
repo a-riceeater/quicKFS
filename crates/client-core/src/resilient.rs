@@ -1512,22 +1512,29 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_waiter_does_not_cancel_shared_reconnect() {
+        // The intervals are sized so the first caller's deadline (180 ms) falls
+        // between the reconnect's start and its finish (80 ms of failing ping
+        // plus 140 ms of connecting), while the second caller — which arrives
+        // once the reconnect is already under way — has room to spare. Every
+        // margin is 40 ms, comfortably above the ~15.6 ms timer granularity a
+        // default Windows scheduler provides; tighter values pass on Linux and
+        // fail intermittently there.
         let epoch = Uuid::new_v4();
         let first = Arc::new(ScriptedFilesystem::new(epoch, 1));
         first.fail_ping.store(true, Ordering::SeqCst);
-        first.ping_delay_ms.store(20, Ordering::SeqCst);
+        first.ping_delay_ms.store(80, Ordering::SeqCst);
         let replacement = Arc::new(ScriptedFilesystem::new(epoch, 1));
         let connector = Arc::new(QueueConnector {
             filesystems: Mutex::new(VecDeque::from([replacement as Arc<dyn RemoteFilesystem>])),
             calls: AtomicUsize::new(0),
-            delay: Duration::from_millis(35),
+            delay: Duration::from_millis(140),
             started: Notify::new(),
         });
         let filesystem = Arc::new(
             ResilientFilesystem::new(
                 first,
                 connector.clone(),
-                deadline_options(Duration::from_millis(45)),
+                deadline_options(Duration::from_millis(180)),
             )
             .await
             .unwrap(),

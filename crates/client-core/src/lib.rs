@@ -15,7 +15,10 @@ pub use resilient::{
     AuthenticatedConnectionConfig, ReconnectPolicy, RemoteFilesystemConnector, ResilientFilesystem,
     ResilientFilesystemOptions,
 };
-pub use trust::{ServerTrust, TrustStoreError, load_trusted_server_pin};
+pub use trust::{
+    PinnedServer, ServerTrust, TRUST_DATABASE_FILE, TrustStore, TrustStoreError, TrustStoreGuard,
+    load_trusted_server_pin, parse_sha256_fingerprint,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {

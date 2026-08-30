@@ -44,6 +44,83 @@ jobs:
       - name: Build documentation
         run: cargo doc --workspace --no-deps
 
+  windows:
+    name: Windows CI
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # The runner has no WinFsp installation, and installing the driver needs
+      # more than the build does. An administrative extract of the MSI gives the
+      # headers and import library the link step wants, which is what
+      # WINFSP_INSTALL_DIR exists for. Mounting is not exercised here; that
+      # needs the driver and is covered by the manual plan in
+      # docs/windows-integration-tests.md.
+      - name: Unpack the WinFsp SDK
+        shell: pwsh
+        run: |
+          $version = "2.0.23075"
+          $msi = "$env:RUNNER_TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-$version.msi" -OutFile $msi
+          $target = "$env:RUNNER_TEMP\winfsp-sdk"
+          Start-Process msiexec.exe -ArgumentList "/a","`"$msi`"","/qn","TARGETDIR=`"$target`"" -Wait -NoNewWindow
+          $sdk = Join-Path $target "DYNAMIC"
+          if (-not (Test-Path (Join-Path $sdk "lib\winfsp-x64.lib"))) {
+            throw "the WinFsp SDK did not unpack as expected"
+          }
+          "WINFSP_INSTALL_DIR=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Scoped to what Windows actually builds. `server-core` and the daemon
+      # are largely cfg(unix), so a whole-workspace lint here would fail on
+      # dead-code warnings for Linux-only server code that the Linux job
+      # already checks properly.
+      - name: Run Clippy
+        run: >
+          cargo clippy --all-targets
+          -p quickfs-protocol
+          -p quickfs-auth
+          -p quickfs-cache
+          -p quickfs-common
+          -p quickfs-client-core
+          -p quickfs-fs-adapter
+          -p quickfs-transport-quic
+          -p quickfs-windows-support
+          -p quickfs-filesystem-winfsp
+          -p quickfs-windows-cli
+          -p quickfs-filesystem-macfuse
+          -p quickfs-client-cli
+          -- -D warnings
+
+      # Same scope, and for the same reason: most server tests report
+      # NotSupported on Windows and are covered by the Linux job.
+      - name: Test Windows client
+        run: >
+          cargo test
+          -p quickfs-protocol
+          -p quickfs-auth
+          -p quickfs-cache
+          -p quickfs-common
+          -p quickfs-client-core
+          -p quickfs-fs-adapter
+          -p quickfs-transport-quic
+          -p quickfs-windows-support
+          -p quickfs-filesystem-winfsp
+          -p quickfs-windows-cli
+
+      - name: Build the Windows client
+        run: cargo build --release -p quickfs-windows-cli
+
   macos:
     name: macOS CI
     runs-on: macos-latest
@@ -60,4 +137,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Test macOS client
-        run: cargo test -p quickfs-client-cli -p quickfs-filesystem-macfuse
+        run: cargo test -p quickfs-client-cli -p quickfs-filesystem-macfuse -p quickfs-fs-adapter

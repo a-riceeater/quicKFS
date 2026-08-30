@@ -1768,7 +1768,10 @@ fn valid_cache_file_name(name: &str) -> bool {
 
 fn ensure_private_directory(path: &Path) -> Result<(), CacheError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_private_directory_metadata(&metadata),
+        Ok(metadata) => {
+            validate_private_directory_metadata(&metadata)?;
+            validate_private_path(path)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match create_private_directory(path) {
                 Ok(()) => {
@@ -1793,7 +1796,14 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
     builder.mode(0o700).create(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    // Created with its owner-only descriptor already attached, so the
+    // directory is never briefly reachable by another account on the machine.
+    quickfs_windows_support::create_private_directory(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
     fs::create_dir(path)
 }
@@ -1803,6 +1813,26 @@ fn validate_private_directory_metadata(metadata: &fs::Metadata) -> Result<(), Ca
         return Err(CacheError::UnsafeStorage);
     }
     validate_private_ownership_and_mode(metadata)
+}
+
+/// Whether a path is reachable only by this account.
+///
+/// The offline cache holds decrypted file contents, so a widened cache
+/// directory leaks exactly the data the transport was protecting. On Unix that
+/// is the owner and mode check on the metadata; on Windows it is an owner and
+/// DACL check, which needs the path.
+fn validate_private_path(path: &Path) -> Result<(), CacheError> {
+    #[cfg(windows)]
+    {
+        if !quickfs_windows_support::validate_private_owner(path).map_err(CacheError::Io)? {
+            return Err(CacheError::UnsafeStorage);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn validate_private_file_metadata(metadata: &fs::Metadata) -> Result<(), CacheError> {
@@ -1825,6 +1855,9 @@ fn validate_private_ownership_and_mode(metadata: &fs::Metadata) -> Result<(), Ca
     }
 }
 
+/// The Windows check has to consult the path rather than its metadata: a
+/// `fs::Metadata` carries no owner or ACL, so the caller passes the path too
+/// and the Unix implementation ignores it.
 #[cfg(not(unix))]
 fn validate_private_ownership_and_mode(_metadata: &fs::Metadata) -> Result<(), CacheError> {
     Ok(())
@@ -1838,7 +1871,12 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_private_directory_permissions(path: &Path) -> Result<(), CacheError> {
+    quickfs_windows_support::harden_private_path(path).map_err(CacheError::Io)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_private_directory_permissions(_path: &Path) -> Result<(), CacheError> {
     Ok(())
 }
@@ -1859,6 +1897,12 @@ fn acquire_namespace_lock(path: &Path) -> Result<File, CacheError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
         .map_err(|_| CacheError::CacheInUse)?;
+    // Two clients sharing one cache namespace would interleave manifest
+    // transactions and corrupt it, so the lock is not optional on any platform
+    // that can express one. `LockFileEx` with the exclusive and
+    // fail-immediately flags is the direct counterpart of the `flock` above.
+    #[cfg(windows)]
+    quickfs_windows_support::lock_file(&file).map_err(|_| CacheError::CacheInUse)?;
     Ok(file)
 }
 
@@ -2535,6 +2579,40 @@ mod tests {
         assert!(
             cache.manifest_writes() >= 1,
             "a waited insert must be durable when its wait returns"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_storage_is_owner_private() {
+        // The Windows counterpart of the Unix mode assertion below: the cache
+        // holds decrypted file contents, so its directory must be reachable
+        // only by the account that opened it.
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = open_cache(&temporary, namespace(6, "alice"), 1_024);
+        cache.insert_range_value(range(1, 0, 4), b"data").unwrap();
+        assert!(
+            quickfs_windows_support::validate_private_owner(&cache.directory).unwrap(),
+            "the cache directory must carry an owner-only protected DACL"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_client_at_a_time_may_hold_a_cache_namespace() {
+        // Two clients sharing a namespace interleave manifest transactions and
+        // corrupt it. On Unix `flock` prevents that; this is the Windows half.
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("cache");
+        let held = PersistentCache::open(&root, namespace(6, "alice"), 1_024).unwrap();
+        assert!(matches!(
+            PersistentCache::open(&root, namespace(6, "alice"), 1_024),
+            Err(CacheError::CacheInUse)
+        ));
+        drop(held);
+        assert!(
+            PersistentCache::open(&root, namespace(6, "alice"), 1_024).is_ok(),
+            "the namespace must be reusable once the holder releases it"
         );
     }
 

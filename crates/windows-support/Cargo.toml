@@ -1,0 +1,33 @@
+[package]
+name = "quickfs-windows-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Memory",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# This crate is the single place quicKFS calls the Win32 security and locking
+# APIs, so it opts out of the workspace-wide `unsafe_code = "forbid"`. Every
+# other crate keeps the ban; concentrating the FFI here is what makes that
+# possible.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

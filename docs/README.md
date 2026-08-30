@@ -9,9 +9,11 @@ quicKFS is currently an experimental authenticated read/write filesystem with fa
 - [Troubleshooting](troubleshooting.md): TLS, connectivity, authentication, and filesystem errors.
 - [Protocol](protocol.md): version 6 wire format, enriched directory views, and request model.
 - [Filesystem semantics](filesystem-semantics.md): current read/write, reconnect, cache, and macFUSE behavior.
+- [Windows client](windows.md): WinFsp requirements, building, mounting, the POSIX-to-Windows metadata mapping, limitations, and troubleshooting.
+- [Windows integration test plan](windows-integration-tests.md): the manual coverage that a mounted volume needs and the automated suite cannot reach.
 - [Architecture](../ARCHITECTURE.md): subsystem and trust boundaries.
 - [Threat model](threat-model.md): current security assumptions.
 - [Caching](caching.md): implemented interfaces and planned cache work.
 - [Roadmap](roadmap.md): planned milestones.
 
-Native macFUSE mounting is available behind the `macfuse` feature with reconnect, account-gated writes, xattrs/resource forks, locks, range I/O, capability-gated server-side copies, and persistent offline reads. Cold-start offline mounts, offline writes/conflict resolution, live-session revocation, and production hardening are not implemented.
+Native macFUSE mounting is available behind the `macfuse` feature with reconnect, account-gated writes, xattrs/resource forks, locks, range I/O, capability-gated server-side copies, and persistent offline reads. Native Windows mounting is available through WinFsp with reconnect, account-gated writes, range I/O, and the same persistent offline reads; extended attributes, reparse points and alternate data streams are not exposed there. Cold-start offline mounts, offline writes/conflict resolution, live-session revocation, and production hardening are not implemented.

@@ -14,6 +14,7 @@ use quickfs_protocol::{
     AttributeChanges, ErrorCode, FileAccess, FileLock, FileOpenOptions, LockKind, Metadata, Name,
     NodeKind, RenameMode, SafeIoctl, SeekWhence, SpecialNodeKind, XattrSetMode,
 };
+use std::ops::Deref;
 use std::{
     ffi::OsStr,
     future::Future,
@@ -201,7 +202,11 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
         adapter.prewarm_for_mount().map_err(|error| {
             io::Error::other(format!("failed to prepare the root directory: {error}"))
         })?;
-        let mut session = fuser::Session::new(adapter.clone(), mountpoint, &fuser_config)?;
+        let mut session = fuser::Session::new(
+            MacFuseAdapter::new(adapter.clone()),
+            mountpoint,
+            &fuser_config,
+        )?;
         eprintln!("quicKFS mount is ready at {}", mountpoint.display());
         let health_unmounter = session.unmount_callable();
         let registration_broken = Arc::new(AtomicBool::new(false));
@@ -237,7 +242,7 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
 /// the inner one is the session outcome itself.
 #[allow(clippy::type_complexity)]
 fn run_session_until_unmount(
-    mut session: fuser::Session<Adapter>,
+    mut session: fuser::Session<MacFuseAdapter>,
     mountpoint: &Path,
     runtime: &Arc<Runtime>,
 ) -> io::Result<io::Result<()>> {
@@ -430,14 +435,38 @@ fn validate_mount_config(config: &MountConfig) -> io::Result<()> {
     Ok(())
 }
 
-impl Adapter {
+/// macFUSE-side wrapper around the shared [`Adapter`].
+///
+/// `fuser::Filesystem` and `Adapter` both live in other crates, so the trait
+/// is implemented for this local newtype instead. It adds no state: it
+/// derefs to the adapter and every callback drives that.
+#[derive(Clone)]
+pub struct MacFuseAdapter(Adapter);
+
+impl MacFuseAdapter {
+    pub fn new(adapter: Adapter) -> Self {
+        Self(adapter)
+    }
+
+    pub fn adapter(&self) -> &Adapter {
+        &self.0
+    }
+
     fn spawn_callback(&self, future: impl Future<Output = ()> + Send + 'static) {
         let task = self.runtime().spawn(future);
         drop(task);
     }
 }
 
-impl Filesystem for Adapter {
+impl Deref for MacFuseAdapter {
+    type Target = Adapter;
+
+    fn deref(&self) -> &Adapter {
+        &self.0
+    }
+}
+
+impl Filesystem for MacFuseAdapter {
     fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> io::Result<()> {
         let Some(capabilities) = self.cached_capabilities() else {
             return Err(io::Error::other(
@@ -468,7 +497,7 @@ impl Filesystem for Adapter {
         let _ = config.set_congestion_threshold(CONGESTION_THRESHOLD);
         // One FUSE read may be larger than one negotiated wire read; the
         // adapter splits it while preserving the file revision.
-        let maximum_readahead = super::MAX_FUSE_IO_SIZE.min(u64::from(u32::MAX));
+        let maximum_readahead = super::MAX_CALLBACK_IO_SIZE.min(u64::from(u32::MAX));
         if let Ok(maximum_readahead) = u32::try_from(maximum_readahead) {
             let _ = config.set_max_readahead(maximum_readahead);
         }
@@ -481,7 +510,7 @@ impl Filesystem for Adapter {
             // adapter calls defensively.
             let maximum = capabilities
                 .max_write_size
-                .min(super::MAX_FUSE_IO_SIZE)
+                .min(super::MAX_CALLBACK_IO_SIZE)
                 .min(u64::from(u32::MAX));
             if let Ok(maximum) = u32::try_from(maximum) {
                 let _ = config.set_max_write(maximum);
@@ -503,7 +532,7 @@ impl Filesystem for Adapter {
 
     fn lookup(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = Name::new(name.as_bytes().to_vec());
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.lookup_async(u64::from(parent), name).await {
                 Ok(result) => reply.entry(
@@ -526,7 +555,7 @@ impl Filesystem for Adapter {
         // maps, so run it off the single macFUSE receive-loop thread; otherwise
         // Finder's bursty forget/batch_forget traffic during a crawl stalls the
         // one reader and later requests never get dispatched.
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             let _ = adapter.forget_inode(u64::from(inode), nlookup);
         });
@@ -537,7 +566,7 @@ impl Filesystem for Adapter {
             .iter()
             .map(|node| (u64::from(node.nodeid()), node.nlookup()))
             .collect::<Vec<_>>();
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             let _ = adapter.forget_inodes(&requests);
         });
@@ -550,7 +579,7 @@ impl Filesystem for Adapter {
         _handle: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             let inode = u64::from(inode);
             match adapter.getattr_async(inode).await {
@@ -615,7 +644,7 @@ impl Filesystem for Adapter {
                 return;
             }
         };
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             let inode = u64::from(inode);
             match adapter
@@ -644,7 +673,7 @@ impl Filesystem for Adapter {
     }
 
     fn readlink(&self, _request: &Request, inode: INodeNo, reply: ReplyData) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.readlink_async(u64::from(inode)).await {
                 Ok(target) => reply.data(&target),
@@ -679,7 +708,7 @@ impl Filesystem for Adapter {
                 return;
             }
         };
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             let result = if let Some(kind) = kind {
                 let device = rdev as libc::dev_t;
@@ -742,7 +771,7 @@ impl Filesystem for Adapter {
         reply: ReplyEntry,
     ) {
         let name = Name::new(name.as_bytes().to_vec());
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .create_directory_async(u64::from(parent), name, permission_mode(mode, umask))
@@ -776,7 +805,7 @@ impl Filesystem for Adapter {
     ) {
         let link_name = Name::new(link_name.as_bytes().to_vec());
         let target = target.as_os_str().as_bytes().to_vec();
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .create_symlink_async(u64::from(parent), link_name, target)
@@ -801,7 +830,7 @@ impl Filesystem for Adapter {
         reply: ReplyEntry,
     ) {
         let new_name = Name::new(new_name.as_bytes().to_vec());
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .create_hard_link_async(u64::from(inode), u64::from(new_parent), new_name)
@@ -841,7 +870,7 @@ impl Filesystem for Adapter {
 
     fn open(&self, _request: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let options = open_options(flags);
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.open_async(u64::from(inode), options).await {
                 Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::empty()),
@@ -862,7 +891,7 @@ impl Filesystem for Adapter {
     ) {
         let name = Name::new(name.as_bytes().to_vec());
         let options = open_options(OpenFlags(flags));
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .create_file_async(
@@ -896,7 +925,7 @@ impl Filesystem for Adapter {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .read_async(u64::from(handle), offset, u64::from(size))
@@ -923,7 +952,7 @@ impl Filesystem for Adapter {
     ) {
         let data = data.to_vec();
         let synchronize = write_sync_mode(flags);
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.write_async(u64::from(handle), offset, &data).await {
                 Ok(written) => {
@@ -951,7 +980,7 @@ impl Filesystem for Adapter {
         lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .flush_async(u64::from(handle), Some(lock_owner.0))
@@ -973,7 +1002,7 @@ impl Filesystem for Adapter {
         flush: bool,
         reply: ReplyEmpty,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .release_async(u64::from(handle), flush, lock_owner.map(|owner| owner.0))
@@ -993,7 +1022,7 @@ impl Filesystem for Adapter {
         data_only: bool,
         reply: ReplyEmpty,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.fsync_async(u64::from(handle), data_only).await {
                 Ok(()) => reply.ok(),
@@ -1007,7 +1036,7 @@ impl Filesystem for Adapter {
             reply.error(Errno::EISDIR);
             return;
         }
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.opendir_async(u64::from(inode)).await {
                 Ok(handle) => {
@@ -1032,7 +1061,7 @@ impl Filesystem for Adapter {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.directory_listing(u64::from(handle), u64::from(inode)) {
                 Ok(listing) => {
@@ -1062,7 +1091,7 @@ impl Filesystem for Adapter {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             let inode = u64::from(inode);
             match adapter.directory_listing_with_metadata(u64::from(handle), inode) {
@@ -1108,7 +1137,7 @@ impl Filesystem for Adapter {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .fsyncdir_async(u64::from(inode), u64::from(handle))
@@ -1121,7 +1150,7 @@ impl Filesystem for Adapter {
     }
 
     fn statfs(&self, _request: &Request, _inode: INodeNo, reply: ReplyStatfs) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.statfs_async().await {
                 Ok(stats) => reply.statfs(
@@ -1158,7 +1187,7 @@ impl Filesystem for Adapter {
         };
         let name = Name::new(name.as_bytes().to_vec());
         let value = value.to_vec();
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .set_xattr_async(u64::from(inode), name, value, mode, position)
@@ -1179,7 +1208,7 @@ impl Filesystem for Adapter {
         reply: ReplyXattr,
     ) {
         let name = Name::new(name.as_bytes().to_vec());
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             if size == 0 {
                 match adapter.xattr_size_async(u64::from(inode), name).await {
@@ -1200,7 +1229,7 @@ impl Filesystem for Adapter {
     }
 
     fn listxattr(&self, _request: &Request, inode: INodeNo, size: u32, reply: ReplyXattr) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.list_xattrs_async(u64::from(inode)).await {
                 Ok(names) => {
@@ -1227,7 +1256,7 @@ impl Filesystem for Adapter {
 
     fn removexattr(&self, _request: &Request, inode: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = Name::new(name.as_bytes().to_vec());
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.remove_xattr_async(u64::from(inode), name).await {
                 Ok(()) => reply.ok(),
@@ -1256,7 +1285,7 @@ impl Filesystem for Adapter {
                 return;
             }
         };
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.get_lock_async(u64::from(handle), lock).await {
                 Ok(Some(conflict)) => reply.locked(
@@ -1292,7 +1321,7 @@ impl Filesystem for Adapter {
                 return;
             }
         };
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.set_lock_async(u64::from(handle), lock, sleep).await {
                 Ok(()) => reply.ok(),
@@ -1309,7 +1338,7 @@ impl Filesystem for Adapter {
         block: u64,
         reply: ReplyBmap,
     ) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .map_block_async(u64::from(inode), block_size, block)
@@ -1354,7 +1383,7 @@ impl Filesystem for Adapter {
             } else {
                 SeekWhence::Hole
             };
-            let adapter = self.clone();
+            let adapter = self.0.clone();
             self.spawn_callback(async move {
                 match adapter.lseek_async(u64::from(handle), offset, whence).await {
                     Ok(offset) => match i64::try_from(offset) {
@@ -1374,7 +1403,7 @@ impl Filesystem for Adapter {
             reply.error(Errno::ENOTTY);
             return;
         }
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .safe_ioctl_async(u64::from(handle), SafeIoctl::BytesAvailable)
@@ -1399,7 +1428,7 @@ impl Filesystem for Adapter {
         _flags: PollFlags,
         reply: ReplyPoll,
     ) {
-        match self.poll_events(u64::from(handle), events) {
+        match poll_events(self, u64::from(handle), events) {
             Ok(ready) => reply.poll(ready),
             Err(error) => reply.error(errno(&error)),
         }
@@ -1419,7 +1448,7 @@ impl Filesystem for Adapter {
             reply.error(Errno::EOPNOTSUPP);
             return;
         }
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .allocate_async(u64::from(handle), offset, length)
@@ -1452,7 +1481,7 @@ impl Filesystem for Adapter {
                 return;
             }
         };
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.lseek_async(u64::from(handle), offset, whence).await {
                 Ok(offset) => match i64::try_from(offset) {
@@ -1482,7 +1511,7 @@ impl Filesystem for Adapter {
             reply.error(Errno::EINVAL);
             return;
         }
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .copy_file_range_async(
@@ -1505,7 +1534,7 @@ impl Filesystem for Adapter {
 
     fn setvolname(&self, _request: &Request, name: &OsStr, reply: ReplyEmpty) {
         let name = Name::new(name.as_bytes().to_vec());
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.set_volume_name_async(name).await {
                 Ok(()) => reply.ok(),
@@ -1526,7 +1555,7 @@ impl Filesystem for Adapter {
     ) {
         let name = Name::new(name.as_bytes().to_vec());
         let new_name = Name::new(new_name.as_bytes().to_vec());
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter
                 .exchange_data_async(
@@ -1545,7 +1574,7 @@ impl Filesystem for Adapter {
     }
 
     fn getxtimes(&self, _request: &Request, inode: INodeNo, reply: ReplyXTimes) {
-        let adapter = self.clone();
+        let adapter = self.0.clone();
         self.spawn_callback(async move {
             match adapter.getattr_async(u64::from(inode)).await {
                 Ok(metadata) => reply.xtimes(
@@ -1571,14 +1600,14 @@ fn add_capability_if_supported(config: &mut KernelConfig, capability: InitFlags)
 }
 
 fn remove_callback(
-    adapter: &Adapter,
+    adapter: &MacFuseAdapter,
     parent: INodeNo,
     name: &OsStr,
     directory: bool,
     reply: ReplyEmpty,
 ) {
     let name = Name::new(name.as_bytes().to_vec());
-    let owned = adapter.clone();
+    let owned = adapter.adapter().clone();
     adapter.spawn_callback(async move {
         match owned.remove_async(u64::from(parent), name, directory).await {
             Ok(()) => reply.ok(),
@@ -1589,7 +1618,7 @@ fn remove_callback(
 
 #[allow(clippy::too_many_arguments)]
 fn rename_callback(
-    adapter: &Adapter,
+    adapter: &MacFuseAdapter,
     parent: INodeNo,
     name: Name,
     new_parent: INodeNo,
@@ -1597,7 +1626,7 @@ fn rename_callback(
     mode: RenameMode,
     reply: ReplyEmpty,
 ) {
-    let owned = adapter.clone();
+    let owned = adapter.adapter().clone();
     adapter.spawn_callback(async move {
         match owned
             .rename_async(
@@ -1893,6 +1922,26 @@ fn file_type(kind: NodeKind) -> FileType {
         NodeKind::BlockDevice => FileType::BlockDevice,
         NodeKind::Socket => FileType::Socket,
     }
+}
+
+/// Readiness for one open handle. A quicKFS handle is always ready for the
+/// access it was opened with: the adapter buffers writes locally and reads are
+/// demand-fetched, so neither direction can block indefinitely the way a pipe
+/// or device can.
+fn poll_events(
+    adapter: &Adapter,
+    handle: u64,
+    requested: PollEvents,
+) -> Result<PollEvents, AdapterError> {
+    let access = adapter.handle_access(handle)?;
+    let mut ready = PollEvents::empty();
+    if access.can_read() {
+        ready |= PollEvents::POLLIN | PollEvents::POLLRDNORM;
+    }
+    if access.can_write() {
+        ready |= PollEvents::POLLOUT | PollEvents::POLLWRNORM;
+    }
+    Ok(ready & requested)
 }
 
 fn errno(error: &AdapterError) -> Errno {

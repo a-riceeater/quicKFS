@@ -21,3 +21,37 @@ Authenticated reconnect accepts only the same persisted server epoch. Revision-m
 The persistent cache is read-through and read-only while disconnected. It can serve previously authenticated metadata, directory snapshots, symlink targets, statfs results, and revision-keyed byte ranges. Metadata has a memory front tier, while a bounded 256 MiB hot range tier prevents repeated disk reads and integrity checks for slices of the same large cached block. Sequential/copy-sized reads use aligned blocks up to 16 MiB; sub-1 MiB probes are bounded to 1 MiB. Concurrent readers single-flight before persistent lookup or remote fetch and share failures as well as successes. The cache does not cold-start a mount while the server is unavailable and never queues offline mutations. See [caching](caching.md) for why these are deliberate consistency and authorization boundaries rather than missing cache toggles.
 
 Unmount does not perform synchronous network cleanup. Handle closes are best-effort under a short bound, and Control+C falls back to a forced local macFUSE detach if graceful unmount stalls, including when the server has already stopped. A process-level eight-second watchdog bounds even a wedged operating-system unmount call.
+
+## Windows
+
+The Windows client presents the same filesystem through WinFsp and shares every
+layer below the bridge with the macOS client, so read/write, reconnect, cache
+and revision behaviour are identical. Where the two hosts genuinely differ, the
+Windows client states the difference rather than approximating it:
+
+- Lookup is case-insensitive with preserved spelling, using the same exact-bytes
+  first, NFD case-folded second selection the macOS adapter uses. A directory
+  holding two entries that fold together is ambiguous and the lookup is refused.
+- Names Win32 cannot round-trip — those containing `< > : " | ? *` or a control
+  character, ending in a dot or a space, or matching a DOS device name — are
+  refused at creation with `STATUS_OBJECT_NAME_INVALID`. Existing entries with
+  such names, created from a POSIX client, remain listable, readable, renamable
+  and deletable.
+- Names that are not valid UTF-8 have no spelling in the Windows namespace and
+  are omitted from directory listings. They stay reachable from a POSIX client.
+- POSIX modes are mapped onto a protected security descriptor naming only the
+  mounting account, with rights taken from the owner bits. The read-only
+  attribute is the one Windows-visible attribute written back to the mode;
+  hidden, system and archive are presentation only. Group and other bits are not
+  approximated onto any Windows trustee.
+- Symbolic links appear as ordinary files: reparse points are not implemented.
+  Extended attributes, alternate data streams, hard links and `SetSecurity` are
+  not exposed, so macOS resource forks stored as xattrs are not visible from
+  Windows.
+- Errors are translated into the specific `NTSTATUS` values applications branch
+  on. A dropped link reports a device-not-connected status rather than a missing
+  file, and a mutation that may have reached the server before the connection
+  failed is reported as an I/O error and never as a clean failure.
+
+The full mapping and the reasoning behind each choice are in the
+[Windows client guide](windows.md).

@@ -1,0 +1,22 @@
+# Vendored from winfsp_wrs_sys 0.4.1 (MIT, https://github.com/Scille/winfsp_wrs).
+#
+# The only change is in build.rs: upstream resolves the WinFsp import library
+# solely through the HKLM installation registry key and panics when it is
+# absent. quicKFS builds also have to work where the SDK is unpacked without a
+# machine-wide install (CI runners, unprivileged developer machines), so the
+# build script accepts WINFSP_LIB_DIR / WINFSP_INSTALL_DIR first and falls back
+# to the registry. The generated bindings in src/ are upstream's, unmodified.
+[package]
+name = "winfsp_wrs_sys"
+version = "0.4.1"
+edition = "2021"
+license = "MIT"
+description = "WinFSP wrapper for rust"
+repository = "https://github.com/Scille/winfsp_wrs"
+publish = false
+
+[lib]
+doctest = false
+
+[build-dependencies]
+registry = "1.2.3"

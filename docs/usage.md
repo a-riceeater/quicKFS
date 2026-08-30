@@ -1,6 +1,6 @@
 # Usage and command reference
 
-The current tools are a server daemon, diagnostic client, and native macFUSE mount. Run each command with `--help` for generated help.
+The current tools are a server daemon, a diagnostic client, a native macFUSE mount, and a native Windows mount. Run each command with `--help` for generated help.
 
 ## Server administration
 
@@ -260,6 +260,80 @@ umount "$HOME/Volumes/quickfs"
 Without a CA option, the mount reads the same private exact-pin database created by `quickfs-client-cli pair` or `trust import`. `--trust-system-roots` and `--ca-cert` are mutually exclusive. The mount reports read/write only when both server and account gates allow it. Cached data remains readable after a disconnect, but write opens/mutations fail closed and the server must be online to start a mount.
 
 When the end-to-end budget expires, a read-only/idempotent operation returns a timeout (`ETIMEDOUT` at macFUSE). A mutation whose result may already have taken effect returns the existing ambiguous-mutation error (`EIO`) and is never replayed. The fixed 100 ms callback margin is not additional remote-work time; it prevents the callback guard from racing the resilient layer's typed error. Timing out one waiter does not cancel the shared bounded reconnect batch; that reconnect may still restore service for another operation with time left in its own budget.
+
+## Windows `quickfs`
+
+One executable covers the whole Windows lifecycle. It is built separately
+because it links against the WinFsp import library:
+
+```powershell
+cargo build --release -p quickfs-windows-cli
+
+target\release\quickfs.exe pair 127.0.0.1:4433 --pairing-id <id>
+target\release\quickfs.exe mount 127.0.0.1:4433 Q: --username alice
+```
+
+Both the server address and the mountpoint are positional. The mountpoint may
+be a drive letter (`Q:`, `Q`, `Q:\`), an existing empty directory, or `*` for
+the next free letter counting down from `Z:`. The mount runs in the foreground
+and verifies the selected trust policy before the password prompt, reconnects
+under that same policy, and retains one shared Tokio runtime around an
+authenticated reconnecting `RemoteFilesystem` — exactly as the macOS mount does,
+because it is the same code.
+
+Unmount by pressing Control+C in the mount window, or from another window:
+
+```powershell
+quickfs unmount Q:
+```
+
+`unmount` reaches the mounting process through a session-local named event, so
+it works only from the logon session that created the mount and says so when no
+such mount exists. Ejecting the drive in Explorer does not unmount a WinFsp
+volume.
+
+| Option | Environment variable | Default | Purpose |
+| --- | --- | --- | --- |
+| `<SERVER>` | `QUICKFS_SERVER` | Required | Server UDP address, positional. |
+| `<MOUNTPOINT>` | — | Required | Drive letter, directory, or `*`, positional. |
+| `--server-name <NAME>` | — | `localhost` | Logical TLS identity and exact-pin key. |
+| `--state-dir <PATH>` | `QUICKFS_CLIENT_STATE_DIR` | `.quickfs-client` | Exact-pin trust database, and the cache unless `--cache-dir` overrides it. |
+| `--username <NAME>` | `QUICKFS_USERNAME` | Required | Account used to authenticate the retained session. |
+| `--cache-dir <PATH>` | `QUICKFS_CACHE_DIR` | Client state directory | Private persistent offline-read cache. |
+| `--cache-max-bytes <BYTES>` | `QUICKFS_CACHE_MAX_BYTES` | `21474836480` | Hard payload budget for the persistent cache. |
+| `--cache-block-kib <KiB>` | — | `16384` | Sequential/copy read-ahead block size, clamped to the negotiated limit. |
+| `--read-ahead-max-bytes <BYTES>` | `QUICKFS_READ_AHEAD_MAX_BYTES` | `67108864` | Speculative read-ahead ceiling; `0` disables it. |
+| `--transport-timeout-ms <MS>` | — | `60000` | Maximum idle wait for one connection/transport phase. |
+| `--callback-timeout-ms <MS>` | — | `120000` | One hard end-to-end budget per operation, including reconnect and safe retry. |
+| `--reconnect-attempts <COUNT>` | — | `3` | Bounded authenticated reconnect attempts. |
+| `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Use the operating-system public/managed roots. |
+| `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Use an explicit enterprise-CA bundle. |
+| `--volume-name <NAME>` | — | `quicKFS` | Volume label shown in Explorer, at most 32 characters. |
+
+The trust subcommands take the server address positionally and share the trust
+database with the macOS client:
+
+```powershell
+quickfs trust import 127.0.0.1:4433 --sha256 A1:B2:...
+quickfs trust import 127.0.0.1:4433 --certificate server.pem
+quickfs trust list
+quickfs forget 127.0.0.1:4433
+```
+
+`--trust-system-roots` and `--ca-cert` are mutually exclusive and apply only to
+mounting; passing either to a pairing or trust command is refused rather than
+silently ignored. Only `mount` requires WinFsp to be installed, so a machine can
+be paired before the runtime is present.
+
+Timeout behaviour is identical to the macOS mount: a read-only operation that
+exhausts its budget returns a timeout status, and a mutation whose result may
+already have taken effect returns an I/O error and is never replayed.
+
+The Windows client does not provide the diagnostic file subcommands
+(`list`, `stat`, `read`, `write`, and the rest) that `quickfs-client-cli` has on
+macOS; use the mounted drive, or run the diagnostic CLI on another host. See the
+[Windows client guide](windows.md) for the POSIX-to-Windows metadata mapping and
+the platform limitations.
 
 ## Logging and limitations
 

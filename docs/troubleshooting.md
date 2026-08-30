@@ -89,7 +89,9 @@ After five failed attempts on one connection, that connection rejects further at
 
 ## Private state permissions are unsafe
 
-On Unix, the server requires state directories to be owned by its effective user with mode `0700` and private files with mode `0600`; the client applies the same ownership and mode policy to its trust database. Both reject symlinks for private state. Repair a state directory only after verifying that every path is the intended one:
+On Unix, the server requires state directories to be owned by its effective user with mode `0700` and private files with mode `0600`; the client applies the same ownership and mode policy to its trust database and offline cache. Both reject symlinks for private state.
+
+On Windows the equivalent check is on the security descriptor: the owner must be the client account, the DACL must be protected against inherited entries, and every allow-entry must name that account, `LocalSystem`, or `BUILTIN\Administrators`. A store that fails it is refused rather than repaired, because anything that can write the trust database can redirect the mount to a server of its choosing. The usual cause is a state directory copied or restored by another tool, which carries that tool's inherited permissions; move it somewhere only your account can reach, or delete it and pair again. `icacls .quickfs-client` shows what it currently carries. Repair a state directory only after verifying that every path is the intended one:
 
 ```sh
 chmod 700 .quickfs .quickfs/pairings .quickfs-client
@@ -226,6 +228,44 @@ diskutil unmount force "$HOME/Volumes/quickfs"
 The mount performs bounded single-flight reconnect and accepts only the same persisted server epoch. Each caller waits at most `--callback-timeout-ms` across that reconnect and all recovery work, but a reconnect already in progress can outlive a caller's deadline because it remains useful to other callers. Revision-matched handles are reopened and their locks replayed; an ambiguous mutation is never retried. Previously cached reads can continue after a disconnect, but cache misses and all mutations fail closed. A mount cannot cold-start while the server is offline. If reconnect reports an epoch/revision conflict, restore the intended server state or unmount/remount rather than bypassing the stale-state check. Use `quickfs-client-cli` to isolate trust/authentication or remote filesystem problems without creating a mount.
 
 If the GUI or a client command says macFUSE is missing even after installation, verify that `/Library/Filesystems/macfuse.fs/Contents/Info.plist` exists, complete any approval or restart requested by the installer, and launch quicKFS again. The preflight is repeated on every process launch, so there is no cached result to clear.
+
+## WinFsp will not mount
+
+`WinFsp is required to use quicKFS on Windows` means the runtime is missing or
+incomplete; install it from <https://winfsp.dev/>. The check requires both the
+installation registry key and the architecture's DLL, so it also catches a
+partial uninstall.
+
+`WinFsp refused the mount with NTSTATUS 0xC0000035` means the mountpoint is
+already taken — by another quicKFS mount, another WinFsp filesystem, or a real
+drive. `0xC0000034` means WinFsp's user-mode library is present but its kernel
+driver is not registered, which happens after an SDK-only extraction;
+`sc query WinFsp` should report a registered service.
+
+`no quicKFS mount is active on Q: in this session` means the mount belongs to a
+different logon session — commonly it was started from an elevated prompt and
+`unmount` was run from an ordinary one, or the reverse. Stop it from the session
+that created it, or press Control+C in its window.
+
+A mount that ends abruptly leaves nothing behind: WinFsp releases the drive
+letter when the process exits, and a fresh mount on the same letter succeeds.
+
+## Windows refuses a filename
+
+Creating a name containing `< > : " | ? *` or a control character, ending in a
+dot or a space, or matching a DOS device name (`CON`, `NUL`, `COM1`…) fails with
+"the filename, directory name, or volume label syntax is incorrect". This is
+deliberate: Win32 cannot round-trip those names, so a file created under one
+could not afterwards be opened or deleted through Explorer. Files that already
+carry such names, created from a POSIX client, remain listable, readable,
+renamable and deletable.
+
+A file whose name is not valid UTF-8 does not appear in a Windows directory
+listing at all, because the Windows namespace has no spelling for it. Use a
+POSIX client to rename it if it needs to be reachable from Windows.
+
+Opening a file whose directory holds another entry differing only by case fails
+rather than resolving arbitrarily; rename one of them from a POSIX client.
 
 ## An optional filesystem operation returns `ENOTSUP`
 

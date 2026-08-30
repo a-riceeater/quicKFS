@@ -5,6 +5,8 @@ members = [
   "clients/macos/client-cli",
   "clients/macos/client-gui/src-tauri",
   "clients/macos/filesystem-macfuse",
+  "clients/windows/client-cli",
+  "clients/windows/filesystem-winfsp",
   "servers/linux/server-daemon",
 ]
 
@@ -46,6 +48,8 @@ toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+widestring = "1"
+winfsp_wrs = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 zstd = { version = "0.13", default-features = false }
 
@@ -57,6 +61,11 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [patch.crates-io]
+# The published winfsp_wrs_sys build script resolves the WinFsp import library
+# only through the machine-wide HKLM install key. The vendored copy also accepts
+# WINFSP_INSTALL_DIR / WINFSP_LIB_DIR so CI runners and unprivileged developer
+# machines can build against an unpacked SDK.
+winfsp_wrs_sys = { path = "vendor/winfsp_wrs_sys" }
 # fuser 0.17 calls libfuse's obsolete API-25 mount entry point on macOS.
 # macFUSE 5.3 requires the current channel-based mount API instead.
 fuser = { path = "vendor/fuser" }

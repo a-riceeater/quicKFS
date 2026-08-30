@@ -1,6 +1,6 @@
 # quicKFS
 
-quicKFS is an experimental authenticated network filesystem designed for high-latency, intermittent, and long-distance connections. Today, a Linux server exports an existing directory while a macOS client mounts it through macFUSE, letting Finder, command-line tools, and applications such as media editors use ordinary filesystem operations instead of a separate transfer or synchronization workflow.
+quicKFS is an experimental authenticated network filesystem designed for high-latency, intermittent, and long-distance connections. Today, a Linux server exports an existing directory while a macOS client mounts it through macFUSE and a Windows client mounts it through WinFsp, letting Finder, Explorer, command-line tools, and applications such as media editors use ordinary filesystem operations instead of a separate transfer or synchronization workflow.
 
 The transport is a purpose-built versioned protocol over QUIC/TLS. It supports random byte-range I/O, account-gated writes, reconnect with revision-safe handle recovery, persistent read-through caching, stable node identity across daemon restarts, and broad filesystem semantics. The protocol and client-core abstractions are platform-independent, and the long-term goal is first-class quicKFS clients and servers across macOS, Linux, Windows, and other platforms.
 
@@ -46,11 +46,14 @@ The protocol also represents filenames and xattr names as arbitrary bytes. Linux
 ## Architecture
 
 ```text
-Finder / application / CLI
+Finder / Explorer / application / CLI
           │
           ▼
-macFUSE adapter ── stable inode + handle translation
-          │         one shared Tokio runtime
+macFUSE bridge          WinFsp bridge
+          └──────┬──────┘
+                 ▼
+shared filesystem adapter ── stable inode + handle translation
+          │                   one shared Tokio runtime
           ▼
 cached RemoteFilesystem
           │
@@ -67,7 +70,7 @@ Linux server daemon
 descriptor-confined export directory
 ```
 
-The platform adapter depends on the `RemoteFilesystem` interface rather than transport details. The same client pipeline used by the diagnostic CLI is wrapped by reconnect and cache layers and retained by the macFUSE mount for its entire lifetime. One multithread Tokio runtime services asynchronous work from synchronous FUSE callbacks.
+The platform adapter depends on the `RemoteFilesystem` interface rather than transport details. The same client pipeline used by the diagnostic CLI is wrapped by reconnect and cache layers and retained by a mount for its entire lifetime. One multithread Tokio runtime services asynchronous work from the host's synchronous callbacks. The inode and handle tables, the caches, the write-coalescing buffer, and the callback-to-runtime bridge live in one adapter crate that both native bridges drive, so protocol behaviour, caching, and consistency rules are shared rather than reimplemented per platform.
 
 The main components are:
 
@@ -77,8 +80,12 @@ The main components are:
 - `crates/cache`: private persistent metadata, directory, symlink, statfs, and revision-keyed range cache;
 - `crates/server-core`: confined filesystem operations, stable identity, revisions, xattrs, copies, locks, and persistence;
 - `servers/linux/server-daemon`: authentication, authorization, QUIC dispatch, limits, and administration;
+- `crates/fs-adapter`: the platform-neutral inode/handle tables, caches, write buffer, and callback bridge shared by both native clients;
+- `crates/macos-support` and `crates/windows-support`: the per-platform runtime checks and private-state primitives;
 - `clients/macos/filesystem-macfuse`: native macFUSE callbacks and the `quickfs-mount` executable;
-- `clients/macos/client-cli`: trust, authentication, administration, and direct protocol diagnostics.
+- `clients/macos/client-cli`: trust, authentication, administration, and direct protocol diagnostics;
+- `clients/windows/filesystem-winfsp`: native WinFsp callbacks, path and `NTSTATUS` translation, and the Windows mount lifecycle;
+- `clients/windows/client-cli`: the `quickfs` executable — mount, unmount, pairing, and trust management.
 
 See [Architecture](ARCHITECTURE.md) for the crate and trust boundaries.
 
@@ -224,6 +231,23 @@ The mount runs in the foreground. Press Control+C in that terminal to unmount. m
 umount ./mountpoint
 ```
 
+### Mount it on Windows
+
+Install [WinFsp](https://winfsp.dev/rel/) (Core, and Developer if this machine also builds the
+client), then:
+
+```powershell
+cargo build --release -p quickfs-windows-cli
+
+target\release\quickfs.exe pair 127.0.0.1:4433 --pairing-id <id>
+target\release\quickfs.exe mount 127.0.0.1:4433 Q: --username alice
+```
+
+The mount runs in the foreground. Press Control+C in that window, or run
+`quickfs unmount Q:` from another one, to unmount. See the
+[Windows client guide](docs/windows.md) for the mountpoint forms, the POSIX-to-Windows
+metadata mapping, and the Windows-specific limitations.
+
 For remote deployment, enterprise certificates, managed pins, cache tuning, server limits, and every command option, use the [setup guide](docs/setup.md) and [usage reference](docs/usage.md).
 
 ## macOS and macFUSE boundaries
@@ -239,6 +263,10 @@ The adapter retains one enriched directory snapshot for Finder's callback burst 
 
 See [Filesystem semantics](docs/filesystem-semantics.md) for the precise behavior and current host limitations.
 
+## Windows and WinFsp boundaries
+
+Ordinary Explorer and application operations—create, delete, random I/O, rename and move, directory enumeration, truncation, timestamps, and flush—work through the native mount. Windows and POSIX genuinely differ in places, and the client states rather than papers over each one: names Win32 cannot round-trip are refused at creation but stay reachable if the server already holds them, names that are not valid UTF-8 are omitted from listings, symbolic links appear as ordinary files, and extended attributes, alternate data streams, hard links and `SetSecurity` are not exposed. POSIX permissions are mapped onto a security descriptor that grants only the mounting account, with rights taken from the owner mode bits; the server remains the real authorization boundary. The full table is in the [Windows client guide](docs/windows.md).
+
 ## Documentation
 
 - [Setup guide](docs/setup.md)
@@ -246,6 +274,8 @@ See [Filesystem semantics](docs/filesystem-semantics.md) for the precise behavio
 - [Protocol version 6](docs/protocol.md)
 - [Authentication and server trust](docs/authentication.md)
 - [Filesystem semantics](docs/filesystem-semantics.md)
+- [Windows client](docs/windows.md)
+- [Windows integration test plan](docs/windows-integration-tests.md)
 - [Caching and offline behavior](docs/caching.md)
 - [Threat model](docs/threat-model.md)
 - [Troubleshooting](docs/troubleshooting.md)

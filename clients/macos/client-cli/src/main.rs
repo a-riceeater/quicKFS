@@ -4,14 +4,12 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use quickfs_client_core::{
-    MAX_CLIENT_WRITE_SIZE, NetworkFilesystem, RemoteFilesystem, ServerTrust,
-    load_trusted_server_pin, resolve_path, verify_pairing,
+    MAX_CLIENT_WRITE_SIZE, NetworkFilesystem, RemoteFilesystem, ServerTrust, TrustStore,
+    load_trusted_server_pin, parse_sha256_fingerprint, resolve_path, verify_pairing,
 };
 use quickfs_protocol::{AttributeChanges, FileAccess, FileOpenOptions, RenameMode};
 use quickfs_transport_quic::{PairingClient, certificate_sha256, load_certificates};
-use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
     fs,
     io::Read,
     net::SocketAddr,
@@ -20,10 +18,6 @@ use std::{
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
-
-const TRUST_LOCK_FILE: &str = ".trusted-servers.lock";
-const MAX_TRUST_DATABASE_SIZE: u64 = 4 * 1024 * 1024;
-const MAX_TRUSTED_SERVERS: usize = 4_096;
 
 #[derive(Parser)]
 #[command(name = "client-cli")]
@@ -159,18 +153,6 @@ impl Drop for Command {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
-struct TrustDatabase {
-    servers: Vec<TrustedServer>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct TrustedServer {
-    address: SocketAddr,
-    server_name: String,
-    certificate_sha256: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -201,15 +183,18 @@ fn reject_enterprise_flags(cli: &Cli) -> Result<()> {
 }
 
 async fn pair(cli: &Cli, pairing_id: Uuid, code: Option<String>, timeout: Duration) -> Result<()> {
-    ensure_unpaired(&cli.state_dir, cli.server, &cli.server_name)?;
+    let store = TrustStore::open(&cli.state_dir)?;
+    store.ensure_unpinned(cli.server, &cli.server_name)?;
     let code = Zeroizing::new(match code {
         Some(code) => code,
         None => rpassword::prompt_password("Pairing code: ")?,
     });
-    let _trust_lock = lock_trust_store(&cli.state_dir)?;
+    let guard = store.lock()?;
     // The prompt can be arbitrarily long, so acquire the writer lock only
     // afterward and recheck before consuming the server-side pairing record.
-    ensure_unpaired(&cli.state_dir, cli.server, &cli.server_name)?;
+    guard
+        .store()
+        .ensure_unpinned(cli.server, &cli.server_name)?;
     let transport = PairingClient::connect(cli.server, &cli.server_name, timeout)
         .await
         .context("failed to open the temporary pairing connection")?;
@@ -217,7 +202,7 @@ async fn pair(cli: &Cli, pairing_id: Uuid, code: Option<String>, timeout: Durati
         .await
         .context("server pairing verification failed")?;
     transport.close();
-    save_trust_locked(&cli.state_dir, cli.server, &cli.server_name, fingerprint)?;
+    guard.pin(cli.server, &cli.server_name, fingerprint)?;
     println!("Paired with {} ({})", cli.server_name, cli.server);
     println!("Pinned certificate SHA-256: {}", hex::encode(fingerprint));
     Ok(())
@@ -486,286 +471,31 @@ fn manage_trust(cli: &Cli, command: &TrustSubcommand) -> Result<()> {
     }
 }
 
-fn parse_sha256_fingerprint(value: &str) -> Result<[u8; 32]> {
-    let normalized: String = value
-        .chars()
-        .filter(|character| *character != ':' && !character.is_ascii_whitespace())
-        .collect();
-    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("SHA-256 fingerprint must contain exactly 64 hexadecimal digits");
-    }
-    let decoded = hex::decode(normalized)?;
-    decoded
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("SHA-256 fingerprint has the wrong length"))
-}
-
 fn import_trust(
     root: &Path,
     address: SocketAddr,
     server_name: &str,
     fingerprint: [u8; 32],
 ) -> Result<()> {
-    let _trust_lock = lock_trust_store(root)?;
-    ensure_unpaired(root, address, server_name)?;
-    save_trust_locked(root, address, server_name, fingerprint)?;
+    let store = TrustStore::open(root)?;
+    let guard = store.lock()?;
+    guard.store().ensure_unpinned(address, server_name)?;
+    guard.pin(address, server_name, fingerprint)?;
     println!("Imported managed pin for {server_name} ({address}).");
     println!("Pinned certificate SHA-256: {}", hex::encode(fingerprint));
     Ok(())
 }
 
 fn forget(root: &Path, address: SocketAddr, server_name: &str) -> Result<()> {
-    let _trust_lock = lock_trust_store(root)?;
-    let path = trust_path(root);
-    let mut database = read_trust_database(root, &path)?;
-    let previous = database.servers.len();
-    database
-        .servers
-        .retain(|record| record.address != address || record.server_name != server_name);
-    if database.servers.len() == previous {
-        bail!("no pinned identity exists for {server_name} at {address}");
-    }
-    write_private_json(&path, &database)?;
+    let store = TrustStore::open(root)?;
+    store.lock()?.forget(address, server_name)?;
     println!("Removed pinned identity for {server_name} ({address}).");
     println!("A new connection will require pairing or another managed trust method.");
     Ok(())
 }
 
-fn trust_path(root: &Path) -> PathBuf {
-    root.join("trusted-servers.json")
-}
-
-fn ensure_unpaired(root: &Path, address: SocketAddr, server_name: &str) -> Result<()> {
-    let path = trust_path(root);
-    if !path.exists() {
-        return Ok(());
-    }
-    let database = read_trust_database(root, &path)?;
-    if database
-        .servers
-        .iter()
-        .any(|record| record.address == address && record.server_name == server_name)
-    {
-        bail!(
-            "this server already has a pinned identity; use `forget` before deliberate re-pairing"
-        );
-    }
-    Ok(())
-}
-
 fn load_trust(root: &Path, address: SocketAddr, server_name: &str) -> Result<[u8; 32]> {
     load_trusted_server_pin(root, address, server_name).map_err(Into::into)
-}
-
-fn save_trust_locked(
-    root: &Path,
-    address: SocketAddr,
-    server_name: &str,
-    fingerprint: [u8; 32],
-) -> Result<()> {
-    if server_name.is_empty() || server_name.len() > 253 {
-        bail!("server name must contain between 1 and 253 bytes");
-    }
-    fs::create_dir_all(root)?;
-    secure_directory(root)?;
-    let path = trust_path(root);
-    let mut database = if path.exists() {
-        read_trust_database(root, &path)?
-    } else {
-        TrustDatabase::default()
-    };
-    if let Some(record) = database
-        .servers
-        .iter()
-        .find(|record| record.address == address && record.server_name == server_name)
-    {
-        let existing: [u8; 32] = hex::decode(&record.certificate_sha256)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("pinned certificate fingerprint has the wrong length"))?;
-        if existing != fingerprint {
-            bail!(
-                "a different identity is already pinned for this server; remove it explicitly before re-pairing"
-            );
-        }
-        return Ok(());
-    }
-    if database.servers.len() >= MAX_TRUSTED_SERVERS {
-        bail!("client trust database has reached its server limit");
-    }
-    database.servers.push(TrustedServer {
-        address,
-        server_name: server_name.into(),
-        certificate_sha256: hex::encode(fingerprint),
-    });
-    write_private_json(&path, &database)
-}
-
-#[cfg(test)]
-fn save_trust(
-    root: &Path,
-    address: SocketAddr,
-    server_name: &str,
-    fingerprint: [u8; 32],
-) -> Result<()> {
-    let _trust_lock = lock_trust_store(root)?;
-    save_trust_locked(root, address, server_name, fingerprint)
-}
-
-fn write_private_json(path: &Path, value: &TrustDatabase) -> Result<()> {
-    validate_trust_database(value)?;
-    let bytes = serde_json::to_vec_pretty(value)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_TRUST_DATABASE_SIZE {
-        bail!("client trust database exceeds its safety limit");
-    }
-    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    #[cfg(unix)]
-    let result = (|| -> Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    #[cfg(not(unix))]
-    let result = fs::write(&temporary, bytes).map_err(Into::into);
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    Ok(())
-}
-
-fn secure_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir() {
-        bail!("client state path is not a real directory");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        validate_current_owner(path, &metadata)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-struct TrustStoreLock {
-    path: PathBuf,
-    _file: fs::File,
-}
-
-impl Drop for TrustStoreLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn lock_trust_store(root: &Path) -> Result<TrustStoreLock> {
-    fs::create_dir_all(root)?;
-    secure_directory(root)?;
-    let path = root.join(TRUST_LOCK_FILE);
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(&path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            anyhow::anyhow!("another client trust-store operation is in progress")
-        } else {
-            error.into()
-        }
-    })?;
-    Ok(TrustStoreLock { path, _file: file })
-}
-
-fn validate_trust_store(root: &Path, path: &Path) -> Result<()> {
-    let root_metadata =
-        fs::symlink_metadata(root).context("client state directory does not exist")?;
-    if !root_metadata.file_type().is_dir() {
-        bail!("client state path is not a real directory");
-    }
-    let file_metadata =
-        fs::symlink_metadata(path).context("client trust database does not exist")?;
-    if !file_metadata.file_type().is_file() {
-        bail!("client trust database is not a regular file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        validate_current_owner(root, &root_metadata)?;
-        validate_current_owner(path, &file_metadata)?;
-        if root_metadata.permissions().mode() & 0o077 != 0 {
-            bail!("client state directory must not be accessible by group or other users");
-        }
-        if file_metadata.permissions().mode() & 0o077 != 0 {
-            bail!("client trust database must not be accessible by group or other users");
-        }
-    }
-    Ok(())
-}
-
-fn read_trust_database(root: &Path, path: &Path) -> Result<TrustDatabase> {
-    validate_trust_store(root, path)?;
-    let file = fs::File::open(path).context("client trust database does not exist")?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_TRUST_DATABASE_SIZE {
-        bail!("client trust database is not regular or exceeds its safety limit");
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.take(MAX_TRUST_DATABASE_SIZE.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_TRUST_DATABASE_SIZE {
-        bail!("client trust database exceeds its safety limit");
-    }
-    let database: TrustDatabase =
-        serde_json::from_slice(&bytes).context("client trust database is malformed")?;
-    validate_trust_database(&database)?;
-    Ok(database)
-}
-
-fn validate_trust_database(database: &TrustDatabase) -> Result<()> {
-    if database.servers.len() > MAX_TRUSTED_SERVERS {
-        bail!("client trust database contains too many servers");
-    }
-    let mut identities = HashSet::with_capacity(database.servers.len());
-    for record in &database.servers {
-        if record.server_name.is_empty() || record.server_name.len() > 253 {
-            bail!("client trust database contains an invalid server name");
-        }
-        let fingerprint = &record.certificate_sha256;
-        if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!("client trust database contains an invalid certificate fingerprint");
-        }
-        if !identities.insert((record.address, record.server_name.clone())) {
-            bail!("client trust database contains a duplicate server identity");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_current_owner(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
-        bail!(
-            "private client state path '{}' must be owned by the effective client user",
-            path.display()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -775,15 +505,29 @@ mod tests {
 
     #[test]
     fn trust_store_never_replaces_an_identity() {
+        // The store itself is exercised in `quickfs-client-core`; what this
+        // checks is that the CLI's own path still goes through it rather than
+        // around it.
         let directory = tempfile::tempdir().unwrap();
         let address = "127.0.0.1:4433".parse().unwrap();
-        save_trust(directory.path(), address, "localhost", [7; 32]).unwrap();
+        let store = TrustStore::open(directory.path()).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .pin(address, "localhost", [7; 32])
+            .unwrap();
         assert_eq!(
             load_trust(directory.path(), address, "localhost").unwrap(),
             [7; 32]
         );
-        assert!(save_trust(directory.path(), address, "localhost", [8; 32]).is_err());
-        assert!(ensure_unpaired(directory.path(), address, "localhost").is_err());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .pin(address, "localhost", [8; 32])
+                .is_err()
+        );
+        assert!(store.ensure_unpinned(address, "localhost").is_err());
     }
 
     #[test]
@@ -827,35 +571,5 @@ mod tests {
             ])
             .is_err()
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn trust_store_is_private_and_rejects_symlinked_root() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-
-        let directory = tempfile::tempdir().unwrap();
-        let state = directory.path().join("state");
-        let address = "127.0.0.1:4433".parse().unwrap();
-        save_trust(&state, address, "localhost", [7; 32]).unwrap();
-        assert_eq!(
-            fs::metadata(&state).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(trust_path(&state))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-
-        let target = directory.path().join("target");
-        fs::create_dir(&target).unwrap();
-        let linked = directory.path().join("linked");
-        symlink(&target, &linked).unwrap();
-        assert!(save_trust(&linked, address, "localhost", [9; 32]).is_err());
-        assert!(!trust_path(&target).exists());
     }
 }
