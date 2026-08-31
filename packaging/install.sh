@@ -19,7 +19,7 @@
 
 set -eu
 
-REPO="quickfs/quickfs"
+REPO="a-riceeater/quicKFS"
 PROGRAM="quickfs-server-daemon"
 SERVICE="quickfs-server.service"
 SERVICE_NAME="quickfs-server"

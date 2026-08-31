@@ -1,6 +1,6 @@
 [Unit]
 Description=quicKFS server daemon
-Documentation=https://github.com/quickfs/quickfs
+Documentation=https://github.com/a-riceeater/quicKFS
 Documentation=file:/etc/quickfs/quickfs.toml.example
 # QUIC binds a UDP socket, so the address must be configured before start.
 After=network-online.target

@@ -55,7 +55,7 @@ quicKFS does not install, approve, or update the system extension for you. The L
 ## Build
 
 ```sh
-git clone https://github.com/quickfs/quickfs.git
+git clone https://github.com/a-riceeater/quicKFS.git
 cd quickfs
 cargo build --workspace
 ```
@@ -259,9 +259,9 @@ server returned, with no chance to look at it first.
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fLO \
-  https://github.com/quickfs/quickfs/releases/latest/download/quickfs-server-linux-x86_64.tar.gz
+  https://github.com/a-riceeater/quicKFS/releases/latest/download/quickfs-server-linux-x86_64.tar.gz
 curl --proto '=https' --tlsv1.2 -fLO \
-  https://github.com/quickfs/quickfs/releases/latest/download/quickfs-server-linux-x86_64.tar.gz.sha256
+  https://github.com/a-riceeater/quicKFS/releases/latest/download/quickfs-server-linux-x86_64.tar.gz.sha256
 
 sha256sum -c quickfs-server-linux-x86_64.tar.gz.sha256
 tar -xzf quickfs-server-linux-x86_64.tar.gz

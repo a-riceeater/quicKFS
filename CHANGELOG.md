@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 - 2026-08-30
 
 - Make the Linux daemon a securely installable and configurable system service. It was previously a binary you built from source and started by hand with a dozen flags, with no configuration file, no service unit, and no installation mechanism; the documentation said a systemd unit was "planned, not supplied". It now has all three.
 
