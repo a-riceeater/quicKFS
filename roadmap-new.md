@@ -353,8 +353,17 @@ These are a coherent feature, not incremental patches — keep them grouped.
 - **[P2] Health/status surface.** A client-side status command / socket
   (connection state, cache stats, current prefetch windows) and a daemon
   health endpoint.
-- **[P2] Deployment packaging.** systemd unit for the Linux daemon, launchd/pkg
-  for the macOS client, config files, and administrator recovery tooling
+- **[DONE] Linux deployment packaging.** First-class TOML configuration
+  (`/etc/quickfs/quickfs.toml`, `deny_unknown_fields`, an explicit
+  CLI > env > TOML > default resolution step, `config validate` and
+  `config print-effective`), a hardened systemd unit that validates before every
+  start, stable-named release archives with SHA-256 checksums, and a
+  fail-closed `install.sh`/`uninstall.sh` pair that never takes ownership of an
+  export or deletes configuration and state. See `packaging/` and
+  `servers/linux/README.md`.
+- **[P2] Remaining deployment packaging.** Detached cryptographic release
+  signing (checksums today are an integrity check, not an independent trust
+  chain), launchd/pkg for the macOS client, and administrator recovery tooling
   (`docs/roadmap.md` item 4).
 
 ---

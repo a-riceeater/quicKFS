@@ -2,6 +2,124 @@
 
 The current tools are a server daemon, a diagnostic client, a native macFUSE mount, and a native Windows mount. Run each command with `--help` for generated help.
 
+## Configuration file
+
+The Linux daemon reads a TOML configuration. The system path is
+`/etc/quickfs/quickfs.toml`; development invocations name another with
+`--config`:
+
+```sh
+quickfs-server-daemon serve --config ./quickfs.toml
+```
+
+`serve` uses `/etc/quickfs/quickfs.toml` when it exists and no `--config` is
+given, and runs from command-line options alone when it does not. A file named
+explicitly with `--config` or `QUICKFS_CONFIG` must exist.
+
+### Precedence
+
+```text
+explicit CLI option > environment variable > TOML value > built-in default
+```
+
+No `serve` option carries a Clap default, so leaving one out really does defer
+to the file and then to the built-in default rather than pinning it to a value
+nobody chose. `--allow-writes` alone means true and `--allow-writes=false` turns
+it off again, so the command line can override a configured `allow_writes` in
+either direction.
+
+`config print-effective` shows exactly what an invocation resolves to.
+
+### Schema
+
+Unknown keys and unknown sections are **errors**. A mistyped `allow_writess`
+fails validation rather than silently leaving the built-in default in place.
+Paths in the file must be absolute: a relative path in a system service resolves
+against whatever working directory the supervisor happened to use. Values passed
+on the command line may still be relative.
+
+```toml
+[server]
+bind = "0.0.0.0:4433"
+export_root = "/srv/quickfs/export"
+state_dir = "/var/lib/quickfs"
+allow_writes = false
+
+[limits]
+max_read_size = 16777216
+max_write_size = 8388608
+max_open_handles = 1024
+max_known_nodes_per_connection = 131072
+max_total_known_nodes = 524288
+max_directory_entry_tasks = 64
+request_timeout_ms = 120000
+max_concurrent_requests = 128
+max_concurrent_requests_per_connection = 64
+max_in_flight_read_bytes = 134217728
+max_in_flight_write_bytes = 67108864
+max_in_flight_write_bytes_per_connection = 16777216
+max_concurrent_connections = 256
+max_concurrent_auth = 4
+auth_attempts_per_minute = 30
+
+[logging]
+filter = "info"
+```
+
+Every key is optional and every value shown is the built-in default, except
+`server.export_root`, which has none and must come from the file, `--export-root`
+or `QUICKFS_EXPORT_ROOT`. The meaning of each limit is the same as the matching
+`serve` option in the table below. `packaging/quickfs.toml.example` is the same
+schema with a paragraph of rationale per key.
+
+`logging.filter` sets the level when `RUST_LOG` is unset; an explicit `RUST_LOG`
+wins, so an operator can debug a running service without editing the file. An
+unparseable filter fails validation instead of being silently discarded.
+
+The configuration holds deployment paths and policy only. It never holds
+passwords, pairing codes, private keys, or certificate material — those live in
+the protected state directory.
+
+### `config validate`
+
+```sh
+quickfs-server-daemon config validate --config /etc/quickfs/quickfs.toml
+quickfs-server-daemon config validate --config /etc/quickfs/quickfs.toml --require-identity
+```
+
+Parses the whole file, rejects unknown fields, checks the bind address syntax,
+requires an absolute export root that exists and is a directory, rejects any
+nesting between the state and export directories in either direction, rejects
+zero or contradictory limits, validates the log filter, and checks state
+permissions when the state directory exists. It mutates nothing and prints no
+secrets. A nonzero exit means the configuration is unusable.
+
+`--require-identity` additionally demands initialized server state. The systemd
+unit passes it from `ExecStartPre`, so a service whose identity was never
+created fails with that message instead of a TLS load error.
+
+### `config print-effective`
+
+```sh
+quickfs-server-daemon config print-effective --config /etc/quickfs/quickfs.toml
+```
+
+Prints the fully resolved configuration as TOML that could be written back,
+after the same validation. It mutates nothing, exits nonzero for an invalid
+configuration, and redacts secret-bearing values. No configuration field carries
+a secret today; the redaction path exists so one added later cannot leak through
+output an administrator pastes into a bug report.
+
+### Rejected configuration files
+
+For the system-service path the daemon refuses a configuration file that is a
+symbolic link, is not a regular file, is writable by group or other users, or
+sits in a directory other users can write without the sticky bit. Anything able
+to rewrite the configuration can point `export_root` at `/` or move `state_dir`
+somewhere it controls, so this is a privilege boundary. The file is stat'ed,
+opened, and re-stat'ed through the open descriptor with device and inode
+compared, which closes the ordinary check/use race between those steps.
+
 ## Server administration
 
 ### `init`
@@ -15,6 +133,19 @@ quickfs-server-daemon init \
 ```
 
 `--state-dir` defaults to `.quickfs`. Supply `--server-name` more than once when the identity needs multiple names. Initialization refuses to overwrite existing identity files.
+
+`init`, `user`, `pair`, and `identity` all accept `--config <PATH>` instead, so
+a deployment does not have to repeat its state directory:
+
+```sh
+sudo -u quickfs quickfs-server-daemon init \
+  --config /etc/quickfs/quickfs.toml --server-name files.example.net
+```
+
+An explicit `--state-dir` (or `QUICKFS_STATE_DIR`) still overrides the
+configured value, which is what a staging or recovery directory needs. Run these
+as the service account, not as root: state created by root would be owned by the
+wrong user and the daemon would refuse it.
 
 To use a certificate issued by a public or enterprise CA, replace `--server-name` with both external identity inputs:
 
@@ -72,31 +203,45 @@ Validates the replacement chain/key, writes a new protected identity generation,
 ## Server `serve`
 
 ```sh
+quickfs-server-daemon serve --config /etc/quickfs/quickfs.toml
 quickfs-server-daemon serve [OPTIONS] --export-root <PATH>
 ```
 
-| Option | Environment variable | Default | Purpose |
-| --- | --- | --- | --- |
-| `--bind <ADDRESS>` | `QUICKFS_BIND` | `0.0.0.0:4433` | UDP address on which QUIC listens. |
-| `--export-root <PATH>` | `QUICKFS_EXPORT_ROOT` | Required | Directory exposed as remote `/`. |
-| `--state-dir <PATH>` | `QUICKFS_STATE_DIR` | `.quickfs` | Identity, accounts, and pairing state. |
-| `--max-read-size <BYTES>` | — | `16777216` | Largest permitted ranged read. |
-| `--allow-writes` | `QUICKFS_ALLOW_WRITES` | Off | Enable the export-wide write gate; an account write grant is also required. |
-| `--max-write-size <BYTES>` | — | `8388608` | Largest raw write/xattr payload. |
-| `--max-open-handles <COUNT>` | — | `1024` | Maximum tracked open files. |
-| `--max-known-nodes-per-connection <COUNT>` | — | `8192` | Maximum node IDs retained by one connection, including the root. |
-| `--max-total-known-nodes <COUNT>` | — | `65536` | Global budget for retained non-root node IDs across connections. |
-| `--max-directory-entry-tasks <COUNT>` | — | `64` | Global worker bound for concurrent child metadata/xattr discovery. |
-| `--request-timeout-ms <MS>` | — | `120000` | Full request timeout, including cold backing-store work and raw payload transfer. Keep it comfortably above the mount transport-phase timeout. |
-| `--max-concurrent-requests <COUNT>` | — | `128` | Global request concurrency bound. |
-| `--max-in-flight-read-bytes <BYTES>` | — | `134217728` | Global memory budget reserved by concurrent raw reads. |
-| `--max-in-flight-write-bytes <BYTES>` | — | `67108864` | Global raw-write memory budget. |
-| `--max-in-flight-write-bytes-per-connection <BYTES>` | — | `16777216` | Per-connection raw-write memory budget. |
-| `--max-concurrent-connections <COUNT>` | — | `256` | Global accepted-connection bound. |
-| `--max-concurrent-auth <COUNT>` | — | `4` | Global Argon2 worker bound. |
-| `--auth-attempts-per-minute <COUNT>` | — | `30` | Rolling login-attempt limit per source IP (maximum `1000`). |
+The "Default" column is the built-in default, used when neither the command
+line, the environment, nor the configuration file supplies a value. The TOML key
+column gives where the same setting lives in `quickfs.toml`.
 
-Example:
+| Option | Environment variable | TOML key | Default | Purpose |
+| --- | --- | --- | --- | --- |
+| `--config <PATH>` | `QUICKFS_CONFIG` | — | `/etc/quickfs/quickfs.toml` if present | Configuration file. An explicitly named file must exist. |
+| `--bind <ADDRESS>` | `QUICKFS_BIND` | `server.bind` | `0.0.0.0:4433` | UDP address on which QUIC listens. |
+| `--export-root <PATH>` | `QUICKFS_EXPORT_ROOT` | `server.export_root` | Required | Directory exposed as remote `/`. Must exist and be a directory; absolute in a configuration file. |
+| `--state-dir <PATH>` | `QUICKFS_STATE_DIR` | `server.state_dir` | `.quickfs` | Identity, accounts, and pairing state. Must not nest with the export root in either direction. |
+| `--allow-writes[=<BOOL>]` | `QUICKFS_ALLOW_WRITES` | `server.allow_writes` | `false` | Export-wide write gate; an account write grant is also required. |
+| `--max-read-size <BYTES>` | — | `limits.max_read_size` | `16777216` | Largest permitted ranged read. |
+| `--max-write-size <BYTES>` | — | `limits.max_write_size` | `8388608` | Largest raw write/xattr payload. |
+| `--max-open-handles <COUNT>` | — | `limits.max_open_handles` | `1024` | Maximum tracked open files. |
+| `--max-known-nodes-per-connection <COUNT>` | — | `limits.max_known_nodes_per_connection` | `131072` | Live working set of inodes one connection may reference, including the root. Not a file count. |
+| `--max-total-known-nodes <COUNT>` | — | `limits.max_total_known_nodes` | `524288` | Global budget for retained non-root node IDs across connections. |
+| `--max-directory-entry-tasks <COUNT>` | — | `limits.max_directory_entry_tasks` | `64` | Global worker bound for concurrent child metadata/xattr discovery. |
+| `--request-timeout-ms <MS>` | — | `limits.request_timeout_ms` | `120000` | Full request timeout, including cold backing-store work and raw payload transfer. Keep it comfortably above the mount transport-phase timeout. |
+| `--max-concurrent-requests <COUNT>` | — | `limits.max_concurrent_requests` | `128` | Global request concurrency bound. |
+| `--max-concurrent-requests-per-connection <COUNT>` | — | `limits.max_concurrent_requests_per_connection` | `64` | Request tasks one connection may occupy, so one client cannot hold every global slot. |
+| `--max-in-flight-read-bytes <BYTES>` | — | `limits.max_in_flight_read_bytes` | `134217728` | Global memory budget reserved by concurrent raw reads. |
+| `--max-in-flight-write-bytes <BYTES>` | — | `limits.max_in_flight_write_bytes` | `67108864` | Global raw-write memory budget. |
+| `--max-in-flight-write-bytes-per-connection <BYTES>` | — | `limits.max_in_flight_write_bytes_per_connection` | `16777216` | Per-connection raw-write memory budget. |
+| `--max-concurrent-connections <COUNT>` | — | `limits.max_concurrent_connections` | `256` | Global accepted-connection bound. |
+| `--max-concurrent-auth <COUNT>` | — | `limits.max_concurrent_auth` | `4` | Global Argon2 worker bound. |
+| `--auth-attempts-per-minute <COUNT>` | — | `limits.auth_attempts_per_minute` | `30` | Rolling login-attempt limit per source IP (maximum `1000`). |
+| — | `RUST_LOG` | `logging.filter` | `info` in the packaged example | Tracing filter. `RUST_LOG` overrides the configured value. |
+
+Example, from a configuration file:
+
+```sh
+quickfs-server-daemon serve --config /etc/quickfs/quickfs.toml
+```
+
+Example, from the command line during development:
 
 ```sh
 RUST_LOG=info quickfs-server-daemon serve \
@@ -105,6 +250,36 @@ RUST_LOG=info quickfs-server-daemon serve \
   --state-dir /var/lib/quickfs \
   --allow-writes
 ```
+
+## Running as a systemd service
+
+```sh
+sudo systemctl enable --now quickfs-server
+sudo systemctl start quickfs-server
+sudo systemctl stop quickfs-server
+sudo systemctl restart quickfs-server
+systemctl status quickfs-server
+journalctl -u quickfs-server -f
+journalctl -u quickfs-server --since '1 hour ago'
+```
+
+The unit runs
+`/usr/local/bin/quickfs-server-daemon serve --config /etc/quickfs/quickfs.toml`
+as `quickfs:quickfs` with `UMask=0077`, logs to the journal, restarts on
+unexpected failure with a bounded delay and start limit, and shuts down cleanly
+on SIGTERM. `ExecStartPre` runs `config validate --require-identity`, so the
+service refuses to start when the configuration is missing or invalid, the
+export root does not exist, state and export overlap, private state permissions
+are unsafe, or the identity was never initialized.
+
+Special-node creation that needs elevated capabilities is unavailable in the
+default service, because `CapabilityBoundingSet` is empty. The hardening
+choices, the four directives deliberately omitted, and the drop-in an expert
+would write to restore `CAP_MKNOD` — along with what that costs — are documented
+in [servers/linux/README.md](../servers/linux/README.md#systemd-hardening).
+
+Installation, upgrade, and uninstall are covered in the
+[setup guide](setup.md#production-linux-installation).
 
 ## Client options
 

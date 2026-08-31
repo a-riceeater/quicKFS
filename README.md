@@ -151,6 +151,41 @@ On the server, filesystem access is descriptor-relative beneath a retained expor
 
 Login attempts and Argon2 work are bounded, raw bodies are length-checked before allocation, and every request requires an authenticated connection. Current limitations include shared export roots, no immediate revocation of an already authenticated session, no account recovery, limited distributed-guessing defense, and no independent formal audit. Read the full [authentication design](docs/authentication.md), [threat model](docs/threat-model.md), and [security policy](SECURITY.md) before deployment.
 
+## Install the Linux server
+
+A released Linux server installs from a checksum-verified archive, with no Rust
+or Cargo on the target machine:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fLO \
+  https://github.com/quickfs/quickfs/releases/latest/download/quickfs-server-linux-x86_64.tar.gz
+curl --proto '=https' --tlsv1.2 -fLO \
+  https://github.com/quickfs/quickfs/releases/latest/download/quickfs-server-linux-x86_64.tar.gz.sha256
+
+sha256sum -c quickfs-server-linux-x86_64.tar.gz.sha256
+tar -xzf quickfs-server-linux-x86_64.tar.gz
+cd quickfs-server-linux-x86_64
+less install.sh          # read it before running it as root
+sudo ./install.sh
+```
+
+Never pipe an installer into a shell. `install.sh` can also fetch and verify the
+release itself; it downloads over HTTPS only, refuses a redirect that leaves
+HTTPS, checks the SHA-256 before extracting anything, rejects unsafe archive
+members, and fails closed. Supported architectures are `x86_64` and `aarch64` on
+glibc 2.35 or newer.
+
+It installs `/usr/local/bin/quickfs-server-daemon`, a commented
+`/etc/quickfs/quickfs.toml`, private state under `/var/lib/quickfs`, a dedicated
+`quickfs` system account, and a hardened systemd unit that runs
+`config validate` before every start. Exports stay read-only, the installer
+never takes ownership of your export and never opens a firewall port, and
+`uninstall.sh` removes only the binary and the unit — configuration, state,
+accounts, pairing records, the server epoch, and the export are all preserved.
+
+Full walkthrough: [setup guide](docs/setup.md#production-linux-installation) and
+[Linux server notes](servers/linux/README.md).
+
 ## Quick start
 
 Rust/Cargo 1.88 or newer is required. A native macOS mount also requires [macFUSE](https://macfuse.io/) and `pkgconf`.
@@ -269,7 +304,8 @@ Ordinary Explorer and application operations—create, delete, random I/O, renam
 
 ## Documentation
 
-- [Setup guide](docs/setup.md)
+- [Setup guide](docs/setup.md) — including [production Linux installation](docs/setup.md#production-linux-installation)
+- [Linux server deployment and systemd](servers/linux/README.md)
 - [Usage and command reference](docs/usage.md)
 - [Protocol version 6](docs/protocol.md)
 - [Authentication and server trust](docs/authentication.md)

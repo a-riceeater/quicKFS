@@ -2,7 +2,8 @@
 
 quicKFS is currently an experimental authenticated read/write filesystem with fail-closed write authorization and read-only offline caching. Start with the setup guide, then use the command reference to run and inspect a local server.
 
-- [Setup](setup.md): local pairing plus enterprise CA, platform-root, and managed-pin deployment.
+- [Setup](setup.md): local pairing plus enterprise CA, platform-root, and managed-pin deployment, and the [production Linux installation](setup.md#production-linux-installation) path — release archive, TOML configuration, service account, systemd, upgrade and uninstall.
+- [Linux server](../servers/linux/README.md): installed layout, service operation, and the systemd hardening choices.
 - [Usage and command reference](usage.md): server and client commands, environment variables, and operational behavior.
 - [Authentication and server trust](authentication.md): pairing-assisted exact pins, enterprise PKI, user passwords, and connection authentication.
 - [Development](development.md): repository workflow, quality checks, and common development tasks.
@@ -16,4 +17,4 @@ quicKFS is currently an experimental authenticated read/write filesystem with fa
 - [Caching](caching.md): implemented interfaces and planned cache work.
 - [Roadmap](roadmap.md): planned milestones.
 
-Native macFUSE mounting is available behind the `macfuse` feature with reconnect, account-gated writes, xattrs/resource forks, locks, range I/O, capability-gated server-side copies, and persistent offline reads. Native Windows mounting is available through WinFsp with reconnect, account-gated writes, range I/O, and the same persistent offline reads; extended attributes, reparse points and alternate data streams are not exposed there. Cold-start offline mounts, offline writes/conflict resolution, live-session revocation, and production hardening are not implemented.
+The Linux server installs from a checksum-verified release archive with no Rust toolchain on the target, reads `/etc/quickfs/quickfs.toml`, and runs as a hardened systemd service under a dedicated `quickfs` system account; exports stay read-only until both the export-wide gate and a per-account grant are open. Native macFUSE mounting is available behind the `macfuse` feature with reconnect, account-gated writes, xattrs/resource forks, locks, range I/O, capability-gated server-side copies, and persistent offline reads. Native Windows mounting is available through WinFsp with reconnect, account-gated writes, range I/O, and the same persistent offline reads; extended attributes, reparse points and alternate data streams are not exposed there. Cold-start offline mounts, offline writes/conflict resolution, live-session revocation, and production hardening are not implemented.

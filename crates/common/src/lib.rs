@@ -80,9 +80,34 @@ pub fn validate_filename(name: &[u8]) -> Result<(), ValidationError> {
     }
 }
 pub fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
+    init_logging_with_fallback(None);
+}
+
+/// Start tracing, using `fallback` as the filter when the environment supplies
+/// none.
+///
+/// An explicit `RUST_LOG` always wins: a configured `logging.filter` sets the
+/// deployment's normal level, and an operator debugging a running service still
+/// gets what they asked for by exporting `RUST_LOG` without editing the file.
+pub fn init_logging_with_fallback(fallback: Option<&str>) {
+    let filter = match (std::env::var("RUST_LOG"), fallback) {
+        (Ok(explicit), _) if !explicit.is_empty() => tracing_subscriber::EnvFilter::new(explicit),
+        (_, Some(fallback)) if !fallback.is_empty() => tracing_subscriber::EnvFilter::new(fallback),
+        _ => tracing_subscriber::EnvFilter::from_default_env(),
+    };
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+/// Check a filter directive without installing a subscriber.
+///
+/// `EnvFilter::new` is deliberately lossy, so a typo in a configured filter
+/// would otherwise be silently discarded and leave the service logging at a
+/// level nobody chose. `config validate` uses this to reject it up front.
+pub fn validate_log_filter(filter: &str) -> Result<(), String> {
+    tracing_subscriber::EnvFilter::builder()
+        .parse(filter)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

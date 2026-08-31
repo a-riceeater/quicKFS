@@ -1,0 +1,250 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and upload workflow artifacts only; do not touch a GitHub release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    # Ubuntu 22.04 pins the glibc floor at 2.35, which is what the archives
+    # document as their minimum. Building on a newer image would silently raise
+    # it and break older distributions with no error until runtime.
+    #
+    # Each architecture builds on its own native runner rather than
+    # cross-compiling: rustls pulls in aws-lc-sys, whose cross build needs a
+    # matching C toolchain and cmake and is a recurring source of release-only
+    # breakage. If `ubuntu-22.04-arm` is not available to this repository,
+    # replace the aarch64 entry with a `cross`-based build rather than a bare
+    # `--target aarch64-unknown-linux-gnu`.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Confirm the runner architecture matches the target
+        run: |
+          set -eu
+          actual="$(uname -m)"
+          case "${{ matrix.arch }}" in
+            x86_64) expected=x86_64 ;;
+            aarch64) expected=aarch64 ;;
+            *) echo "unknown matrix arch"; exit 1 ;;
+          esac
+          if [ "$actual" != "$expected" ]; then
+            echo "runner reports $actual but this job builds $expected" >&2
+            exit 1
+          fi
+
+      # The daemon and every crate it links are exercised here before anything
+      # is packaged, so a release archive is never produced from a red tree.
+      - name: Run server tests
+        run: >
+          cargo test --locked
+          -p quickfs-server-daemon
+          -p quickfs-server-core
+          -p quickfs-auth
+          -p quickfs-common
+          -p quickfs-protocol
+          -p quickfs-transport-quic
+
+      - name: Build the release binary
+        run: cargo build --release --locked -p quickfs-server-daemon
+
+      - name: Record the package version
+        id: version
+        run: |
+          set -eu
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "quickfs-server-daemon") | .version')"
+          [ -n "$version" ] || { echo "could not read the package version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "quicKFS server version $version"
+
+      - name: Confirm the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/v}"
+          if [ "$tag" != "${{ steps.version.outputs.version }}" ]; then
+            echo "tag v$tag does not match Cargo package version ${{ steps.version.outputs.version }}" >&2
+            exit 1
+          fi
+
+      - name: Smoke-test the binary
+        run: |
+          set -eu
+          binary=target/release/quickfs-server-daemon
+          "$binary" --help >/dev/null
+          "$binary" --version
+          "$binary" --version | grep -q "${{ steps.version.outputs.version }}"
+
+          # A real end-to-end configuration check against a throwaway export.
+          work="$(mktemp -d)"
+          mkdir -p "$work/export" "$work/state"
+          chmod 700 "$work/state"
+          sed -e "s|^export_root = .*|export_root = \"$work/export\"|" \
+              -e "s|^state_dir = .*|state_dir = \"$work/state\"|" \
+              packaging/quickfs.toml.example > "$work/quickfs.toml"
+          chmod 640 "$work/quickfs.toml"
+          "$binary" config validate --config "$work/quickfs.toml"
+          "$binary" config print-effective --config "$work/quickfs.toml" >/dev/null
+          # Not yet initialized, so the service-start check must refuse.
+          if "$binary" config validate --config "$work/quickfs.toml" --require-identity; then
+            echo "--require-identity accepted uninitialized state" >&2
+            exit 1
+          fi
+          rm -r "$work"
+
+      - name: Assemble the archive
+        id: package
+        run: |
+          set -eu
+          name="quickfs-server-linux-${{ matrix.arch }}"
+          stage="$(mktemp -d)/$name"
+          mkdir -p "$stage"
+
+          install -m 0755 target/release/quickfs-server-daemon "$stage/quickfs-server-daemon"
+          install -m 0644 packaging/systemd/quickfs-server.service "$stage/quickfs-server.service"
+          install -m 0644 packaging/quickfs.toml.example "$stage/quickfs.toml.example"
+          install -m 0755 packaging/install.sh "$stage/install.sh"
+          install -m 0755 packaging/uninstall.sh "$stage/uninstall.sh"
+          install -m 0644 packaging/README-install.md "$stage/README-install.md"
+          install -m 0644 LICENSE "$stage/LICENSE"
+          printf '%s\n' "${{ steps.version.outputs.version }}" > "$stage/VERSION"
+          chmod 0644 "$stage/VERSION"
+
+          # Exactly these members, and nothing else. No source tree, no target
+          # directory, no private state, no credentials, no development
+          # certificates.
+          expected="LICENSE README-install.md VERSION install.sh quickfs-server-daemon quickfs-server.service quickfs.toml.example uninstall.sh"
+          actual="$(cd "$stage" && ls -A | sort | tr '\n' ' ' | sed 's/ $//')"
+          if [ "$actual" != "$(printf '%s' "$expected" | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ $//')" ]; then
+            echo "archive contents differ from the expected set:" >&2
+            echo "  expected: $expected" >&2
+            echo "  actual:   $actual" >&2
+            exit 1
+          fi
+
+          # Deterministic-ish: sorted names, fixed owner, no directory noise.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              -czf "$name.tar.gz" -C "$(dirname "$stage")" "$name"
+
+          # The checksum is generated from the final archive, after it exists.
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          sha256sum -c "$name.tar.gz.sha256"
+          echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the archive installs into a DESTDIR
+        run: |
+          set -eu
+          root="$(mktemp -d)"
+          work="$(mktemp -d)"
+          tar -xzf "${{ steps.package.outputs.archive }}" -C "$work"
+          DESTDIR="$root" "$work"/quickfs-server-linux-${{ matrix.arch }}/install.sh --no-interactive
+          test -x "$root/usr/local/bin/quickfs-server-daemon"
+          test -f "$root/etc/quickfs/quickfs.toml"
+          test -f "$root/etc/quickfs/quickfs.toml.example"
+          test -f "$root/etc/systemd/system/quickfs-server.service"
+          test -d "$root/var/lib/quickfs"
+          "$root/usr/local/bin/quickfs-server-daemon" --version
+          DESTDIR="$root" "$work"/quickfs-server-linux-${{ matrix.arch }}/uninstall.sh
+          test ! -e "$root/usr/local/bin/quickfs-server-daemon"
+          test -f "$root/etc/quickfs/quickfs.toml"
+          test -d "$root/var/lib/quickfs"
+
+      - name: Verify the unit
+        run: |
+          set -eu
+          if ! command -v systemd-analyze >/dev/null 2>&1; then
+            echo "systemd-analyze is unavailable on this runner; skipping"
+            exit 0
+          fi
+          # verify resolves User=, Group= and the ExecStart program, so give the
+          # throwaway runner all three. Neither is used to run anything.
+          sudo groupadd --system --force quickfs
+          id quickfs >/dev/null 2>&1 || sudo useradd --system --gid quickfs \
+            --home-dir /var/lib/quickfs --no-create-home --shell /usr/sbin/nologin quickfs
+          sudo install -m 0755 target/release/quickfs-server-daemon /usr/local/bin/quickfs-server-daemon
+          systemd-analyze verify packaging/systemd/quickfs-server.service
+          sudo rm -f /usr/local/bin/quickfs-server-daemon
+
+      # Only complete, checksum-verified pairs are published, so both files are
+      # uploaded together from the same step's output.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickfs-server-linux-${{ matrix.arch }}
+          path: |
+            quickfs-server-linux-${{ matrix.arch }}.tar.gz
+            quickfs-server-linux-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attach assets to the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Re-verify every checksum before publishing
+        run: |
+          set -eu
+          cd artifacts
+          ls -l
+          for checksum in *.tar.gz.sha256; do
+            sha256sum -c "$checksum"
+          done
+          # Both architectures must have produced a complete pair.
+          for arch in x86_64 aarch64; do
+            test -f "quickfs-server-linux-$arch.tar.gz"
+            test -f "quickfs-server-linux-$arch.tar.gz.sha256"
+          done
+
+      - name: Upload assets to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/quickfs-server-linux-x86_64.tar.gz
+            artifacts/quickfs-server-linux-x86_64.tar.gz.sha256
+            artifacts/quickfs-server-linux-aarch64.tar.gz
+            artifacts/quickfs-server-linux-aarch64.tar.gz.sha256
+          fail_on_unmatched_files: true

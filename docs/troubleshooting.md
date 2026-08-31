@@ -110,6 +110,105 @@ administration, identity-installation, or pairing command is still running,
 then remove only the stale lock file. Never delete a lock held by a live
 process.
 
+## The service will not start
+
+`ExecStartPre` runs `config validate --require-identity`, so the unit fails
+before the daemon binds anything. The journal holds the exact reason:
+
+```sh
+systemctl status quickfs-server
+journalctl -u quickfs-server -n 50 --no-pager
+```
+
+Reproduce the same check by hand, which prints the message on its own:
+
+```sh
+sudo -u quickfs /usr/local/bin/quickfs-server-daemon config validate \
+  --config /etc/quickfs/quickfs.toml --require-identity
+```
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `configuration file '…' does not exist` | The unit points at a file that was never created. | Reinstall, or copy `/etc/quickfs/quickfs.toml.example` to `quickfs.toml`. |
+| `failed to parse configuration '…'` with `unknown field` | A misspelled key or section. | Compare against `quickfs.toml.example`. Unknown keys are errors on purpose. |
+| `… must be an absolute path` | A relative path in the configuration file. | Use an absolute path; a service has no meaningful working directory. |
+| `failed to open export root '…'` | The export root does not exist or the service account cannot reach it. | Create it, or grant access without recursive `chown` — see [setup](setup.md#granting-the-daemon-access-to-an-export). |
+| `export root '…' is not a directory` | `export_root` names a file. | Point it at the directory to publish. |
+| `server state directory '…' overlaps export root '…'` | One path contains the other. | Move them into disjoint trees. Weakening this check would publish the private key and password database to every authenticated client. |
+| `server state permissions are unsafe` | State is group- or other-accessible, or a state file is a symlink or not a regular file. | `sudo chown -R quickfs:quickfs /var/lib/quickfs` then `sudo chmod 700 /var/lib/quickfs` and `600` on its files. Check each path first. |
+| `server identity has not been initialized in '…'` | `init` was never run, or was run against another state directory. | `sudo -u quickfs quickfs-server-daemon init --config /etc/quickfs/quickfs.toml --server-name <NAME>`. |
+| `configuration file '…' is a symbolic link` | The system configuration path is a link. | Replace it with a real file. Anything able to redirect that link chooses the daemon's export root. |
+| `configuration file '…' is writable by group or other users` | Mode looser than `0640`. | `sudo chown root:quickfs /etc/quickfs/quickfs.toml && sudo chmod 640 /etc/quickfs/quickfs.toml`. |
+| `logging.filter '…' is invalid` | An unparseable tracing directive. | Use `info`, `warn`, or `quickfs_server_daemon=debug,info`. |
+
+A configuration change takes effect on restart:
+
+```sh
+sudo systemctl restart quickfs-server
+```
+
+If the service starts and then exits repeatedly, the start limit stops it after
+five attempts in two minutes rather than looping. Fix the cause and run
+`sudo systemctl reset-failed quickfs-server` before starting again.
+
+## The service runs but clients cannot reach it
+
+QUIC is UDP. Allow the configured UDP port through the host and network
+firewalls; quicKFS never changes firewall rules for you:
+
+```sh
+sudo ss -lunp | grep 4433               # is the daemon actually listening?
+sudo ufw allow 4433/udp
+sudo firewall-cmd --permanent --add-port=4433/udp && sudo firewall-cmd --reload
+```
+
+Check that `server.bind` is not `127.0.0.1` when clients are remote, and that
+the client's `--server-name` matches the name the identity was created for. A
+successful TCP connection test proves nothing about QUIC reachability.
+
+## Creating a device node fails on the service
+
+The systemd unit runs with an empty `CapabilityBoundingSet`, so `mknod` of
+character and block devices is unavailable by design: it needs `CAP_MKNOD`, and
+a network-facing file server should not hold it. FIFOs and unix sockets need no
+capability and continue to work.
+
+Restoring it is a deliberate, documented override with real consequences — see
+[systemd hardening](../servers/linux/README.md#systemd-hardening).
+
+## The installer refused to continue
+
+Each of these is a fail-closed stop, not a transient error:
+
+- `unsupported architecture '…'` — quicKFS publishes `x86_64` and `aarch64`
+  Linux server archives. Build from source for anything else.
+- `checksum mismatch for '…'` — nothing was extracted or executed. Re-download;
+  if it repeats, do not install the archive.
+- `archive contains a symbolic link` / `hard link` / `device node` / `FIFO`, or
+  `archive member '…' is an absolute path` / `escapes the extraction directory`
+  — the archive is not a quicKFS release archive. Do not extract it by hand.
+- `release payload is missing '…'` — an incomplete archive.
+- `downloaded file '…' is empty` — a truncated transfer.
+- `run this installer as root, or set DESTDIR to stage the layout` — use `sudo`,
+  or `DESTDIR=/tmp/staging ./install.sh --no-systemd` to inspect the layout
+  without touching the system.
+
+Nothing is installed until every check passes, so a failed run leaves an
+existing installation exactly as it was.
+
+## Uninstalling left files behind
+
+That is deliberate. `uninstall.sh` removes only
+`/usr/local/bin/quickfs-server-daemon` and
+`/etc/systemd/system/quickfs-server.service`. It preserves `/etc/quickfs`,
+`/var/lib/quickfs`, the `quickfs` user and group, and your export root, which it
+never reads.
+
+Deleting `/var/lib/quickfs` destroys the server identity and the export epoch:
+every exact-pin client must be paired again, and every client discards its cache
+and reconnects as if to a different server. There is no recovery. The
+uninstaller prints the manual commands if you have decided you want that.
+
 ## A path is not found
 
 Remote paths start at the configured export root, not at the server filesystem root. If the server uses:

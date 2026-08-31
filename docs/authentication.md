@@ -105,6 +105,8 @@ By default, `init --server-name` generates a self-signed identity. Enterprise de
 
 The certificate and private key remain on the server. Pairing/managed-pin clients store only leaf fingerprints; CA clients use centrally provisioned roots. Back up the state directory securely. Anyone obtaining an active private key can impersonate that server to clients whose trust policy accepts its certificate.
 
+In a packaged Linux installation this directory is `/var/lib/quickfs`, owned `quickfs:quickfs` with mode `0700`, and every administrative command below accepts `--config /etc/quickfs/quickfs.toml` instead of a repeated `--state-dir`. Run them as the `quickfs` service account: state created by root would be owned by the wrong user and the daemon would refuse it.
+
 State files are created with mode `0600` and state directories with mode `0700` on Unix. The daemon rejects symlinked, non-regular, incorrectly owned, or group/other-accessible state, including the identity certificate whose integrity must also be protected. It also refuses to start when the state and export directories overlap in either direction, which prevents exposing the private key, password database, or pairing records to authenticated filesystem clients.
 
 ## Password storage and login limits

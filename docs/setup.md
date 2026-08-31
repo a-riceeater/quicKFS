@@ -2,6 +2,10 @@
 
 This guide creates a local server, user account, trusted client, and optionally writable mount. The local walkthrough uses pairing; a later section configures public/enterprise PKI or managed pins without per-client administrator contact. Linux is the deployment server target; the daemon also runs on macOS for development, without Linux-only special-node creation.
 
+Deploying a real Linux server rather than building one? Skip to
+[Production Linux installation](#production-linux-installation). That path uses
+a released archive and needs no Rust or Cargo on the server.
+
 ## How pairing and login fit together
 
 For the default unmanaged-client flow, pairing and login are separate operations:
@@ -23,6 +27,10 @@ The state created by these operations is deliberately split:
 Use the same client `--server` and `--server-name` values during pairing and later commands. For local development their defaults are `127.0.0.1:4433` and `localhost`. For a remote setup, repeat both values on every client command; `QUICKFS_SERVER` can supply the address, while `--server-name` remains explicit. Persist the client state directory rather than pairing anew for each invocation. In CA modes, `--server-name` must match a DNS name or IP address in the certificate.
 
 ## Prerequisites
+
+These prerequisites are for building from source. Installing a released Linux
+server needs none of them — see
+[Production Linux installation](#production-linux-installation).
 
 Install Git and Rust/Cargo 1.88 or newer. Rust 1.85 was the first stable release supporting Rust 2024; the current dependency graph sets the project's supported minimum at 1.88. The repository's `rust-toolchain.toml` selects current stable through rustup.
 
@@ -225,6 +233,262 @@ Keep the window running. When finished, press Control+C there, or run
 deployments, pass the same `--ca-cert` or `--trust-system-roots` option. See the
 [usage reference](usage.md#windows-quickfs) for every option and the
 [Windows client guide](windows.md) for the platform limitations.
+
+## Production Linux installation
+
+The walkthrough above builds from source, which is right for development. A
+Linux server is deployed instead from a released archive: no Rust or Cargo on
+the target machine, a TOML configuration, a dedicated system account, and a
+hardened systemd service.
+
+### Supported platforms
+
+| | |
+| --- | --- |
+| Architectures | `x86_64` (also matched by `amd64`) and `aarch64` (also matched by `arm64`) |
+| libc | glibc 2.35 or newer. The archives are built on Ubuntu 22.04. |
+| Init | systemd, for the supplied unit. The daemon itself runs without one. |
+| Not covered | musl distributions such as Alpine; build from source there. |
+
+An unrecognized architecture is rejected rather than guessed at.
+
+### Download, read, then run
+
+There is deliberately no `curl … | sh` recipe. A pipe hands root to whatever the
+server returned, with no chance to look at it first.
+
+```sh
+curl --proto '=https' --tlsv1.2 -fLO \
+  https://github.com/quickfs/quickfs/releases/latest/download/quickfs-server-linux-x86_64.tar.gz
+curl --proto '=https' --tlsv1.2 -fLO \
+  https://github.com/quickfs/quickfs/releases/latest/download/quickfs-server-linux-x86_64.tar.gz.sha256
+
+sha256sum -c quickfs-server-linux-x86_64.tar.gz.sha256
+tar -xzf quickfs-server-linux-x86_64.tar.gz
+cd quickfs-server-linux-x86_64
+less install.sh
+sudo ./install.sh
+```
+
+`install.sh` also fetches the release itself when no local archive is given:
+
+```sh
+sudo ./install.sh                 # latest release
+sudo ./install.sh --version v0.2.0
+sudo ./install.sh --no-start      # install and configure, do not start
+sudo ./install.sh --archive ./quickfs-server-linux-x86_64.tar.gz
+DESTDIR=/tmp/quickfs-package ./install.sh --no-systemd
+```
+
+It downloads over HTTPS only, refuses a redirect that leaves HTTPS, verifies the
+SHA-256 checksum **before** extracting or executing anything, refuses archive
+members that are absolute paths, contain `..`, or are symlinks, hardlinks,
+devices, FIFOs or sockets, and fails closed on a partial download, a checksum
+mismatch, an unexpected archive layout, an unsupported architecture, or an
+invalid configuration.
+
+Under `DESTDIR` the installer only stages files: it creates no user or group,
+never contacts systemd, and writes nothing outside that directory.
+
+### What the checksums prove
+
+The `.sha256` file comes from the same GitHub release as the archive. It detects
+a truncated or corrupted download and a mirror that altered the bytes. It does
+**not** establish an independent trust chain: anyone able to replace the archive
+in that release could replace the checksum beside it. Detached cryptographic
+release signing is not yet set up for this project, and the installer's
+verification step is structured so a signature check can be added in front of it
+without changing anything else.
+
+### Installed layout
+
+| Path | Owner | Mode | Contents |
+| --- | --- | --- | --- |
+| `/usr/local/bin/quickfs-server-daemon` | `root:root` | `0755` | The daemon |
+| `/etc/quickfs` | `root:quickfs` | `0750` | Configuration directory |
+| `/etc/quickfs/quickfs.toml` | `root:quickfs` | `0640` | Your configuration |
+| `/etc/quickfs/quickfs.toml.example` | `root:quickfs` | `0640` | Documented example, replaced on upgrade |
+| `/var/lib/quickfs` | `quickfs:quickfs` | `0700` | Identity, accounts, pairing records, export epoch |
+| `/etc/systemd/system/quickfs-server.service` | `root:root` | `0644` | The unit |
+
+The daemon refuses to start when its private state is group- or
+other-accessible, and refuses a configuration file that is a symbolic link or is
+writable by group or other users.
+
+### The service account
+
+`quickfs` is a system user and group created with no password, no interactive
+shell, no created home directory, and no supplementary groups. It should own the
+private state directory and nothing else. Everything that account can read or
+write is reachable by a compromise of the network-facing daemon, so giving it
+ownership of unrelated data turns one service bug into access to that data.
+
+### Granting the daemon access to an export
+
+The installer never changes the ownership or permissions of your export, and
+never recursively. Choose one of these deliberately:
+
+```sh
+# 1. A dedicated export owned by the service account.
+sudo install -d -o quickfs -g quickfs -m 0750 /srv/quickfs/export
+
+# 2. A dedicated export whose owning group is quickfs, with the setgid bit so
+#    new files inherit the group.
+sudo chgrp quickfs /srv/quickfs/export
+sudo chmod 2750 /srv/quickfs/export
+
+# 3. A POSIX ACL on existing data, leaving its ownership alone.
+sudo setfacl -m u:quickfs:rx /srv/project-share
+sudo setfacl -d -m u:quickfs:rx /srv/project-share     # for new entries
+
+# 4. Membership of a storage group you chose on purpose.
+sudo usermod -aG media quickfs
+```
+
+Option 4 gives the service everything that group can reach, so pick the group
+knowing that. Do not run `chown -R quickfs` over a share other users or services
+also own.
+
+### Configure
+
+```sh
+sudoedit /etc/quickfs/quickfs.toml
+quickfs-server-daemon config validate --config /etc/quickfs/quickfs.toml
+quickfs-server-daemon config print-effective --config /etc/quickfs/quickfs.toml
+```
+
+`quickfs.toml.example` documents every key. Unknown keys are errors, so a
+mistyped `allow_writess` fails validation instead of silently leaving writes
+disabled in a file that appears to enable them. See the
+[configuration reference](usage.md#configuration-file) for the schema and the
+precedence rules.
+
+### Initialize, add an account, start
+
+```sh
+sudo -u quickfs /usr/local/bin/quickfs-server-daemon init \
+  --config /etc/quickfs/quickfs.toml \
+  --server-name files.example.net
+
+sudo -u quickfs /usr/local/bin/quickfs-server-daemon user add \
+  --config /etc/quickfs/quickfs.toml alice
+
+sudo systemctl enable --now quickfs-server
+systemctl status quickfs-server
+journalctl -u quickfs-server -f
+
+sudo -u quickfs /usr/local/bin/quickfs-server-daemon pair create \
+  --config /etc/quickfs/quickfs.toml
+```
+
+Run these as `quickfs`, not as root: state created by root would be owned by the
+wrong account and the daemon would refuse it. `--config` supplies the state
+directory so it does not have to be repeated; an explicit `--state-dir` still
+wins.
+
+The installer never asks for or creates the first account password, never
+generates a pairing code on your behalf, and never leaves either in a log,
+argument, environment variable or temporary file.
+
+### Read-only by default, and how to enable writes
+
+An export is read-only until **both** gates are open:
+
+```sh
+sudoedit /etc/quickfs/quickfs.toml      # allow_writes = true
+sudo systemctl restart quickfs-server
+sudo -u quickfs /usr/local/bin/quickfs-server-daemon user grant-write \
+  --config /etc/quickfs/quickfs.toml alice
+```
+
+Neither the installer nor the unit enables writes.
+
+### Firewall
+
+QUIC is UDP. Allow the configured UDP port (`4433` by default) through the host
+and network firewalls yourself:
+
+```sh
+sudo ufw allow 4433/udp                                    # ufw
+sudo firewall-cmd --permanent --add-port=4433/udp && sudo firewall-cmd --reload
+```
+
+The installer never changes firewall rules. A successful TCP test does not prove
+QUIC reachability.
+
+### Managing the service
+
+```sh
+sudo systemctl start quickfs-server
+sudo systemctl stop quickfs-server
+sudo systemctl restart quickfs-server
+sudo systemctl reload-or-restart quickfs-server
+systemctl status quickfs-server
+journalctl -u quickfs-server -f
+journalctl -u quickfs-server --since '1 hour ago'
+```
+
+`ExecStartPre` runs `config validate --require-identity`, so the service refuses
+to start — with the reason in the journal — when the configuration is missing or
+invalid, the export root does not exist, state and export overlap, private state
+permissions are unsafe, or the server identity was never initialized. The unit's
+hardening choices, and the four directives deliberately left out, are documented
+in [servers/linux/README.md](../servers/linux/README.md#systemd-hardening),
+along with the override an expert needs for special-node creation and what that
+override costs.
+
+### Back up the state directory
+
+`/var/lib/quickfs` is not reconstructible.
+
+```sh
+sudo systemctl stop quickfs-server
+sudo tar -czf quickfs-state-$(date +%F).tar.gz -C /var/lib quickfs
+sudo systemctl start quickfs-server
+```
+
+Store the archive as securely as the private key it contains. If the state
+directory is lost:
+
+- the **server identity** is gone, so every exact-pin client refuses to connect
+  until it is paired again or given a new managed pin (CA-trusting clients
+  recover once a new certificate for the same name is installed);
+- the **export epoch and node-identity key** are gone, so every client treats
+  the server as a different one, discards its cached metadata and byte ranges,
+  and reconnects cold;
+- **accounts and pairing records** are gone and must be recreated.
+
+There is no recovery path for any of these.
+
+### Upgrade
+
+Run the newer installer. It replaces the binary and unit atomically, refreshes
+`quickfs.toml.example`, validates the configuration with the new binary,
+reloads systemd, and restarts only after validation succeeds. It preserves
+`quickfs.toml`, `/var/lib/quickfs`, the certificate identity, accounts, pairing
+records, and the server epoch. If the download, checksum, extraction,
+installation, or validation fails, nothing is replaced and the running
+installation keeps working.
+
+Clients and the server must share the protocol **major** version, which keys the
+ALPN. Same-major minor differences negotiate, so a `6.4` daemon serves a `6.0`
+client. Coordinate a client and server upgrade only when the major changes.
+
+### Uninstall
+
+```sh
+sudo ./uninstall.sh
+```
+
+It stops and disables the service, removes only the installed binary and unit,
+and reloads systemd. It preserves `/etc/quickfs` (including your
+`quickfs.toml`), `/var/lib/quickfs`, the `quickfs` user and group, and your
+export root, which it never reads and never touches. Reinstalling later reuses
+all of it, so clients do not need to be paired again.
+
+There is no `--purge`. The script prints the exact manual commands for removing
+configuration and state, and what that costs, so the decision and the paths are
+both yours.
 
 ## Enterprise setup without per-client pairing
 

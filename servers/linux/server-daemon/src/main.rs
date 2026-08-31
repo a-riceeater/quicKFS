@@ -8,7 +8,7 @@ use quickfs_auth::{
     load_pairing, remove_user, set_user_enabled, set_user_writable, validate_server_state,
     validate_username, verify_user_authorization,
 };
-use quickfs_common::{DEFAULT_MAX_READ_SIZE, DEFAULT_MAX_WRITE_SIZE, Limits, init_logging};
+use quickfs_common::{Limits, init_logging, init_logging_with_fallback};
 use quickfs_protocol::*;
 use quickfs_server_core::{Export, ExportSession};
 use quickfs_transport_quic::{
@@ -25,17 +25,25 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, Semaphore, oneshot};
+
+mod config;
+use config::ServerConfig;
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Parser)]
-#[command(name = "server-daemon")]
+#[command(
+    name = "quickfs-server-daemon",
+    version,
+    about = "quicKFS Linux server daemon"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 #[derive(Subcommand)]
 enum Command {
-    Serve(Serve),
+    /// Serve the configured export over QUIC.
+    Serve(Box<config::ServeArgs>),
     /// Create persistent server identity and authentication state.
     Init(Init),
     /// Manage user accounts.
@@ -44,12 +52,40 @@ enum Command {
     Pair(PairCommand),
     /// Install a renewed or replacement server certificate identity.
     Identity(IdentityCommand),
+    /// Inspect the TOML configuration without changing anything.
+    Config(ConfigCommand),
+}
+
+// The `--config`/`--state-dir` pair shared by every administrative command.
+//
+// `--config` exists so an administrator does not have to repeat the deployment
+// state directory on every `init`, `user`, `pair`, and `identity` invocation.
+// An explicit `--state-dir` (or `QUICKFS_STATE_DIR`) still wins, so a staging
+// or recovery directory can be named directly.
+//
+// Deliberately not a doc comment: Clap uses a flattened struct's documentation
+// as the description of every subcommand that flattens it, which would replace
+// each command's own one-line summary with this paragraph.
+#[derive(clap::Args, Clone, Debug, Default)]
+struct StateSelection {
+    /// Configuration file supplying `server.state_dir`.
+    #[arg(long, env = "QUICKFS_CONFIG", value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Private server state directory. Overrides the configured value.
+    #[arg(long, env = "QUICKFS_STATE_DIR", value_name = "PATH")]
+    state_dir: Option<PathBuf>,
+}
+
+impl StateSelection {
+    fn resolve(&self) -> Result<PathBuf> {
+        config::resolve_state_dir(self.state_dir.as_deref(), self.config.as_deref())
+    }
 }
 
 #[derive(clap::Args)]
 struct Init {
-    #[arg(long, default_value = ".quickfs")]
-    state_dir: PathBuf,
+    #[command(flatten)]
+    state: StateSelection,
     #[arg(
         long = "server-name",
         required_unless_present = "certificate",
@@ -82,41 +118,46 @@ struct UserCommand {
 
 #[derive(Subcommand)]
 enum UserSubcommand {
+    /// Create an account, prompting twice for a hidden password.
     Add {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         username: String,
     },
+    /// Set a new password for an existing account.
     Password {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         username: String,
     },
+    /// Allow this account to log in again.
     Enable {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         username: String,
     },
+    /// Refuse new logins for this account. Live connections are not revoked.
     Disable {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         username: String,
     },
+    /// Remove this account. Live connections are not revoked.
     Delete {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         username: String,
     },
     /// Permit this user to mutate exports started with --allow-writes.
     GrantWrite {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         username: String,
     },
     /// Return this user to read-only access.
     RevokeWrite {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         username: String,
     },
 }
@@ -129,9 +170,10 @@ struct PairCommand {
 
 #[derive(Subcommand)]
 enum PairSubcommand {
+    /// Create a single-use pairing ID and code for one client.
     Create {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         #[arg(long, default_value_t = 300)]
         expires_seconds: u64,
     },
@@ -147,8 +189,8 @@ struct IdentityCommand {
 enum IdentitySubcommand {
     /// Validate and atomically activate an externally issued identity.
     Install {
-        #[arg(long, default_value = ".quickfs")]
-        state_dir: PathBuf,
+        #[command(flatten)]
+        state: StateSelection,
         /// PEM leaf certificate followed by any intermediate certificates.
         #[arg(long, value_name = "PEM")]
         certificate: PathBuf,
@@ -157,75 +199,98 @@ enum IdentitySubcommand {
         private_key: PathBuf,
     },
 }
-#[derive(clap::Args, Clone)]
-struct Serve {
-    #[arg(long, env = "QUICKFS_BIND", default_value = "0.0.0.0:4433")]
-    bind: SocketAddr,
-    #[arg(long, env = "QUICKFS_EXPORT_ROOT")]
-    export_root: PathBuf,
-    #[arg(long, env = "QUICKFS_STATE_DIR", default_value = ".quickfs")]
-    state_dir: PathBuf,
-    #[arg(long,default_value_t=DEFAULT_MAX_READ_SIZE)]
-    max_read_size: u64,
-    /// Permit mutating filesystem requests. Exports are read-only by default.
-    #[arg(long, env = "QUICKFS_ALLOW_WRITES", default_value_t = false)]
-    allow_writes: bool,
-    #[arg(long, default_value_t = DEFAULT_MAX_WRITE_SIZE)]
-    max_write_size: u64,
-    #[arg(long, default_value_t = 1024)]
-    max_open_handles: usize,
-    // The per-connection ceiling on distinct inodes one client may reference at
-    // once (its live working set), not a limit on files in the export. macOS
-    // keeps a large kernel vnode cache, so a Finder/Spotlight/`find` crawl over
-    // a big media library legitimately holds tens of thousands of live inodes on
-    // a single mount, and `auto_xattr` roughly doubles that by tracking `._`
-    // AppleDouble sidecars. 8192 (the historical default) was sized for small
-    // exports and starved such workloads with "too many known nodes". The
-    // semaphore backing this is counter-based, so a higher ceiling costs nothing
-    // until nodes are actually tracked (~400-500 bytes each). See docs/protocol.md.
-    #[arg(long, default_value_t = 131_072)]
-    max_known_nodes_per_connection: usize,
-    #[arg(long, default_value_t = 524_288)]
-    max_total_known_nodes: usize,
-    /// Aggregate metadata/xattr workers used across directory requests.
-    #[arg(long, default_value_t = 64)]
-    max_directory_entry_tasks: usize,
-    /// End-to-end request deadline, including cold backing-store work and raw
-    /// payload transfer. This must comfortably exceed the mount's transport
-    /// phase deadline so a slow read is not canceled while still progressing.
-    #[arg(long, default_value_t = 120_000)]
-    request_timeout_ms: u64,
-    #[arg(long, default_value_t = 128)]
-    max_concurrent_requests: usize,
-    /// Concurrent request tasks one connection may occupy. Keeps a single
-    /// slow or hostile client from holding every global request slot.
-    #[arg(long, default_value_t = 64)]
-    max_concurrent_requests_per_connection: usize,
-    #[arg(long, default_value_t = 128 * 1024 * 1024)]
-    max_in_flight_read_bytes: usize,
-    /// Aggregate memory reserved for write request bodies across all clients.
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
-    max_in_flight_write_bytes: usize,
-    /// Memory reserved for write bodies from any one client connection.
-    #[arg(long, default_value_t = 16 * 1024 * 1024)]
-    max_in_flight_write_bytes_per_connection: usize,
-    #[arg(long, default_value_t = 256)]
-    max_concurrent_connections: usize,
-    #[arg(long, default_value_t = 4)]
-    max_concurrent_auth: usize,
-    #[arg(long, default_value_t = 30)]
-    auth_attempts_per_minute: usize,
+
+#[derive(clap::Args)]
+struct ConfigCommand {
+    #[command(subcommand)]
+    command: ConfigSubcommand,
 }
+
+#[derive(Subcommand)]
+enum ConfigSubcommand {
+    /// Parse and check a configuration file. Mutates nothing.
+    Validate {
+        #[command(flatten)]
+        args: Box<config::ServeArgs>,
+        /// Also require an initialized server identity, exactly as the daemon
+        /// does at startup. The systemd unit passes this from ExecStartPre.
+        #[arg(long)]
+        require_identity: bool,
+    },
+    /// Print the fully resolved configuration. Mutates nothing.
+    PrintEffective {
+        #[command(flatten)]
+        args: Box<config::ServeArgs>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_logging();
     let Cli { command } = Cli::parse();
     match command {
-        Command::Serve(c) => serve(c).await,
-        Command::Init(c) => init(c),
-        Command::User(c) => manage_user(c),
-        Command::Pair(c) => manage_pairing(c),
-        Command::Identity(c) => manage_identity(c),
+        Command::Serve(args) => {
+            let resolved = config::load_and_resolve(&args)?;
+            // Logging comes up after resolution so `logging.filter` can supply
+            // the default level; an explicit RUST_LOG still wins.
+            init_logging_with_fallback(resolved.log_filter.as_deref());
+            serve(resolved).await
+        }
+        Command::Init(c) => {
+            init_logging();
+            init(c)
+        }
+        Command::User(c) => {
+            init_logging();
+            manage_user(c)
+        }
+        Command::Pair(c) => {
+            init_logging();
+            manage_pairing(c)
+        }
+        Command::Identity(c) => {
+            init_logging();
+            manage_identity(c)
+        }
+        Command::Config(c) => {
+            init_logging();
+            manage_config(c)
+        }
+    }
+}
+
+/// `config validate` and `config print-effective`.
+///
+/// Both default to the system configuration path and treat it as explicitly
+/// named, so a missing `/etc/quickfs/quickfs.toml` is an error here even though
+/// `serve` may legitimately run without one during development.
+fn manage_config(command: ConfigCommand) -> Result<()> {
+    match command.command {
+        ConfigSubcommand::Validate {
+            mut args,
+            require_identity,
+        } => {
+            default_config_path(&mut args);
+            let resolved = config::load_and_resolve(&args)?;
+            config::validate(&resolved, require_identity)?;
+            match &resolved.source {
+                Some(path) => println!("Configuration '{}' is valid.", path.display()),
+                None => println!("Configuration is valid."),
+            }
+            Ok(())
+        }
+        ConfigSubcommand::PrintEffective { mut args } => {
+            default_config_path(&mut args);
+            let resolved = config::load_and_resolve(&args)?;
+            config::validate(&resolved, false)?;
+            print!("{}", config::print_effective(&resolved));
+            Ok(())
+        }
+    }
+}
+
+fn default_config_path(args: &mut config::ServeArgs) {
+    if args.config.is_none() {
+        args.config = Some(PathBuf::from(config::DEFAULT_CONFIG_PATH));
     }
 }
 
@@ -252,10 +317,11 @@ fn load_external_identity(
 fn manage_identity(command: IdentityCommand) -> Result<()> {
     match command.command {
         IdentitySubcommand::Install {
-            state_dir,
+            state,
             certificate,
             private_key,
         } => {
+            let state_dir = state.resolve()?;
             let (certificate_pem, private_key_pem) =
                 load_external_identity(&certificate, &private_key)?;
             let paths = install_identity(&state_dir, &certificate_pem, &private_key_pem)
@@ -273,11 +339,13 @@ fn manage_identity(command: IdentityCommand) -> Result<()> {
 
 fn init(command: Init) -> Result<()> {
     let Init {
-        state_dir,
+        state,
         server_names,
         certificate,
         private_key,
     } = command;
+    let state_dir = state.resolve()?;
+    let config_hint = state.config.clone();
     let paths = match (certificate, private_key) {
         (Some(certificate), Some(private_key)) => {
             let (certificate_pem, private_key_pem) =
@@ -291,74 +359,69 @@ fn init(command: Init) -> Result<()> {
     println!("Initialized quicKFS server state:");
     println!("  certificate: {}", paths.certificate.display());
     println!("  private key: {}", paths.private_key.display());
-    println!("Next, add a user with `server-daemon user add <USERNAME>`.");
+    match &config_hint {
+        Some(config) => println!(
+            "Next, add a user with `quickfs-server-daemon user add --config {} <USERNAME>`.",
+            config.display()
+        ),
+        None => println!(
+            "Next, add a user with `quickfs-server-daemon user add --state-dir {} <USERNAME>`.",
+            state_dir.display()
+        ),
+    }
     Ok(())
 }
 
 fn manage_user(command: UserCommand) -> Result<()> {
     match command.command {
-        UserSubcommand::Add {
-            state_dir,
-            username,
-        } => {
+        UserSubcommand::Add { state, username } => {
+            let state_dir = state.resolve()?;
             let password = prompt_new_password()?;
             add_user(&state_dir, &username, password.as_bytes())
                 .with_context(|| format!("failed to add user '{username}'"))?;
             println!("Added user '{username}'.");
             Ok(())
         }
-        UserSubcommand::Password {
-            state_dir,
-            username,
-        } => {
+        UserSubcommand::Password { state, username } => {
+            let state_dir = state.resolve()?;
             let password = prompt_new_password()?;
             change_password(&state_dir, &username, password.as_bytes())
                 .with_context(|| format!("failed to change password for '{username}'"))?;
             println!("Changed password for '{username}'.");
             Ok(())
         }
-        UserSubcommand::Enable {
-            state_dir,
-            username,
-        } => {
+        UserSubcommand::Enable { state, username } => {
+            let state_dir = state.resolve()?;
             set_user_enabled(&state_dir, &username, true)?;
             println!("Enabled user '{username}'.");
             Ok(())
         }
-        UserSubcommand::Disable {
-            state_dir,
-            username,
-        } => {
+        UserSubcommand::Disable { state, username } => {
+            let state_dir = state.resolve()?;
             set_user_enabled(&state_dir, &username, false)?;
             println!(
                 "Disabled user '{username}'. Existing authenticated connections are not revoked."
             );
             Ok(())
         }
-        UserSubcommand::Delete {
-            state_dir,
-            username,
-        } => {
+        UserSubcommand::Delete { state, username } => {
+            let state_dir = state.resolve()?;
             remove_user(&state_dir, &username)?;
             println!(
                 "Deleted user '{username}'. Existing authenticated connections are not revoked."
             );
             Ok(())
         }
-        UserSubcommand::GrantWrite {
-            state_dir,
-            username,
-        } => {
+        UserSubcommand::GrantWrite { state, username } => {
+            let state_dir = state.resolve()?;
             set_user_writable(&state_dir, &username, true)?;
             println!(
                 "Granted write access to '{username}'. The daemon must also be started with --allow-writes."
             );
             Ok(())
         }
-        UserSubcommand::RevokeWrite {
-            state_dir,
-            username,
-        } => {
+        UserSubcommand::RevokeWrite { state, username } => {
+            let state_dir = state.resolve()?;
             set_user_writable(&state_dir, &username, false)?;
             println!(
                 "Revoked write access from '{username}'. Existing authenticated connections are not revoked."
@@ -380,9 +443,10 @@ fn prompt_new_password() -> Result<Zeroizing<String>> {
 fn manage_pairing(command: PairCommand) -> Result<()> {
     match command.command {
         PairSubcommand::Create {
-            state_dir,
+            state,
             expires_seconds,
         } => {
+            let state_dir = state.resolve()?;
             let pairing = create_pairing(&state_dir, Duration::from_secs(expires_seconds))?;
             println!("Pairing ID: {}", pairing.id);
             println!("Pairing code: {}", pairing.code);
@@ -395,33 +459,26 @@ fn manage_pairing(command: PairCommand) -> Result<()> {
     }
 }
 
-async fn serve(c: Serve) -> Result<()> {
+async fn serve(c: ServerConfig) -> Result<()> {
     serve_until(c, shutdown_signal(), None).await
 }
 
 async fn serve_until<F>(
-    c: Serve,
+    c: ServerConfig,
     shutdown: F,
     ready: Option<oneshot::Sender<SocketAddr>>,
 ) -> Result<()>
 where
     F: Future<Output = ()>,
 {
-    validate_configuration(&c)?;
-
-    let state_root = tokio::fs::canonicalize(&c.state_dir)
+    // Exactly the checks `config validate` performs, so a unit whose
+    // ExecStartPre passed cannot then fail differently in ExecStart, and a
+    // development invocation with no configuration file gets the same rules.
+    c.validate_limits()?;
+    let (state_root, export_root) = c.resolve_roots()?;
+    tokio::fs::metadata(&state_root)
         .await
-        .with_context(|| format!("failed to open state directory '{}'", c.state_dir.display()))?;
-    let export_root = tokio::fs::canonicalize(&c.export_root)
-        .await
-        .with_context(|| format!("failed to open export root '{}'", c.export_root.display()))?;
-    if state_root.starts_with(&export_root) || export_root.starts_with(&state_root) {
-        bail!(
-            "server state directory '{}' overlaps export root '{}'; this could expose private authentication state",
-            state_root.display(),
-            export_root.display()
-        );
-    }
+        .with_context(|| format!("failed to open state directory '{}'", state_root.display()))?;
     validate_server_state(&state_root).context("server state permissions are unsafe")?;
 
     let state_paths = StatePaths::resolve(state_root.clone())
@@ -599,89 +656,6 @@ where
                 break;
             }
         }
-    }
-    Ok(())
-}
-
-fn validate_configuration(c: &Serve) -> Result<()> {
-    if c.max_read_size == 0 {
-        bail!("maximum read size must be greater than zero");
-    }
-    if c.max_write_size == 0 {
-        bail!("maximum write size must be greater than zero");
-    }
-    if c.max_open_handles == 0 {
-        bail!("maximum open handles must be greater than zero");
-    }
-    if c.max_known_nodes_per_connection == 0 {
-        bail!("maximum known nodes per connection must be greater than zero");
-    }
-    if c.max_total_known_nodes == 0
-        || c.max_known_nodes_per_connection.saturating_sub(1) > c.max_total_known_nodes
-    {
-        bail!("total known-node capacity must cover at least one connection");
-    }
-    if c.request_timeout_ms == 0 {
-        bail!("request timeout must be greater than zero milliseconds");
-    }
-    if c.max_directory_entry_tasks == 0 {
-        bail!("maximum directory entry tasks must be greater than zero");
-    }
-    if c.max_concurrent_requests == 0 {
-        bail!("maximum concurrent requests must be greater than zero");
-    }
-    if c.max_concurrent_requests_per_connection == 0 {
-        bail!("maximum concurrent requests per connection must be greater than zero");
-    }
-    if c.max_in_flight_read_bytes == 0 {
-        bail!("maximum in-flight read bytes must be greater than zero");
-    }
-    if c.max_in_flight_write_bytes == 0 || c.max_in_flight_write_bytes_per_connection == 0 {
-        bail!("global and per-connection in-flight write-byte budgets must be greater than zero");
-    }
-    if c.max_read_size > u32::MAX.into()
-        || usize::try_from(c.max_read_size).is_err()
-        || c.max_read_size as usize > c.max_in_flight_read_bytes
-    {
-        bail!(
-            "maximum read size must fit within the configured in-flight read-byte budget and u32"
-        );
-    }
-    if c.max_write_size > u32::MAX.into()
-        || usize::try_from(c.max_write_size).is_err()
-        || c.max_write_size as usize > c.max_in_flight_write_bytes
-        || c.max_write_size as usize > c.max_in_flight_write_bytes_per_connection
-    {
-        bail!("maximum write size must fit within both in-flight write-byte budgets and u32");
-    }
-    if c.max_in_flight_write_bytes_per_connection > c.max_in_flight_write_bytes {
-        bail!("per-connection write-byte budget must not exceed the global write-byte budget");
-    }
-    if c.max_open_handles > Semaphore::MAX_PERMITS
-        || c.max_known_nodes_per_connection > Semaphore::MAX_PERMITS
-        || c.max_total_known_nodes > Semaphore::MAX_PERMITS
-        || c.max_directory_entry_tasks > Semaphore::MAX_PERMITS
-        || c.max_concurrent_requests > Semaphore::MAX_PERMITS
-        || c.max_concurrent_requests_per_connection > Semaphore::MAX_PERMITS
-        || c.max_concurrent_connections > Semaphore::MAX_PERMITS
-        || c.max_concurrent_auth > Semaphore::MAX_PERMITS
-        || c.max_in_flight_read_bytes > Semaphore::MAX_PERMITS
-        || c.max_in_flight_write_bytes > Semaphore::MAX_PERMITS
-        || c.max_in_flight_write_bytes_per_connection > Semaphore::MAX_PERMITS
-    {
-        bail!("configured concurrency exceeds the runtime semaphore limit");
-    }
-    if c.max_concurrent_connections == 0 {
-        bail!("maximum concurrent connections must be greater than zero");
-    }
-    if c.max_concurrent_auth == 0 {
-        bail!("maximum concurrent authentication tasks must be greater than zero");
-    }
-    if c.auth_attempts_per_minute == 0 {
-        bail!("authentication attempts per minute must be greater than zero");
-    }
-    if c.auth_attempts_per_minute > 1_000 {
-        bail!("authentication attempts per minute must not exceed 1000");
     }
     Ok(())
 }
@@ -1840,14 +1814,14 @@ mod tests {
         state_dir: &std::path::Path,
         export_root: &std::path::Path,
         timeout: u64,
-    ) -> Serve {
-        Serve {
+    ) -> ServerConfig {
+        ServerConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             export_root: export_root.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
-            max_read_size: DEFAULT_MAX_READ_SIZE,
+            max_read_size: quickfs_common::DEFAULT_MAX_READ_SIZE,
             allow_writes: false,
-            max_write_size: DEFAULT_MAX_WRITE_SIZE,
+            max_write_size: quickfs_common::DEFAULT_MAX_WRITE_SIZE,
             max_open_handles: 8,
             max_known_nodes_per_connection: 128,
             max_total_known_nodes: 512,
@@ -1861,6 +1835,8 @@ mod tests {
             max_concurrent_connections: 32,
             max_concurrent_auth: 2,
             auth_attempts_per_minute: 100,
+            log_filter: None,
+            source: None,
         }
     }
 
@@ -2372,7 +2348,10 @@ mod tests {
         assert!(capabilities.writable);
         assert!(capabilities.supports_locks);
         assert!(capabilities.supports_atomic_rename);
-        assert_eq!(capabilities.max_write_size, DEFAULT_MAX_WRITE_SIZE);
+        assert_eq!(
+            capabilities.max_write_size,
+            quickfs_common::DEFAULT_MAX_WRITE_SIZE
+        );
         assert!(first.stat_filesystem().await.unwrap().block_size > 0);
 
         let options = FileOpenOptions {
@@ -3088,7 +3067,7 @@ mod tests {
                 Request::WriteRange {
                     handle,
                     offset: 0,
-                    length: DEFAULT_MAX_WRITE_SIZE + 1,
+                    length: quickfs_common::DEFAULT_MAX_WRITE_SIZE + 1,
                 },
             )
             .await,

@@ -1,0 +1,116 @@
+[Unit]
+Description=quicKFS server daemon
+Documentation=https://github.com/quickfs/quickfs
+Documentation=file:/etc/quickfs/quickfs.toml.example
+# QUIC binds a UDP socket, so the address must be configured before start.
+After=network-online.target
+Wants=network-online.target
+# Bounded restarts: a permanently broken configuration stops rather than
+# looping forever. These live in [Unit]; systemd deprecated them in [Service].
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=exec
+
+# Dedicated unprivileged system identity. It owns the private state directory
+# and nothing else; it must never own unrelated data, because anything it can
+# write is reachable by a compromise of the network-facing daemon.
+User=quickfs
+Group=quickfs
+
+# 0077 so anything the daemon creates in its state directory is owner-only,
+# which is what the daemon's own private-state validation requires.
+UMask=0077
+
+# Fail before the service is reported as started when the configuration is
+# missing, unparseable, contradictory, points at a missing export root, overlaps
+# the state directory, has unsafe private-state permissions, or has no server
+# identity yet. No shell, no interpolation - argv is fixed.
+ExecStartPre=/usr/local/bin/quickfs-server-daemon config validate --config /etc/quickfs/quickfs.toml --require-identity
+ExecStart=/usr/local/bin/quickfs-server-daemon serve --config /etc/quickfs/quickfs.toml
+
+# The daemon treats SIGTERM as a graceful shutdown: it stops accepting, closes
+# the endpoint, and waits for connections to drain.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+# Restart on an unexpected exit, with a bounded delay. The start limit in
+# [Unit] stops a permanently broken configuration from looping.
+Restart=on-failure
+RestartSec=5s
+
+# One descriptor per open file, per QUIC connection, and per directory scan.
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=quickfs-server
+
+# --- Hardening -------------------------------------------------------------
+#
+# These are chosen to be safe for an administrator-selected export root that
+# the service must be able to read, and write when allow_writes is enabled.
+# See "systemd hardening" in servers/linux/README.md for what is deliberately
+# absent and why.
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# No capabilities at all. This is also what makes `mknod` of character/block
+# device nodes unavailable in the default service: creating them needs
+# CAP_MKNOD, and a network-facing file server should not hold it. FIFOs and
+# unix sockets need no capability and continue to work.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# AF_INET/AF_INET6 carry QUIC. AF_UNIX reaches journald. AF_NETLINK is what
+# glibc uses to enumerate interfaces; dropping it can make a wildcard bind fail
+# in ways that look like a configuration error.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# Deliberately NOT set here:
+#
+#   ProtectHome=true / read-only
+#     An administrator may legitimately export a directory under /home. Setting
+#     this would make that export silently empty or unreadable rather than
+#     failing loudly, which is worse than not setting it. Add it in a drop-in
+#     if your export is not under /home.
+#
+#   ProtectSystem=strict + ReadWritePaths=
+#     The export root and state directory are configured in TOML, so the unit
+#     cannot know which paths to re-open for writing. `full` already makes
+#     /usr, /boot, /efi and /etc read-only to the service, which covers the
+#     binary and its own configuration.
+#
+#   StateDirectory=quickfs
+#     state_dir is configurable; letting systemd create and chown a fixed
+#     /var/lib/quickfs would disagree with any other configured value.
+#
+#   PrivateUsers=true
+#     Blocks reading an export owned by other UIDs, which is the normal case.
+#
+#   IPAddressDeny / IPAddressAllow
+#     A file server's clients are not known to the unit.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,134 @@
+# quicKFS server daemon configuration.
+#
+# System path:  /etc/quickfs/quickfs.toml   (root:quickfs, mode 0640)
+# Validate:     quickfs-server-daemon config validate --config /etc/quickfs/quickfs.toml
+# Show results: quickfs-server-daemon config print-effective --config /etc/quickfs/quickfs.toml
+#
+# Precedence, highest first:
+#
+#   explicit CLI option > environment variable > TOML value > built-in default
+#
+# Unknown keys and unknown sections are errors, not warnings. A misspelled
+# `allow_writess` fails validation instead of silently leaving writes disabled
+# in a file that appears to enable them - or, worse, the reverse.
+#
+# This file contains deployment paths and policy only. It never contains
+# passwords, pairing codes, private keys, or certificate material: those live in
+# the protected state directory below and are created by `init`, `user add`, and
+# `pair create`.
+#
+# Paths in this file must be absolute. A relative path in a system service
+# resolves against whatever working directory the supervisor happened to use.
+
+[server]
+
+# UDP address QUIC listens on. quicKFS is UDP: a TCP reachability test proves
+# nothing. Allow this UDP port through the host and network firewalls yourself;
+# the installer deliberately does not touch firewall rules.
+#
+# Use 127.0.0.1:4433 to restrict the daemon to this host while testing.
+bind = "0.0.0.0:4433"
+
+# The directory published as remote "/". It must exist, be a directory, and be
+# readable (and, for writes, writable) by the `quickfs` service user.
+#
+# Grant that access deliberately - see "Granting the daemon access to an export"
+# in docs/setup.md. Do not run `chown -R quickfs` over an export that other
+# users or services also own; the installer never does.
+export_root = "/srv/quickfs/export"
+
+# Private server state: TLS identity, Argon2id password records, pairing
+# records, and the export epoch/node-identity key. Mode 0700, owned by
+# quickfs:quickfs, and it must be a disjoint tree from export_root in both
+# directions - the daemon refuses to start if either contains the other,
+# because that would publish the private key and password database to every
+# authenticated client.
+#
+# Back this directory up. Losing it loses the server identity (every exact-pin
+# client must be re-paired) and the export epoch (clients discard cached state
+# and reconnect as if to a new server).
+state_dir = "/var/lib/quickfs"
+
+# Export-wide write gate. Read-only is the default and the recommended posture.
+#
+# Writes additionally require a per-account grant:
+#   quickfs-server-daemon user grant-write --config /etc/quickfs/quickfs.toml alice
+# Both gates must be open before any mutation is authorized.
+allow_writes = false
+
+[limits]
+
+# Every value below is a resource bound. The defaults are the built-in ones;
+# each line may be deleted to keep the default. Removing a line is safer than
+# guessing a number.
+
+# Largest permitted ranged read, in bytes. Matches the maximum macFUSE read.
+max_read_size = 16777216
+
+# Largest raw write / xattr payload, in bytes.
+max_write_size = 8388608
+
+# Maximum tracked open file handles across the export.
+max_open_handles = 1024
+
+# Per-connection ceiling on distinct inodes one client may reference at once -
+# its live working set, not a count of files in the export. macOS keeps a large
+# kernel vnode cache, so a Finder or Spotlight crawl over a big media library
+# legitimately holds tens of thousands of live inodes, and `auto_xattr` roughly
+# doubles that with `._` sidecars. The backing semaphore is counter-based, so a
+# high ceiling costs nothing until nodes are actually tracked (~400-500 bytes
+# each).
+max_known_nodes_per_connection = 131072
+
+# Global budget for retained non-root node IDs across all connections.
+max_total_known_nodes = 524288
+
+# Aggregate metadata/xattr workers used across concurrent directory views.
+# Raising this can hurt a saturated rotational array; measure before changing it.
+max_directory_entry_tasks = 64
+
+# End-to-end request deadline, including cold backing-store work and raw payload
+# transfer. Keep it comfortably above the mount's transport-phase timeout so a
+# slow but progressing read is not canceled.
+request_timeout_ms = 120000
+
+# Global request concurrency bound.
+max_concurrent_requests = 128
+
+# Request tasks one connection may occupy. This is what stops a single slow or
+# hostile client from holding every global request slot.
+max_concurrent_requests_per_connection = 64
+
+# Global memory budget reserved by concurrent raw reads, in bytes. Must be at
+# least max_read_size.
+max_in_flight_read_bytes = 134217728
+
+# Global raw-write memory budget, in bytes. Must be at least max_write_size.
+max_in_flight_write_bytes = 67108864
+
+# Raw-write memory budget for any one connection, in bytes. Must be at least
+# max_write_size and no greater than max_in_flight_write_bytes.
+max_in_flight_write_bytes_per_connection = 16777216
+
+# Global accepted-connection bound.
+max_concurrent_connections = 256
+
+# Global Argon2 worker bound. Password verification is memory-hard on purpose;
+# this is what keeps it from exhausting the async runtime.
+max_concurrent_auth = 4
+
+# Rolling login attempts permitted per source IP per minute (maximum 1000).
+# Pairing attempts share this limiter.
+auth_attempts_per_minute = 30
+
+[logging]
+
+# tracing-subscriber filter directive used when RUST_LOG is not set, so an
+# operator debugging a running service can still override it without editing
+# this file:
+#
+#   sudo systemctl edit quickfs-server     # [Service] Environment=RUST_LOG=debug
+#
+# Examples: "info", "warn", "quickfs_server_daemon=debug,info".
+# Logs never contain passwords, pairing codes, or file contents.
+filter = "info"

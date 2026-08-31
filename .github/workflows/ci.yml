@@ -32,6 +32,27 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
 
+      # ShellCheck and systemd-analyze are both preinstalled on the Ubuntu
+      # runner. The packaging test suite (run from `cargo test` below) skips
+      # them when absent, so running them explicitly here keeps a missing tool
+      # from turning into a silently skipped check.
+      - name: ShellCheck the packaging scripts
+        run: shellcheck -s sh packaging/install.sh packaging/uninstall.sh packaging/tests/run.sh
+
+      # `systemd-analyze verify` resolves User=, Group= and the ExecStart
+      # program, so the unit is checked against a runner that actually has
+      # them. Both are throwaway on a CI machine and neither is used to run
+      # anything.
+      - name: Verify the systemd unit
+        run: |
+          set -eu
+          sudo groupadd --system --force quickfs
+          id quickfs >/dev/null 2>&1 || sudo useradd --system --gid quickfs \
+            --home-dir /var/lib/quickfs --no-create-home --shell /usr/sbin/nologin quickfs
+          sudo install -m 0755 /bin/true /usr/local/bin/quickfs-server-daemon
+          systemd-analyze verify packaging/systemd/quickfs-server.service
+          sudo rm -f /usr/local/bin/quickfs-server-daemon
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
