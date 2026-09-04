@@ -240,7 +240,7 @@ jobs:
           done
 
       - name: Upload assets to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/quickfs-server-linux-x86_64.tar.gz
