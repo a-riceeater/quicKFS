@@ -202,7 +202,7 @@ jobs:
       # Only complete, checksum-verified pairs are published, so both files are
       # uploaded together from the same step's output.
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: quickfs-server-linux-${{ matrix.arch }}
           path: |
