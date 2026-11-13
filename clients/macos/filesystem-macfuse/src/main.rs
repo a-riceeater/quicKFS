@@ -160,8 +160,10 @@ mod macos {
             conflicts_with = "trust_system_roots"
         )]
         ca_cert: Option<PathBuf>,
-        #[arg(long, default_value = "quicKFS", value_parser = parse_mount_name)]
-        volume_name: String,
+        /// Volume label shown by Finder. Defaults to the export's renamed
+        /// label if it has one, otherwise the mountpoint folder's name.
+        #[arg(long, value_parser = parse_mount_name)]
+        volume_name: Option<String>,
         /// Select the macFUSE 5 FSKit backend when the kernel extension is unavailable.
         #[arg(long, value_enum, default_value_t)]
         macfuse_backend: Backend,

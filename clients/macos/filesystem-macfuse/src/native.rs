@@ -74,7 +74,9 @@ const FSIOC_FIOSEEKDATA: u32 = darwin_iowr(b'A', 17, std::mem::size_of::<i64>() 
 
 #[derive(Clone, Debug)]
 pub struct MountConfig {
-    pub volume_name: String,
+    /// Explicit Finder volume label. `None` derives it; see
+    /// [`resolve_volume_name`].
+    pub volume_name: Option<String>,
     pub filesystem_name: String,
     pub backend: MacFuseBackend,
 }
@@ -94,7 +96,7 @@ pub enum MacFuseBackend {
 impl Default for MountConfig {
     fn default() -> Self {
         Self {
-            volume_name: "quicKFS".into(),
+            volume_name: None,
             filesystem_name: "quickfs".into(),
             backend: MacFuseBackend::Automatic,
         }
@@ -106,11 +108,11 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
     let capabilities = adapter
         .probe_capabilities()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let volume_name = if config.volume_name == MountConfig::default().volume_name {
-        capabilities.volume_name.clone()
-    } else {
-        config.volume_name.clone()
-    };
+    let volume_name = resolve_volume_name(
+        config.volume_name.as_deref(),
+        &capabilities.volume_name,
+        mountpoint,
+    );
     let mut fuser_config = Config::default();
     fuser_config.mount_options.extend([
         if capabilities.writable {
@@ -423,8 +425,43 @@ fn backend_mount_option(backend: MacFuseBackend) -> Option<MountOption> {
     }
 }
 
+/// Label used when nothing better is known; also the server's default for an
+/// export that has never been renamed.
+const DEFAULT_VOLUME_NAME: &str = "quicKFS";
+
+/// Whether `name` can be passed as `volname=` and round-trip through the
+/// server's rename rules (commas would split the macFUSE option string).
+fn is_usable_volume_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 255 && !name.contains(['/', ':', ',', '\0'])
+}
+
+/// Pick the Finder label, most specific first:
+/// 1. an explicit `--volume-name`;
+/// 2. a name the export was renamed to (Finder rename persists server-side);
+/// 3. the mountpoint folder's name, so mounting on `~/Volumes/raid` shows
+///    "raid";
+/// 4. the generic default.
+fn resolve_volume_name(explicit: Option<&str>, server_name: &str, mountpoint: &Path) -> String {
+    if let Some(name) = explicit {
+        return name.to_owned();
+    }
+    if server_name != DEFAULT_VOLUME_NAME && is_usable_volume_name(server_name) {
+        return server_name.to_owned();
+    }
+    mountpoint
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| is_usable_volume_name(name))
+        .unwrap_or(DEFAULT_VOLUME_NAME)
+        .to_owned()
+}
+
 fn validate_mount_config(config: &MountConfig) -> io::Result<()> {
-    for value in [&config.volume_name, &config.filesystem_name] {
+    for value in config
+        .volume_name
+        .iter()
+        .chain(std::iter::once(&config.filesystem_name))
+    {
         if value.is_empty() || value.len() > 255 || value.contains(',') || value.contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2031,6 +2068,42 @@ mod tests {
             backend_mount_option(MacFuseBackend::FsKit),
             Some(MountOption::CUSTOM(option)) if option == "backend=fskit"
         ));
+    }
+
+    #[test]
+    fn volume_name_prefers_explicit_then_renamed_export_then_mountpoint() {
+        let raid = Path::new("/Users/me/Volumes/raid");
+        // Explicit flag always wins, even when it equals the default.
+        assert_eq!(
+            resolve_volume_name(Some("quicKFS"), "Media", raid),
+            "quicKFS"
+        );
+        assert_eq!(resolve_volume_name(Some("Edit"), "quicKFS", raid), "Edit");
+        // A Finder rename persisted on the server beats the folder name.
+        assert_eq!(resolve_volume_name(None, "Media", raid), "Media");
+        // Unrenamed export: use the folder the user mounted on.
+        assert_eq!(resolve_volume_name(None, "quicKFS", raid), "raid");
+        assert_eq!(
+            resolve_volume_name(None, "quicKFS", Path::new("/Volumes/My RAID/")),
+            "My RAID"
+        );
+    }
+
+    #[test]
+    fn volume_name_never_forwards_option_breaking_names() {
+        // A comma would inject extra macFUSE mount options.
+        assert_eq!(
+            resolve_volume_name(None, "x,allow_other", Path::new("/mnt/raid")),
+            "raid"
+        );
+        assert_eq!(
+            resolve_volume_name(None, "quicKFS", Path::new("/mnt/a,allow_other")),
+            "quicKFS"
+        );
+        assert_eq!(
+            resolve_volume_name(None, "quicKFS", Path::new("/")),
+            "quicKFS"
+        );
     }
 
     #[test]

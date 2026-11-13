@@ -430,7 +430,7 @@ umount "$HOME/Volumes/quickfs"
 | `--reconnect-attempts <COUNT>` | — | `3` | Bounded authenticated reconnect attempts. |
 | `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Use the operating-system public/managed roots. |
 | `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Use an explicit enterprise-CA bundle. |
-| `--volume-name <NAME>` | — | `quicKFS` | Volume label shown by macOS. |
+| `--volume-name <NAME>` | — | Derived | Volume label shown by Finder. Without it, the export's persisted Finder rename is used if it has one, otherwise the mountpoint folder's name (`~/Volumes/raid` shows as `raid`), falling back to `quicKFS`. |
 
 Without a CA option, the mount reads the same private exact-pin database created by `quickfs-client-cli pair` or `trust import`. `--trust-system-roots` and `--ca-cert` are mutually exclusive. The mount reports read/write only when both server and account gates allow it. Cached data remains readable after a disconnect, but write opens/mutations fail closed and the server must be online to start a mount.
 
