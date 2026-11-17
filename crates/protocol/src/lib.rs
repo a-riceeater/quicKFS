@@ -938,13 +938,24 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, CodecError> 
 /// packing decisions (directory-view chunking) stay measured against the
 /// uncompressed size — compression happens *after* the fit.
 pub fn encode_frame<T: Serialize>(value: &T, compress: bool) -> Result<(u32, Vec<u8>), CodecError> {
+    encode_frame_measured(value, compress).map(|(prefix, body, _)| (prefix, body))
+}
+
+/// [`encode_frame`] that also returns the uncompressed postcard payload length,
+/// so a transport can report how much compression saved.
+pub fn encode_frame_measured<T: Serialize>(
+    value: &T,
+    compress: bool,
+) -> Result<(u32, Vec<u8>, usize), CodecError> {
     let payload = encode(value)?;
+    let payload_len = payload.len();
     if compress {
-        Ok(frame_body(payload))
+        let (prefix, body) = frame_body(payload);
+        Ok((prefix, body, payload_len))
     } else {
         // `payload.len()` is bounded by `MAX_FRAME_SIZE` (2^20), so it fits in the
         // low 31 bits and never sets `FRAME_COMPRESSED_FLAG`.
-        Ok((payload.len() as u32, payload))
+        Ok((payload_len as u32, payload, payload_len))
     }
 }
 
@@ -979,12 +990,20 @@ pub fn parse_frame_header(prefix: u32) -> Result<(bool, usize), CodecError> {
 /// hostile peer cannot force an unbounded allocation from a tiny frame
 /// (decompression-bomb guard), then postcard-decoded.
 pub fn decode_frame<T: DeserializeOwned>(compressed: bool, body: &[u8]) -> Result<T, CodecError> {
+    decode_frame_measured(compressed, body).map(|(value, _)| value)
+}
+
+/// [`decode_frame`] that also returns the uncompressed postcard payload length.
+pub fn decode_frame_measured<T: DeserializeOwned>(
+    compressed: bool,
+    body: &[u8],
+) -> Result<(T, usize), CodecError> {
     if compressed {
         let payload =
             zstd::bulk::decompress(body, MAX_FRAME_SIZE).map_err(|_| CodecError::Decompress)?;
-        decode(&payload)
+        Ok((decode(&payload)?, payload.len()))
     } else {
-        decode(body)
+        Ok((decode(body)?, body.len()))
     }
 }
 pub fn decode_request(bytes: &[u8]) -> Result<Envelope<Request>, CodecError> {
@@ -1002,6 +1021,24 @@ pub fn decode_request(bytes: &[u8]) -> Result<Envelope<Request>, CodecError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measured_frames_report_the_uncompressed_payload() {
+        let value = vec![7_u8; 64 * 1024];
+        let (prefix, body, payload) = encode_frame_measured(&value, true).unwrap();
+        let (compressed, length) = parse_frame_header(prefix).unwrap();
+        assert!(compressed);
+        assert_eq!(length, body.len());
+        assert!(body.len() < payload);
+        let (decoded, decoded_payload): (Vec<u8>, usize) =
+            decode_frame_measured(compressed, &body).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(decoded_payload, payload);
+
+        let (prefix, body, payload) = encode_frame_measured(&value, false).unwrap();
+        assert_eq!(parse_frame_header(prefix).unwrap(), (false, payload));
+        assert_eq!(body.len(), payload);
+    }
     #[test]
     fn round_trip() {
         let m = Envelope::new(Request::Ping { nonce: 42 });
