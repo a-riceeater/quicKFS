@@ -84,6 +84,7 @@ The main components are:
 - `crates/macos-support` and `crates/windows-support`: the per-platform runtime checks and private-state primitives;
 - `clients/macos/filesystem-macfuse`: native macFUSE callbacks and the `quickfs-mount` executable;
 - `clients/macos/client-cli`: trust, authentication, administration, and direct protocol diagnostics;
+- `clients/macos/app` and `clients/macos/core-bridge`: the native SwiftUI app for macOS 26 and the C-ABI bridge it uses to reach `client-core`;
 - `clients/windows/filesystem-winfsp`: native WinFsp callbacks, path and `NTSTATUS` translation, and the Windows mount lifecycle;
 - `clients/windows/client-cli`: the `quickfs` executable — mount, unmount, pairing, and trust management.
 
