@@ -146,24 +146,28 @@ final class MountController {
 
     static func arguments(for profile: ServerProfile, mountpoint: URL) -> [String] {
         let options = profile.mount
-        var arguments = [
-            mountpoint.path,
-            "--server", profile.address,
-            "--server-name", profile.serverName,
-            "--username", profile.username,
-            "--state-dir", Paths.state.path,
-            "--cache-dir", Paths.cache.path,
-            "--cache-max-bytes", String(UInt64(max(0.25, options.cacheMaxGiB) * 1_073_741_824)),
-            "--cache-block-kib", String(max(64, options.cacheBlockKiB)),
-            "--read-ahead-max-bytes", String(UInt64(max(0, options.readAheadMiB)) * 1_048_576),
-            "--timeout-ms", String(max(1, options.timeoutSeconds) * 1000),
-            "--callback-timeout-ms", String(max(1, options.callbackTimeoutSeconds) * 1000),
-            "--reconnect-attempts", String(max(1, options.reconnectAttempts)),
-            "--reconnect-initial-backoff-ms", String(max(0, options.reconnectInitialBackoffMs)),
-            "--reconnect-max-backoff-ms",
-            String(max(options.reconnectInitialBackoffMs, options.reconnectMaxBackoffMs)),
-            "--password-stdin",
+        let cacheBytes = UInt64(max(0.25, options.cacheMaxGiB) * 1_073_741_824)
+        let readAheadBytes = UInt64(max(0, options.readAheadMiB)) * 1_048_576
+        let initialBackoff = max(0, options.reconnectInitialBackoffMs)
+        let maxBackoff = max(initialBackoff, options.reconnectMaxBackoffMs)
+        var arguments: [String] = [mountpoint.path]
+        let pairs: [(String, String)] = [
+            ("--server", profile.address),
+            ("--server-name", profile.serverName),
+            ("--username", profile.username),
+            ("--state-dir", Paths.state.path),
+            ("--cache-dir", Paths.cache.path),
+            ("--cache-max-bytes", String(cacheBytes)),
+            ("--cache-block-kib", String(max(64, options.cacheBlockKiB))),
+            ("--read-ahead-max-bytes", String(readAheadBytes)),
+            ("--timeout-ms", String(max(1, options.timeoutSeconds) * 1000)),
+            ("--callback-timeout-ms", String(max(1, options.callbackTimeoutSeconds) * 1000)),
+            ("--reconnect-attempts", String(max(1, options.reconnectAttempts))),
+            ("--reconnect-initial-backoff-ms", String(initialBackoff)),
+            ("--reconnect-max-backoff-ms", String(maxBackoff)),
         ]
+        for (flag, value) in pairs { arguments += [flag, value] }
+        arguments.append("--password-stdin")
         if let name = options.volumeName?.trimmingCharacters(in: .whitespaces), !name.isEmpty {
             arguments += ["--volume-name", name.replacingOccurrences(of: ",", with: " ")]
         }
