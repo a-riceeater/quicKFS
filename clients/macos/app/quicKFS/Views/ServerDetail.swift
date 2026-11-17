@@ -8,14 +8,14 @@ struct ServerDetail: View {
     @AppStorage("serverTab") private var tab: Tab = .files
 
     enum Tab: String, CaseIterable, Identifiable {
-        case files, overview, activity, settings
+        case files, overview, console, settings
         var id: Self { self }
 
         var symbol: String {
             switch self {
             case .files: "folder"
             case .overview: "gauge.with.dots.needle.67percent"
-            case .activity: "waveform.path.ecg"
+            case .console: "terminal"
             case .settings: "slider.horizontal.3"
             }
         }
@@ -80,7 +80,7 @@ struct ServerDetail: View {
         switch tab {
         case .files: FileBrowser(profile: profile, connection: state.connection, browser: state.browser)
         case .overview: OverviewView(profile: profile, state: state)
-        case .activity: ActivityView(mount: state.mount)
+        case .console: ConsoleView(profile: profile, state: state)
         case .settings: ServerSettingsView(profile: profile)
         }
     }
