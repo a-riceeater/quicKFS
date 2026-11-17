@@ -1,8 +1,8 @@
 #!/bin/sh
 # Build a signed, update-ready quicKFS.app and its Sparkle appcast entry.
 #
-#   SIGN_IDENTITY="Developer ID Application: …"  (default: ad-hoc "-")
-#   TEAM_ID=ABCDE12345                            (needed with a Developer ID)
+#   SIGN_IDENTITY="Developer ID Application: …"  (default: Signing.xcconfig)
+#   TEAM_ID=ABCDE12345                            (default: Signing.xcconfig)
 #   SPARKLE_PUBLIC_KEY=…                          (from Sparkle's generate_keys)
 #   NOTARY_PROFILE=quickfs                        (optional notarytool profile)
 #   VERSION=0.2.0 BUILD=2                         (default: project.yml values)
@@ -22,14 +22,15 @@ xcodegen generate --quiet
 
 set -- -project quicKFS.xcodeproj -scheme quicKFS -configuration Release \
     -derivedDataPath "$DERIVED" \
-    CODE_SIGN_IDENTITY="${SIGN_IDENTITY:--}" \
-    DEVELOPMENT_TEAM="${TEAM_ID:-}" \
     SPARKLE_PUBLIC_KEY="${SPARKLE_PUBLIC_KEY:-}"
+# Without SIGN_IDENTITY, signing comes from Signing.xcconfig / Local.xcconfig.
+[ -n "${SIGN_IDENTITY:-}" ] && set -- "$@" CODE_SIGN_IDENTITY="$SIGN_IDENTITY"
+[ -n "${TEAM_ID:-}" ] && set -- "$@" DEVELOPMENT_TEAM="$TEAM_ID"
 [ -n "${VERSION:-}" ] && set -- "$@" MARKETING_VERSION="$VERSION"
 [ -n "${BUILD:-}" ] && set -- "$@" CURRENT_PROJECT_VERSION="$BUILD"
 # Library validation needs a shared Team ID, which ad-hoc signatures lack, so
 # only a real identity gets the hardened runtime that notarization requires.
-if [ "${SIGN_IDENTITY:--}" != "-" ]; then
+if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ]; then
     set -- "$@" ENABLE_HARDENED_RUNTIME=YES OTHER_CODE_SIGN_FLAGS="--timestamp"
 fi
 LOG="$OUT/xcodebuild.log"

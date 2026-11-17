@@ -49,7 +49,16 @@ Command-line build:
 xcodebuild -project quicKFS.xcodeproj -scheme quicKFS -derivedDataPath build/DerivedData build
 ```
 
-Debug builds are ad-hoc signed, so macOS treats each rebuild as a new app and asks once for Keychain access to a saved password.
+### Signing
+
+`Signing.xcconfig` defaults to ad-hoc signing, which needs no Apple account but gives every build a new identity, so macOS asks again for Keychain access after each rebuild. To sign with your own certificate instead, create the gitignored `Local.xcconfig` beside it:
+
+```text
+DEVELOPMENT_TEAM = ABCDE12345
+CODE_SIGN_IDENTITY = Apple Development
+```
+
+then run `xcodegen generate`. `security find-identity -v -p codesigning` lists your identities, and the team ID is the certificate's OU (`security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject`). With a stable certificate, choose Always Allow the next time the Keychain asks and rebuilds stop prompting. `scripts/release.sh` uses the same settings unless `SIGN_IDENTITY`/`TEAM_ID` are given.
 
 ## Releases and updates
 

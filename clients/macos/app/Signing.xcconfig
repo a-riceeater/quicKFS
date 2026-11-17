@@ -1,0 +1,18 @@
+// Code signing for the quicKFS app.
+//
+// The default is ad-hoc ("Sign to Run Locally"), which needs no Apple account
+// but gives every build a new identity, so macOS asks again for Keychain
+// access after each rebuild. To sign with your own certificate, create
+// Local.xcconfig next to this file (it is gitignored), for example:
+//
+//   DEVELOPMENT_TEAM = ABCDE12345
+//   CODE_SIGN_IDENTITY = Apple Development
+//
+// `security find-identity -v -p codesigning` lists your identities; the team
+// ID is the OU field of the certificate. Run `xcodegen generate` afterwards.
+
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

@@ -43,15 +43,17 @@ targets:
       - name: Embed mount helper
         script: exec "${PROJECT_DIR}/scripts/embed-helper.sh"
         basedOnDependencyAnalysis: false
+    # Signing comes from Signing.xcconfig, which includes an optional,
+    # gitignored Local.xcconfig with your own team and certificate.
+    configFiles:
+      Debug: Signing.xcconfig
+      Release: Signing.xcconfig
     settings:
       base:
         PRODUCT_NAME: quicKFS
         PRODUCT_BUNDLE_IDENTIFIER: org.quickfs.client
         INFOPLIST_FILE: quicKFS/Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: quicKFS/Resources/quicKFS.entitlements
-        CODE_SIGN_STYLE: Manual
-        CODE_SIGN_IDENTITY: "-"
-        DEVELOPMENT_TEAM: ""
         ENABLE_HARDENED_RUNTIME: NO
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         SWIFT_OBJC_BRIDGING_HEADER: quicKFS/Bridge/quicKFS-Bridging-Header.h
