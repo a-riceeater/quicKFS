@@ -2080,6 +2080,15 @@ mod tests {
         assert!(after.congestion_window > 0);
         assert!(after.mtu >= 1200);
         assert_eq!(after.reconnects, 0);
+        let protocol = after.protocol;
+        assert_eq!(protocol.alpn, "quickfs/6");
+        assert_eq!(protocol.client_version, quickfs_protocol::PROTOCOL_VERSION);
+        assert_eq!(protocol.server_version, quickfs_protocol::PROTOCOL_VERSION);
+        assert!(protocol.compression);
+        assert!(protocol.streams > before.protocol.streams);
+        assert!(protocol.frames_sent > before.protocol.frames_sent);
+        assert!(protocol.frames_received > before.protocol.frames_received);
+        assert!(protocol.payload_bytes_received >= protocol.frame_bytes_received);
         server.stop().await;
     }
 

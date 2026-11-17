@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use quickfs_auth::parse_pairing_code;
 use quickfs_protocol::*;
+pub use quickfs_transport_quic::ProtocolStats;
 use quickfs_transport_quic::{PairingClient, QuicClient, TransportError};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -106,6 +107,8 @@ pub struct LinkStats {
     pub congestion_events: u64,
     /// Transports replaced since the filesystem first connected.
     pub reconnects: u64,
+    /// Negotiated quickfs version, features, and frame/data totals.
+    pub protocol: ProtocolStats,
 }
 
 impl LinkStats {
@@ -126,6 +129,7 @@ impl LinkStats {
             bytes_lost: stats.path.lost_bytes,
             congestion_events: stats.path.congestion_events,
             reconnects: 0,
+            protocol: client.protocol_stats(),
         }
     }
 }
