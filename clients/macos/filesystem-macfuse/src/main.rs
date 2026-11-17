@@ -348,8 +348,8 @@ mod macos {
         if line.is_empty() {
             bail!("no password was supplied on standard input");
         }
-        let text = std::str::from_utf8(&line)
-            .context("the standard-input password is not valid UTF-8")?;
+        let text =
+            std::str::from_utf8(&line).context("the standard-input password is not valid UTF-8")?;
         Ok(Zeroizing::new(text.to_owned()))
     }
 
@@ -379,7 +379,9 @@ mod macos {
         #[test]
         fn stdin_password_strips_line_endings_and_rejects_empty_or_huge_input() {
             assert_eq!(
-                read_password_line(&b"secret\r\nignored"[..]).unwrap().as_str(),
+                read_password_line(&b"secret\r\nignored"[..])
+                    .unwrap()
+                    .as_str(),
                 "secret"
             );
             assert!(read_password_line(&b"\n"[..]).is_err());
