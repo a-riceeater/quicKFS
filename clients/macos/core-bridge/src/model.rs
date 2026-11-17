@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub enum BridgeError {
     #[error("{0}")]
     Invalid(String),
-    #[error("{0}")]
+    #[error("{}", client_message(.0))]
     Client(#[from] ClientError),
     #[error("{0}")]
     Trust(#[from] TrustStoreError),
@@ -29,6 +29,15 @@ pub enum BridgeError {
 }
 
 pub type BridgeResult<T> = Result<T, BridgeError>;
+
+/// The server's own message without the `server: Code:` prefix, since the
+/// code travels separately in the reply.
+fn client_message(error: &ClientError) -> String {
+    match error {
+        ClientError::Server(_, message) if !message.is_empty() => message.clone(),
+        other => other.to_string(),
+    }
+}
 
 impl BridgeError {
     pub fn invalid(message: impl Into<String>) -> Self {
