@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
 
+/// `eprintln!` that never panics. Once the process that launched the mount
+/// exits, stderr is a broken pipe and `eprintln!` would panic, which in the
+/// signal task would abandon the unmount and leave the volume mounted.
+macro_rules! note {
+    ($($argument:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($argument)*);
+    }};
+}
+
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
     anyhow::bail!("quickfs-mount is available only on macOS")
@@ -24,7 +34,7 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
             let elapsed = self.started.elapsed();
-            eprintln!(
+            note!(
                 "[{:>10.3} {} {}] {}",
                 elapsed.as_secs_f64() * 1000.0,
                 record.level(),
@@ -177,6 +187,11 @@ mod macos {
         /// counters). The macOS app reads it to chart a mount's throughput.
         #[arg(long, value_name = "PATH")]
         stats_file: Option<PathBuf>,
+        /// Unmount when the launching process exits. The macOS app passes
+        /// this so a crash or forced quit cannot leave an orphaned mount
+        /// holding the cache and mountpoint.
+        #[arg(long)]
+        exit_with_parent: bool,
     }
 
     pub fn run() -> Result<()> {
@@ -252,6 +267,9 @@ mod macos {
         if let Some(path) = cli.stats_file.clone() {
             spawn_stats_writer(&runtime, Arc::clone(&resilient), path);
         }
+        if cli.exit_with_parent {
+            spawn_parent_watch(&runtime);
+        }
         let capabilities = runtime
             .block_on(resilient.capabilities())
             .context("failed to query filesystem capabilities")?;
@@ -307,7 +325,10 @@ mod macos {
         } else {
             "read-only"
         };
-        println!(
+        // stdout may also be a closed pipe; never let the banner panic.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stdout(),
             "Preparing {access} {} ({}) for {} with reconnect and offline read caching. Press Control+C or run `umount '{}'` to unmount.",
             cli.server_name,
             cli.server,
@@ -333,6 +354,26 @@ mod macos {
              or use --ca-cert/--trust-system-roots for centrally managed PKI",
             )?;
         Ok(ServerTrust::pinned(fingerprint))
+    }
+
+    /// Start the normal graceful unmount (the SIGINT path) once the parent
+    /// process is gone, which the kernel signals by reparenting us.
+    fn spawn_parent_watch(runtime: &tokio::runtime::Runtime) {
+        let parent = rustix::process::getppid();
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                ticker.tick().await;
+                if rustix::process::getppid() != parent {
+                    note!("the launching process exited; unmounting");
+                    let _ = rustix::process::kill_process(
+                        rustix::process::getpid(),
+                        rustix::process::Signal::INT,
+                    );
+                    return;
+                }
+            }
+        });
     }
 
     /// Publish link statistics for the app once a second. Each snapshot is

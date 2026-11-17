@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
+/// `eprintln!` that never panics. Once the process that launched the mount
+/// exits, stderr is a broken pipe and `eprintln!` would panic, which in the
+/// signal task would abandon the unmount and leave the volume mounted.
+macro_rules! note {
+    ($($argument:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($argument)*);
+    }};
+}
+
 use super::{Adapter, AdapterError, CreatedNode, DirectoryListing};
 use fuser::{
     BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
@@ -209,7 +219,7 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
             mountpoint,
             &fuser_config,
         )?;
-        eprintln!("quicKFS mount is ready at {}", mountpoint.display());
+        note!("quicKFS mount is ready at {}", mountpoint.display());
         let health_unmounter = session.unmount_callable();
         let registration_broken = Arc::new(AtomicBool::new(false));
         let can_retry = attempt < VOLUME_REGISTRATION_ATTEMPTS;
@@ -221,7 +231,7 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
         );
         let result = run_session_until_unmount(session, mountpoint, &runtime)?;
         if registration_broken.load(Ordering::Acquire) && can_retry {
-            eprintln!(
+            note!(
                 "remounting {} (attempt {} of {}) after macOS registered the volume unusably",
                 mountpoint.display(),
                 attempt + 1,
@@ -231,8 +241,8 @@ pub fn mount(adapter: Adapter, mountpoint: &Path, config: &MountConfig) -> io::R
             continue;
         }
         match &result {
-            Ok(()) => eprintln!("quicKFS mount session ended"),
-            Err(error) => eprintln!("quicKFS mount session failed: {error}"),
+            Ok(()) => note!("quicKFS mount session ended"),
+            Err(error) => note!("quicKFS mount session failed: {error}"),
         }
         return result;
     }
@@ -264,7 +274,7 @@ fn run_session_until_unmount(
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
         }
-        eprintln!("Unmounting quicKFS...");
+        note!("Unmounting quicKFS...");
         let watchdog_mountpoint = signal_mountpoint.clone();
         let watchdog_unmount_complete = Arc::clone(&signal_unmount_complete);
         if let Err(error) = std::thread::Builder::new()
@@ -274,7 +284,7 @@ fn run_session_until_unmount(
                 if watchdog_unmount_complete.load(Ordering::Acquire) {
                     return;
                 }
-                eprintln!(
+                note!(
                     "unmount did not finish within {} seconds; closing the mount process to detach {}",
                     UNMOUNT_WATCHDOG_TIMEOUT.as_secs(),
                     watchdog_mountpoint.display()
@@ -282,15 +292,15 @@ fn run_session_until_unmount(
                 std::process::exit(130);
             })
         {
-            eprintln!("failed to start unmount watchdog: {error}; closing the mount process");
+            note!("failed to start unmount watchdog: {error}; closing the mount process");
             std::process::exit(130);
         }
         let graceful = tokio::task::spawn_blocking(move || unmounter.unmount());
         let graceful = tokio::time::timeout(GRACEFUL_UNMOUNT_TIMEOUT, graceful).await;
         if !matches!(graceful, Ok(Ok(Ok(())))) {
-            eprintln!("graceful unmount did not complete; forcing a local detach");
+            note!("graceful unmount did not complete; forcing a local detach");
             if let Err(error) = force_local_unmount(signal_mountpoint).await {
-                eprintln!("forced unmount failed: {error}; closing the mount process");
+                note!("forced unmount failed: {error}; closing the mount process");
                 std::process::exit(130);
             }
         }
@@ -354,15 +364,15 @@ fn spawn_registration_health_check(
             }
             registration_broken.store(true, Ordering::Release);
             if can_retry {
-                eprintln!(
+                note!(
                     "macOS registered {} unusably for Finder (alias probe failed); remounting",
                     mountpoint.display()
                 );
                 if let Err(error) = unmounter.unmount() {
-                    eprintln!("health-check unmount failed: {error}");
+                    note!("health-check unmount failed: {error}");
                 }
             } else {
-                eprintln!(
+                note!(
                     "warning: macOS registered {} unusably for Finder (alias probe failed) and \
                      the retry budget is exhausted; terminal access keeps working, but opening \
                      the volume in Finder will fail with an input/output error until it is \
@@ -373,7 +383,7 @@ fn spawn_registration_health_check(
             }
         });
     if let Err(error) = spawned {
-        eprintln!("failed to start the volume-registration health check: {error}");
+        note!("failed to start the volume-registration health check: {error}");
     }
 }
 
@@ -2009,7 +2019,7 @@ fn errno(error: &AdapterError) -> Errno {
 }
 
 fn report_callback_error(operation: &str, error: &AdapterError) {
-    eprintln!("quicKFS {operation} failed: {error}");
+    note!("quicKFS {operation} failed: {error}");
 }
 
 fn is_expected_lookup_miss(error: &AdapterError) -> bool {
