@@ -94,6 +94,8 @@ struct TransferTray: View {
 
 private struct TransferRow: View {
     let item: TransferItem
+    @State private var showingDetail = false
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -116,6 +118,10 @@ private struct TransferRow: View {
                         .controlSize(.small)
                 }
             }
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .opacity(hovering ? 1 : 0.4)
             if item.isRunning {
                 Button("Cancel", systemImage: "xmark.circle.fill") { item.cancel() }
                     .labelStyle(.iconOnly)
@@ -131,7 +137,16 @@ private struct TransferRow: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .glassEffect(.regular, in: .rect(cornerRadius: 14))
+        .contentShape(.rect)
+        .glassEffect(hovering ? .regular.tint(.accentColor.opacity(0.12)).interactive() : .regular.interactive(),
+                     in: .rect(cornerRadius: 14))
+        .onHover { hovering = $0 }
+        .onTapGesture { showingDetail = true }
+        .popover(isPresented: $showingDetail, arrowEdge: .leading) {
+            TransferDetail(item: item)
+        }
+        .help("Show transfer details")
+        .animation(.smooth(duration: 0.15), value: hovering)
     }
 
     private var symbol: String {
