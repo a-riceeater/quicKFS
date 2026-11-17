@@ -73,7 +73,7 @@ struct ServerDetail: View {
     @ViewBuilder
     private var content: some View {
         switch tab {
-        case .files: FileBrowser(profile: profile, connection: state.connection)
+        case .files: FileBrowser(profile: profile, connection: state.connection, browser: state.browser)
         case .overview: OverviewView(profile: profile, state: state)
         case .activity: ActivityView(mount: state.mount)
         case .settings: ServerSettingsView(profile: profile)

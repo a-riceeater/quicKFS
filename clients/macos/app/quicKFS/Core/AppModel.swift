@@ -9,10 +9,13 @@ final class ServerState: Identifiable {
     let id: UUID
     let connection: ServerConnection
     let mount = MountController()
+    /// Kept per server so navigation and transfers survive switching views.
+    let browser: BrowserModel
 
     init(id: UUID, profile: @escaping @MainActor () -> ServerProfile) {
         self.id = id
         connection = ServerConnection(profile: profile)
+        browser = BrowserModel(connection: connection)
     }
 }
 
