@@ -14,6 +14,7 @@ SwiftUI app ── JSON over a C ABI ──► quickfs-core-bridge (static libra
 
 - **`core-bridge`** (`clients/macos/core-bridge`) exposes `quickfs_bridge_call(json) -> json`. It shares the CLI's trust store (`trusted-servers.json`) and runs pairing, managed pin import, authenticated browsing sessions with reconnect, and pipelined transfers on one Tokio runtime. Calls block, so the app makes them off the main thread; transfers return an id that the app polls for progress.
 - **`quickfs-mount`** runs as a separate helper because a FUSE session owns its process: SIGINT starts the graceful unmount and a watchdog exits if the kernel wedges. The app passes the Keychain password on stdin (`--password-stdin`), watches for the ready line, and sends SIGINT to eject. Quitting the app ejects every mount first.
+- **Telemetry**: link figures come from QUIC's own counters. While a server is mounted the helper writes them every second to `--stats-file` (in `Application Support/quicKFS/telemetry`); otherwise the app samples its browsing session. The helper also gets `--exit-with-parent`, so a crashed app never leaves an orphaned mount.
 - **State**: the trust store lives in `~/Library/Application Support/quicKFS/state`, saved servers in `servers.json` next to it, the offline read cache in `~/Library/Caches/org.quickfs.client`, and passwords in the login Keychain. Mounts default to `~/Volumes/<server>`.
 
 ## What maps to what
@@ -29,6 +30,9 @@ SwiftUI app ── JSON over a C ABI ──► quickfs-core-bridge (static libra
 | `create`, `mkdir`, `truncate`, `remove`, `rename` | New menu, Resize, Delete (recursive), Rename, drag onto a folder to move |
 | (none) | Upload and download files or whole folders, chmod in the inspector |
 | `quickfs-mount` flags | Server settings: mount point, volume name, backend, cache, read-ahead, timeouts, reconnect |
+| `QUICKFS_FUSE_DEBUG=1` | Console: Trace, then Remount |
+| (none) | Overview: live throughput, latency, loss, totals; Console: event stream, QUIC counters, helper invocation |
+| (none) | Settings: offline cache size and Clear (only while nothing is mounted) |
 
 ## Building
 
