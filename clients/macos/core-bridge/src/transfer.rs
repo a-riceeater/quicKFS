@@ -48,9 +48,25 @@ pub struct Progress {
     files: AtomicU64,
     files_total: AtomicU64,
     cancel: AtomicBool,
+    /// The file being copied now, relative to the transfer's root.
+    current: Mutex<String>,
 }
 
 impl Progress {
+    fn set_current(&self, name: impl Into<String>) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name.into();
+    }
+
+    fn current(&self) -> String {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn check(&self) -> BridgeResult<()> {
         if self.cancel.load(Ordering::Acquire) {
             Err(BridgeError::Cancelled)
@@ -137,6 +153,7 @@ pub fn status(id: u64) -> BridgeResult<Value> {
         "total": progress.total.load(Ordering::Relaxed),
         "files": progress.files.load(Ordering::Relaxed),
         "files_total": progress.files_total.load(Ordering::Relaxed),
+        "current": progress.current(),
     });
     let (state, error) = match lock_state(&transfer) {
         State::Running => ("running", None),
@@ -193,6 +210,7 @@ pub async fn download(
 ) -> BridgeResult<()> {
     let filesystem = session.filesystem.as_ref();
     let root = filesystem.get_metadata(node).await?;
+    let destination_root = destination.clone();
     let mut plan = Vec::new();
     match root.kind {
         NodeKind::Directory => {
@@ -262,6 +280,11 @@ pub async fn download(
                 create_local_symlink(&target, &path)?;
             }
             Planned::File { node, path } => {
+                let shown = match path.strip_prefix(&destination_root) {
+                    Ok(relative) if !relative.as_os_str().is_empty() => relative,
+                    _ => path.file_name().map(Path::new).unwrap_or(&path),
+                };
+                progress.set_current(shown.display().to_string());
                 download_file(filesystem, node, &path, overwrite, read_chunk, &progress).await?;
                 progress.files.fetch_add(1, Ordering::Relaxed);
             }
@@ -392,6 +415,7 @@ pub async fn upload(
     if metadata.is_file() {
         progress.total.store(metadata.len(), Ordering::Relaxed);
         progress.files_total.store(1, Ordering::Relaxed);
+        progress.set_current(String::from_utf8_lossy(name.as_bytes()).into_owned());
         upload_file(
             filesystem,
             parent,
@@ -439,6 +463,7 @@ pub async fn upload(
         let relative = file
             .strip_prefix(&source)
             .map_err(|_| BridgeError::invalid("upload source changed during the walk"))?;
+        progress.set_current(relative.display().to_string());
         let mut remote = root;
         let mut local = source.clone();
         if let Some(parent_path) = relative.parent() {
@@ -636,6 +661,9 @@ pub async fn write_at(
     progress: Arc<Progress>,
 ) -> BridgeResult<()> {
     let filesystem = session.filesystem.as_ref();
+    if let Some(name) = source.file_name() {
+        progress.set_current(name.to_string_lossy().into_owned());
+    }
     let local = tokio::fs::File::open(&source).await?;
     progress
         .total
