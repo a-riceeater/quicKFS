@@ -37,14 +37,12 @@ still build against an SDK unpacked with
 installation, because the driver comes from the installer. See the
 [Windows client guide](windows.md).
 
-The Tauri desktop client has an additional frontend quality gate:
+The native macOS app builds with Xcode 26 and XcodeGen; its Rust bridge is part of the workspace checks above:
 
 ```sh
-cd clients/macos/client-gui
-npm install
-npm run check
-npm run build
-cargo check -p quickfs-client-gui
+cd clients/macos/app
+xcodegen generate
+xcodebuild -project quicKFS.xcodeproj -scheme quicKFS -derivedDataPath build/DerivedData build
 ```
 
 ## Focused commands

@@ -403,10 +403,11 @@ These are a coherent feature, not incremental patches — keep them grouped.
 
 ## 12. Client GUI
 
-- **[P2] Assess and complete `clients/macos/client-gui`** (Svelte + Tauri).
-  Audit its current state and define the intended UX: mount/unmount, trust
-  approval, connection/cache status, and the diagnostics from §10. Scope TBD
-  after an inventory — listed so it isn't forgotten, not yet specified.
+- **[Done] Native macOS app** (`clients/macos/app`, SwiftUI + Sparkle) replaced
+  the Tauri client: pairing and managed trust, browsing and transfers, mount
+  and eject, link and capability status, per-server mount tuning.
+- **[P2] App follow-ups**: surface cache occupancy and the §10 diagnostics,
+  alternate addresses per server (LAN and VPN), and Finder sidebar favorites.
 
 ---
 

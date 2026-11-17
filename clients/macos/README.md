@@ -2,28 +2,18 @@
 
 `client-cli` exercises the server without mounting. `filesystem-macfuse` provides the `quickfs-mount` executable and native read/write callbacks for ordinary namespace operations, random I/O, xattrs/resource forks, hardlinks/special nodes, locks, server-side copy, data/hole seek, exchange/backup/volume operations, and inode eviction. Protocol v6 loads a directory through one enriched request and serves Finder's follow-up metadata/xattr callbacks locally. It bridges callbacks through one retained multi-thread Tokio runtime and an authenticated reconnecting `RemoteFilesystem`, with a persistent read-through cache for safe offline reads, a bounded 256 MiB process-local hot range tier, and single-flight persistent/network block loads. Some optional callbacks are unavailable when the installed macFUSE/macOS ABI does not advertise them; the exact boundaries are documented in [filesystem semantics](../../docs/filesystem-semantics.md).
 
-Every macOS client process performs a lightweight runtime preflight against the installed macFUSE filesystem bundle. `quickfs-client-cli` and `quickfs-mount` stop with the official installation URL when it is absent. The GUI performs the same check once during startup and replaces the pairing flow with a blocking installation screen. The result is intentionally not persisted: checking two local filesystem entries on each launch is cheap and avoids stale state after macFUSE is installed or removed. Download macFUSE from the [official website](https://macfuse.io/).
+Every macOS client process performs a lightweight runtime preflight against the installed macFUSE filesystem bundle. `quickfs-client-cli` and `quickfs-mount` stop with the official installation URL when it is absent. The app performs the same check through the bridge at launch and shows an installation screen until macFUSE is present. The result is intentionally not persisted: checking two local filesystem entries on each launch is cheap and avoids stale state after macFUSE is installed or removed. Download macFUSE from the [official website](https://macfuse.io/).
 
-## Desktop GUI
+## Desktop app
 
-`client-gui` is the Tauri 2 and Svelte desktop client. Its Rust process depends directly on `quickfs-client-core`; it does not parse or wrap CLI output. The initial shell uses a compact macOS utility-window layout with grouped input for the existing 27-character high-entropy code, a macFUSE startup gate, and System/Light/Dark appearance modes. Network pairing and the post-pairing browser are the next implementation slice.
-
-Install Node.js 20 or later, then run the native development application:
+`app` is the native SwiftUI client for macOS 26 (Liquid Glass), generated with XcodeGen and updated through Sparkle. It links `core-bridge`, a static library over `quickfs-client-core`, so pairing, trust, authentication, browsing, and transfers run through the same code as the CLI rather than parsing CLI output, and it launches the bundled `quickfs-mount` helper for each mounted server. See [app/README.md](app/README.md) for the architecture, build, and release steps.
 
 ```sh
-cd clients/macos/client-gui
-npm install
-npm run tauri -- dev
+brew install xcodegen pkgconf
+cd clients/macos/app
+xcodegen generate
+open quicKFS.xcodeproj
 ```
-
-Run the frontend checks without opening a native window:
-
-```sh
-npm run check
-npm run build
-```
-
-The UI uses the macOS system font stack rather than redistributing an Apple font file. Pairing-code characters use the built-in monospaced stack for unambiguous case-sensitive entry.
 
 ## Native mount
 
