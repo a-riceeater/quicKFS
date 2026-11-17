@@ -116,6 +116,13 @@ final class MountController {
         }
         self.process = process
         pid = process.processIdentifier
+        let launched = process.processIdentifier
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(15))
+            guard let self, self.phase == .starting, self.pid == launched else { return }
+            self.log.append(.app, .warning,
+                "macFUSE has not attached the volume after 15 s; Eject cancels the attempt")
+        }
         log.append(.app, .debug, "helper started, pid \(process.processIdentifier)")
         let handle = input.fileHandleForWriting
         // The helper may exit before reading (for example on a trust error);

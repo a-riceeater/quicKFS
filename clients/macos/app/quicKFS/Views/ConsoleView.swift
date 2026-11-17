@@ -41,16 +41,19 @@ struct ConsoleView: View {
             Readouts(state: state)
             controls
             Terminal(lines: lines, follow: follow)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(-1)
             if showDetails {
                 HStack(alignment: .top, spacing: 12) {
                     Counters(telemetry: state.telemetry)
                     Invocation(commandLine: state.mount.commandLine)
                 }
-                .fixedSize(horizontal: false, vertical: true)
+                .frame(height: 118)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .animation(.smooth, value: showDetails)
         .task { await state.telemetry.watch() }
     }
@@ -131,6 +134,18 @@ private struct Readouts: View {
         GlassEffectContainer(spacing: 8) {
             HStack(spacing: 8) {
                 LiveIndicator(source: telemetry.source)
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 56), spacing: 8), count: 8), spacing: 8) {
+                    figures
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .frame(height: 64)
+    }
+
+    @ViewBuilder
+    private var figures: some View {
+        Group {
                 tile("RTT", String(format: "%.2f", telemetry.current?.rttMs ?? 0), "ms",
                      trace: telemetry.samples.map(\.rttMs), tint: .accentColor)
                 tile("RX", rate(telemetry.current?.receiveRate).0, rate(telemetry.current?.receiveRate).1,
@@ -143,7 +158,6 @@ private struct Readouts: View {
                 tile("MTU", "\(telemetry.latest?.mtu ?? 0)", "B")
                 tile("PID", state.mount.pid.map(String.init) ?? "—", nil)
                 uptime
-            }
         }
     }
 
@@ -164,13 +178,14 @@ private struct Readouts: View {
                 }
             }
             .lineLimit(1)
+            .minimumScaleFactor(0.6)
             Sparkline(values: trace.suffix(40).map { $0 }, tint: tint)
                 .frame(height: 12)
                 .opacity(trace.isEmpty ? 0 : 1)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .frame(minWidth: 64, maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 64, maxHeight: 64, alignment: .leading)
         .glassEffect(.regular, in: .rect(cornerRadius: 12))
     }
 
@@ -202,8 +217,7 @@ private struct LiveIndicator: View {
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .foregroundStyle(.secondary)
         }
-        .frame(width: 40)
-        .padding(.vertical, 10)
+        .frame(width: 40, height: 64)
         .glassEffect(.regular, in: .rect(cornerRadius: 12))
         .onAppear { pulse = true }
         .help(source == .mount ? "Live from the mounted volume" : source == .session ? "Live from this window's session" : "No live link")
@@ -217,25 +231,23 @@ private struct Terminal: View {
     let follow: Bool
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(lines) { line in
-                        ConsoleRow(line: line).id(line.id)
-                    }
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .overlay {
-                if lines.isEmpty {
-                    Text("no events")
-                        .font(.callout.monospaced())
-                        .foregroundStyle(.tertiary)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 1) {
+                ForEach(lines) { line in
+                    ConsoleRow(line: line)
                 }
             }
-            .onChange(of: lines.last?.id) {
-                if follow, let last = lines.last?.id { proxy.scrollTo(last, anchor: .bottom) }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        // Following keeps the newest line in view as the log grows, without
+        // reaching into any other scroll view in the window.
+        .defaultScrollAnchor(follow ? .bottom : .top, for: .sizeChanges)
+        .overlay {
+            if lines.isEmpty {
+                Text("no events")
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.tertiary)
             }
         }
         .background(Color.black.opacity(0.55), in: .rect(cornerRadius: 16))
