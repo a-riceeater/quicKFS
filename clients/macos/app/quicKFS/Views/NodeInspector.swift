@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Details for the selected entry, the GUI form of the CLI `stat` command.
 struct NodeInspector: View {

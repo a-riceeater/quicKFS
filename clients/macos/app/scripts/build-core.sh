@@ -7,7 +7,10 @@
 # one helper process per mounted server.
 set -eu
 
-export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# A terminal-like PATH: Xcode prepends its raw toolchain, whose clang has no
+# default SDK, ahead of the /usr/bin shims cargo build scripts expect.
+CARGO_PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+MACOS_SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
 WORKSPACE="$(cd "$PROJECT_DIR/../../.." && pwd)"
 OUTPUT="$BUILT_PRODUCTS_DIR/quickfs-core"
 mkdir -p "$OUTPUT"
@@ -28,19 +31,26 @@ rust_target() {
     esac
 }
 
-# Xcode exports toolchain variables meant for Swift and C targets; keep them
-# away from cargo build scripts, which build host tools with their own flags.
-unset SDKROOT LIBRARY_PATH CPATH
+# Xcode exports dozens of toolchain variables meant for its own targets.
+# Run cargo in a clean environment so C build scripts (ring, aws-lc, zstd)
+# see the same toolchain as a terminal build, with the app's deployment target.
+cargo_clean() {
+    env -i HOME="$HOME" USER="${USER:-}" TMPDIR="${TMPDIR:-/tmp}" PATH="$CARGO_PATH" \
+        SDKROOT="$MACOS_SDK" \
+        ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
+        MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}" \
+        cargo "$@"
+}
 
 LIBRARIES=""
 HELPERS=""
 for ARCH in $ARCHS; do
     TARGET="$(rust_target "$ARCH")"
     # shellcheck disable=SC2086
-    cargo build --manifest-path "$WORKSPACE/Cargo.toml" --target "$TARGET" $PROFILE_FLAG \
+    cargo_clean build --manifest-path "$WORKSPACE/Cargo.toml" --target "$TARGET" $PROFILE_FLAG \
         -p quickfs-core-bridge
     # shellcheck disable=SC2086
-    cargo build --manifest-path "$WORKSPACE/Cargo.toml" --target "$TARGET" $PROFILE_FLAG \
+    cargo_clean build --manifest-path "$WORKSPACE/Cargo.toml" --target "$TARGET" $PROFILE_FLAG \
         -p quickfs-filesystem-macfuse --features macfuse --bin quickfs-mount
     LIBRARIES="$LIBRARIES $WORKSPACE/target/$TARGET/$PROFILE_DIR/libquickfs_core_bridge.a"
     HELPERS="$HELPERS $WORKSPACE/target/$TARGET/$PROFILE_DIR/quickfs-mount"
