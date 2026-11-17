@@ -22,7 +22,7 @@ struct TransferDetail: View {
                 footer
             }
             .padding(18)
-            .frame(width: 560)
+            .frame(width: 600)
         }
     }
 
@@ -59,11 +59,13 @@ struct TransferDetail: View {
 
     private var speed: some View {
         let status = item.status
-        let (figure, unit) = Rate.parts(item.currentRate)
+        // Once finished, the headline is the average rather than a zero.
+        let headline = item.isRunning ? item.currentRate : item.rate
+        let (figure, unit) = Rate.parts(headline)
         return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Figure(value: figure, unit: unit, size: .largeTitle)
-                Text(Rate.megabits(item.currentRate))
+                Text(item.isRunning ? Rate.megabits(headline) : "\(Rate.megabits(headline)) average")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -72,8 +74,16 @@ struct TransferDetail: View {
                     .font(.title2.weight(.semibold))
                     .monospacedDigit()
             }
-            ProgressView(value: status?.fraction ?? 0)
-                .tint(tint)
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.quaternary)
+                    Capsule()
+                        .fill(tint.gradient)
+                        .frame(width: max(6, geometry.size.width * (status?.fraction ?? 0)))
+                }
+            }
+            .frame(height: 6)
+            .animation(.smooth, value: status?.fraction)
             HStack {
                 stat("transferred", "\(Format.bytes(status?.bytes ?? 0)) of \(Format.bytes(status?.total ?? 0))")
                 Spacer()
@@ -133,7 +143,7 @@ struct TransferDetail: View {
                 row("packets lost", lost == 0 ? "0" : String(format: "%llu (%.2f%%)", lost, Double(lost) / Double(max(1, sent)) * 100),
                     alert: lost > 0)
                 row("congestion events", "\(item.delta(\.congestionEvents))", alert: item.delta(\.congestionEvents) > 0)
-                row("congestion window", Format.bytes(link.congestionWindow))
+                row(item.direction == .download ? "our send window" : "send window", Format.bytes(link.congestionWindow))
                 row("path MTU", "\(link.mtu) B")
                 row("on the wire", Format.bytes(wire))
                 if data > 0, wire > data {
@@ -155,9 +165,9 @@ struct TransferDetail: View {
             if let proto = item.link?.protocol {
                 row("ALPN", proto.alpn)
                 row("version", "\(ProtocolSnapshot.version(proto.clientVersion)) ↔ \(ProtocolSnapshot.version(proto.serverVersion))")
-                row("compression", proto.compression ? "zstd, frames ≥ 1 KiB" : "off")
+                row("compression", proto.compression ? "zstd ≥ 1 KiB" : "off")
                 if let chunk = item.status?.chunkBytes, let depth = item.status?.pipelineDepth {
-                    row("pipeline", "\(Format.bytes(chunk)) × \(depth) in flight")
+                    row("pipeline", "\(Self.binary(chunk)) × \(depth)")
                 }
                 row("request streams", item.protocolDelta(\.streams).formatted())
                 row("frames out / in", "\(item.protocolDelta(\.framesSent).formatted()) / \(item.protocolDelta(\.framesReceived).formatted())")
@@ -234,6 +244,12 @@ struct TransferDetail: View {
                 .foregroundStyle(alert ? .orange : .primary)
                 .textSelection(.enabled)
         }
+    }
+
+    /// Request sizes are powers of two, so show them as such ("4 MiB").
+    private static func binary(_ bytes: UInt64) -> String {
+        bytes >= 1 << 20 && bytes % (1 << 20) == 0 ? "\(bytes >> 20) MiB"
+            : bytes >= 1 << 10 && bytes % (1 << 10) == 0 ? "\(bytes >> 10) KiB" : "\(bytes) B"
     }
 
     private func duration(_ seconds: TimeInterval?) -> String {

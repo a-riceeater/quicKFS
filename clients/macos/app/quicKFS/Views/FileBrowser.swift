@@ -30,6 +30,9 @@ struct FileBrowser: View {
         }
         .task(id: connection.isOnline) {
             if browser.entries.isEmpty { await browser.reload() }
+            #if DEBUG
+            await DebugHooks.startDownloadIfRequested(browser: browser)
+            #endif
         }
         .safeAreaInset(edge: .top, spacing: 0) { PathBar(browser: browser).padding(.horizontal, 12).padding(.top, 8) }
         .safeAreaInset(edge: .bottom, spacing: 0) {

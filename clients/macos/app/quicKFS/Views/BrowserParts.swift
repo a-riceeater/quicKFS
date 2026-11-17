@@ -146,6 +146,9 @@ private struct TransferRow: View {
             TransferDetail(item: item)
         }
         .help("Show transfer details")
+        #if DEBUG
+        .onAppear { if DebugHooks.showTransferDetail { showingDetail = true } }
+        #endif
         .animation(.smooth(duration: 0.15), value: hovering)
     }
 
