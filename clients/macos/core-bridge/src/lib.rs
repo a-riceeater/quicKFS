@@ -9,6 +9,7 @@
 //! and mount use. Calls block the calling thread, so the app issues them off
 //! the main thread; long transfers return immediately with an id to poll.
 
+mod cache;
 mod ffi;
 mod model;
 mod session;
@@ -186,6 +187,15 @@ enum Request {
     },
     TransferForget {
         transfer: u64,
+    },
+    LinkStats {
+        session: u64,
+    },
+    CacheUsage {
+        cache_dir: PathBuf,
+    },
+    CacheClear {
+        cache_dir: PathBuf,
     },
 }
 
@@ -449,6 +459,12 @@ async fn dispatch(
         Request::TransferStatus { transfer: id } => transfer::status(id),
         Request::TransferCancel { transfer: id } => transfer::cancel(id),
         Request::TransferForget { transfer: id } => Ok(transfer::forget(id)),
+        Request::LinkStats { session: id } => {
+            let session = session::session(id)?;
+            Ok(json!({ "link": session.filesystem.link_stats() }))
+        }
+        Request::CacheUsage { cache_dir } => cache::usage(&cache_dir),
+        Request::CacheClear { cache_dir } => cache::clear(&cache_dir),
     }
 }
 
