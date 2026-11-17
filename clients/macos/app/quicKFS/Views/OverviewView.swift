@@ -1,33 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
+import AppKit
 import Charts
 import SwiftUI
 
-/// Storage, link quality, and what the server supports. The GUI form of the
-/// CLI `ping`, `capabilities`, and `filesystem-stats` commands.
+/// Throughput, link quality, storage, and what the server supports. The GUI
+/// form of the CLI `ping`, `capabilities`, and `filesystem-stats` commands.
 struct OverviewView: View {
     let profile: ServerProfile
     let state: ServerState
     @Environment(AppModel.self) private var model
 
     private var connection: ServerConnection { state.connection }
+    private var telemetry: Telemetry { state.telemetry }
 
     var body: some View {
         ScrollView {
             GlassEffectContainer(spacing: 16) {
                 VStack(spacing: 16) {
+                    ThroughputCard(telemetry: telemetry)
                     HStack(alignment: .top, spacing: 16) {
-                        StorageCard(stats: connection.stats)
-                        LatencyCard(samples: connection.latency)
+                        LatencyCard(telemetry: telemetry)
+                        LossCard(telemetry: telemetry)
+                        TransferredCard(telemetry: telemetry)
                     }
                     .fixedSize(horizontal: false, vertical: true)
                     HStack(alignment: .top, spacing: 16) {
-                        MountCard(profile: profile, mount: state.mount)
-                        IdentityCard(profile: profile, pin: model.pin(for: profile),
-                                     capabilities: connection.capabilities)
+                        StorageCard(stats: connection.stats)
+                        ServerCard(profile: profile, state: state, pin: model.pin(for: profile))
                     }
                     .fixedSize(horizontal: false, vertical: true)
                     if let capabilities = connection.capabilities {
-                        CapabilityGrid(capabilities: capabilities)
+                        FeatureCard(capabilities: capabilities)
                     }
                 }
                 .padding(20)
@@ -38,21 +41,241 @@ struct OverviewView: View {
             await connection.refreshStats()
             await connection.refreshCapabilities()
         }
-        .refreshable {
-            await connection.refreshStats()
-            await connection.ping()
-        }
+        .task { await telemetry.watch() }
     }
 }
 
-private struct Card<Content: View>: View {
+// MARK: - Building blocks
+
+struct Card<Content: View>: View {
+    var padding: CGFloat = 18
     @ViewBuilder var content: () -> Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12, content: content)
-            .padding(18)
+            .padding(padding)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .glassEffect(.regular, in: .rect(cornerRadius: 22))
+    }
+}
+
+/// A small uppercase caption above a figure, used sparingly.
+struct CardTitle: View {
+    let text: String
+    var symbol: String?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let symbol { Image(systemName: symbol) }
+            Text(text.uppercased())
+                .tracking(0.8)
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(.secondary)
+    }
+}
+
+struct Figure: View {
+    let value: String
+    var unit: String?
+    var size: Font = .title2
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 3) {
+            Text(value)
+                .font(size.weight(.semibold))
+                .monospacedDigit()
+                .contentTransition(.numericText())
+            if let unit {
+                Text(unit).font(.callout).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+enum Rate {
+    /// Split a byte rate into a figure and unit, such as ("12.4", "MB/s").
+    static func parts(_ bytesPerSecond: Double) -> (String, String) {
+        let units = ["B/s", "KB/s", "MB/s", "GB/s"]
+        var value = max(0, bytesPerSecond)
+        var index = 0
+        while value >= 1000, index < units.count - 1 {
+            value /= 1000
+            index += 1
+        }
+        let text = value >= 100 || index == 0 ? String(format: "%.0f", value) : String(format: "%.1f", value)
+        return (text, units[index])
+    }
+
+    static func megabits(_ bytesPerSecond: Double) -> String {
+        String(format: "%.1f Mbit/s", bytesPerSecond * 8 / 1_000_000)
+    }
+}
+
+// MARK: - Cards
+
+private struct ThroughputCard: View {
+    let telemetry: Telemetry
+
+    var body: some View {
+        Card {
+            HStack(alignment: .top) {
+                CardTitle(text: "Throughput", symbol: "arrow.up.arrow.down")
+                Spacer()
+                SourceBadge(source: telemetry.source)
+            }
+            HStack(alignment: .bottom, spacing: 28) {
+                direction("arrow.down", .accentColor, telemetry.current?.receiveRate ?? 0, peak: telemetry.peakReceive)
+                direction("arrow.up", .orange, telemetry.current?.sendRate ?? 0, peak: telemetry.peakSend)
+                Spacer()
+            }
+            Chart(telemetry.samples) { sample in
+                AreaMark(x: .value("Time", sample.date), y: .value("Rate", sample.receiveRate),
+                         series: .value("Direction", "down"))
+                    .foregroundStyle(.linearGradient(colors: [Color.accentColor.opacity(0.35), .clear],
+                                                     startPoint: .top, endPoint: .bottom))
+                    .interpolationMethod(.monotone)
+                LineMark(x: .value("Time", sample.date), y: .value("Rate", sample.receiveRate),
+                         series: .value("Direction", "down"))
+                    .foregroundStyle(Color.accentColor)
+                    .interpolationMethod(.monotone)
+                LineMark(x: .value("Time", sample.date), y: .value("Rate", sample.sendRate),
+                         series: .value("Direction", "up"))
+                    .foregroundStyle(Color.orange.opacity(0.8))
+                    .lineStyle(.init(lineWidth: 1.2))
+                    .interpolationMethod(.monotone)
+            }
+            .chartXAxis(.hidden)
+            .chartYAxis {
+                AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) { value in
+                    AxisGridLine().foregroundStyle(.quaternary)
+                    AxisValueLabel {
+                        if let rate = value.as(Double.self) {
+                            let (figure, unit) = Rate.parts(rate)
+                            Text("\(figure) \(unit)")
+                        }
+                    }
+                }
+            }
+            .frame(height: 120)
+            .overlay {
+                if telemetry.samples.count < 2 {
+                    Text(telemetry.source == .none ? "Waiting for a connection" : "Measuring")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func direction(_ symbol: String, _ tint: Color, _ rate: Double, peak: Double) -> some View {
+        let (figure, unit) = Rate.parts(rate)
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: symbol)
+                    .font(.title3.weight(.bold))
+                    .foregroundStyle(tint)
+                Figure(value: figure, unit: unit, size: .largeTitle)
+            }
+            Text("\(Rate.megabits(rate))  ·  peak \(Rate.parts(peak).0) \(Rate.parts(peak).1)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+    }
+}
+
+private struct SourceBadge: View {
+    let source: Telemetry.Source
+
+    var body: some View {
+        if source != .none {
+            HStack(spacing: 5) {
+                Circle().fill(.green).frame(width: 6, height: 6)
+                Text(source == .mount ? "MOUNT" : "SESSION")
+            }
+            .font(.caption2.weight(.semibold).monospaced())
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .glassEffect(.regular, in: .capsule)
+            .help(source == .mount
+                ? "All Finder and app traffic through the mounted volume"
+                : "This window's own connection to the server")
+        }
+    }
+}
+
+private struct LatencyCard: View {
+    let telemetry: Telemetry
+
+    var body: some View {
+        Card {
+            CardTitle(text: "Latency", symbol: "timer")
+            Figure(value: String(format: (telemetry.current?.rttMs ?? 0) < 10 ? "%.1f" : "%.0f",
+                                 telemetry.current?.rttMs ?? 0), unit: "ms")
+            Text(String(format: "jitter %.1f ms", telemetry.jitterMs))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Sparkline(values: telemetry.samples.map(\.rttMs), tint: .accentColor)
+        }
+        .help("Smoothed QUIC round-trip time and its variation over the last 20 seconds")
+    }
+}
+
+private struct LossCard: View {
+    let telemetry: Telemetry
+
+    var body: some View {
+        Card {
+            CardTitle(text: "Packet loss", symbol: "waveform.path.badge.minus")
+            Figure(value: String(format: "%.2f", telemetry.lossPercent), unit: "%")
+            Text("\(telemetry.latest?.packetsLost ?? 0) of \(telemetry.latest?.packetsSent ?? 0) packets")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Sparkline(values: telemetry.samples.map { $0.lossFraction * 100 }, tint: .red)
+        }
+        .help("Packets the sender declared lost on this connection")
+    }
+}
+
+private struct TransferredCard: View {
+    let telemetry: Telemetry
+
+    var body: some View {
+        Card {
+            CardTitle(text: "Transferred", symbol: "arrow.left.arrow.right")
+            HStack(alignment: .firstTextBaseline, spacing: 14) {
+                Label(Format.bytes(telemetry.totalReceived), systemImage: "arrow.down")
+                Label(Format.bytes(telemetry.totalSent), systemImage: "arrow.up")
+            }
+            .font(.title3.weight(.semibold))
+            .monospacedDigit()
+            Text("\(telemetry.latest?.reconnects ?? 0) reconnects  ·  window \(Format.bytes(telemetry.latest?.congestionWindow ?? 0))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+        .help("Traffic measured while this view has been open")
+    }
+}
+
+struct Sparkline: View {
+    let values: [Double]
+    let tint: Color
+
+    var body: some View {
+        Chart(Array(values.enumerated()), id: \.offset) { index, value in
+            LineMark(x: .value("t", index), y: .value("v", value))
+                .foregroundStyle(tint)
+                .interpolationMethod(.monotone)
+        }
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .frame(height: 28)
+        .opacity(values.count > 1 ? 1 : 0)
     }
 }
 
@@ -61,35 +284,31 @@ private struct StorageCard: View {
 
     var body: some View {
         Card {
+            CardTitle(text: "Storage", symbol: "internaldrive")
             HStack(spacing: 18) {
                 ZStack {
-                    Circle().stroke(.quaternary, lineWidth: 12)
+                    Circle().stroke(.quaternary, lineWidth: 11)
                     Circle()
                         .trim(from: 0, to: stats?.usedFraction ?? 0)
-                        .stroke(ringColor.gradient, style: .init(lineWidth: 12, lineCap: .round))
+                        .stroke(ringColor.gradient, style: .init(lineWidth: 11, lineCap: .round))
                         .rotationEffect(.degrees(-90))
-                    Text((stats?.usedFraction ?? 0), format: .percent.precision(.fractionLength(0)))
-                        .font(.title3.weight(.semibold))
+                    Text(stats?.usedFraction ?? 0, format: .percent.precision(.fractionLength(0)))
+                        .font(.callout.weight(.semibold))
                         .monospacedDigit()
-                        .contentTransition(.numericText())
                 }
-                .frame(width: 96, height: 96)
+                .frame(width: 84, height: 84)
                 .animation(.smooth, value: stats?.usedFraction)
-                VStack(alignment: .leading, spacing: 6) {
-                    Image(systemName: "internaldrive")
-                        .foregroundStyle(.secondary)
-                    if let stats {
-                        Text(Format.bytes(stats.availableBytes))
-                            .font(.title2.weight(.semibold))
-                            .monospacedDigit()
+                if let stats {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Figure(value: Format.bytes(stats.availableBytes))
                         Text("free of \(Format.bytes(stats.totalBytes))")
                             .foregroundStyle(.secondary)
-                        Text("\(stats.filesFree.formatted()) inodes free")
+                        Text("\(stats.filesFree.formatted()) file slots free")
                             .font(.caption)
                             .foregroundStyle(.tertiary)
-                    } else {
-                        ProgressView().controlSize(.small)
                     }
+                } else {
+                    ProgressView().controlSize(.small)
                 }
             }
         }
@@ -104,206 +323,110 @@ private struct StorageCard: View {
     }
 }
 
-private struct LatencyCard: View {
-    let samples: [Double]
+private struct ServerCard: View {
+    let profile: ServerProfile
+    let state: ServerState
+    let pin: PinnedServer?
+
+    private var capabilities: Capabilities? { state.connection.capabilities }
 
     var body: some View {
         Card {
-            HStack(alignment: .firstTextBaseline) {
-                Image(systemName: "bolt.horizontal")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let last = samples.last {
-                    Text(Format.milliseconds(last))
-                        .font(.title2.weight(.semibold))
-                        .monospacedDigit()
-                        .contentTransition(.numericText())
-                }
-            }
-            if samples.count > 1 {
-                Chart(Array(samples.enumerated()), id: \.offset) { index, value in
-                    AreaMark(x: .value("Sample", index), y: .value("RTT", value))
-                        .foregroundStyle(.linearGradient(
-                            colors: [Color.accentColor.opacity(0.35), .clear], startPoint: .top, endPoint: .bottom))
-                        .interpolationMethod(.monotone)
-                    LineMark(x: .value("Sample", index), y: .value("RTT", value))
-                        .foregroundStyle(Color.accentColor)
-                        .interpolationMethod(.monotone)
-                }
-                .chartXAxis(.hidden)
-                .chartYAxis {
-                    AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) { value in
-                        AxisGridLine()
-                        AxisValueLabel { if let ms = value.as(Double.self) { Text(Format.milliseconds(ms)) } }
+            CardTitle(text: "Server", symbol: "server.rack")
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 7) {
+                row("Access", capabilities.map { $0.writable ? "Read and write" : "Read only" } ?? "Unknown")
+                GridRow {
+                    Text("Identity").foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(identity).lineLimit(1).truncationMode(.middle)
+                        if let pin {
+                            Button("Copy fingerprint", systemImage: "doc.on.doc") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(pin.sha256, forType: .string)
+                            }
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.borderless)
+                            .help("Copy the full SHA-256 fingerprint")
+                        }
                     }
                 }
-                .frame(height: 70)
-                .animation(.smooth, value: samples)
-            } else {
-                Spacer(minLength: 70)
-            }
-        }
-        .help("Round-trip time, sampled every five seconds")
-    }
-}
-
-private struct MountCard: View {
-    let profile: ServerProfile
-    let mount: MountController
-
-    var body: some View {
-        Card {
-            HStack {
-                Image(systemName: mount.isMounted ? "externaldrive.fill.badge.checkmark" : "externaldrive")
-                    .font(.title2)
-                    .foregroundStyle(mount.isMounted ? .green : .secondary)
-                    .contentTransition(.symbolEffect(.replace))
-                Spacer()
-                if let since = mount.mountedAt {
-                    Text(since, style: .relative)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
+                row("Volume", capabilities.map { $0.volumeName.isEmpty ? profile.name : $0.volumeName } ?? profile.name)
+                row("Largest request", capabilities.map {
+                    "\(Format.bytes($0.maxReadSize)) read · \(Format.bytes($0.maxWriteSize)) write"
+                } ?? "Unknown")
+                GridRow {
+                    Text("Mount").foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(state.mount.isMounted ? profile.mountpointURL.path(percentEncoded: false) : "Not mounted")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if state.mount.isMounted {
+                            Button("Open in Finder", systemImage: "arrow.up.forward.app") { state.mount.revealInFinder() }
+                                .labelStyle(.iconOnly)
+                                .buttonStyle(.borderless)
+                        }
+                    }
                 }
             }
-            Text(profile.mountpointURL.path(percentEncoded: false))
-                .font(.callout.monospaced())
-                .lineLimit(2)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-            if mount.isMounted {
-                Button("Open in Finder", systemImage: "folder") { mount.revealInFinder() }
-                    .buttonStyle(.glass)
-            }
+            .font(.callout)
+        }
+    }
+
+    private var identity: String {
+        switch profile.trust {
+        case .pinned:
+            guard let pin else { return "Not paired" }
+            return "Pinned · \(pin.sha256.prefix(8))…\(pin.sha256.suffix(8))"
+        case .enterpriseCA(let path): return "CA · \((path as NSString).lastPathComponent)"
+        case .systemRoots: return "System trust · \(profile.serverName)"
+        }
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label).foregroundStyle(.secondary)
+            Text(value).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
         }
     }
 }
 
-private struct IdentityCard: View {
-    let profile: ServerProfile
-    let pin: PinnedServer?
-    let capabilities: Capabilities?
-
-    var body: some View {
-        Card {
-            HStack {
-                Image(systemName: trustSymbol)
-                    .font(.title2)
-                    .foregroundStyle(.tint)
-                Spacer()
-                if let capabilities {
-                    Image(systemName: capabilities.writable ? "pencil" : "lock")
-                        .foregroundStyle(.secondary)
-                        .help(capabilities.writable ? "Read and write" : "Read only")
-                }
-            }
-            if let pin {
-                Text(fingerprint(pin.sha256))
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .help("Pinned certificate SHA-256")
-            } else {
-                Text(trustDescription).foregroundStyle(.secondary)
-            }
-            if let capabilities {
-                Text("\(capabilities.volumeName.isEmpty ? profile.name : capabilities.volumeName)  ·  \(Format.bytes(capabilities.maxReadSize)) reads  ·  \(Format.bytes(capabilities.maxWriteSize)) writes")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-    }
-
-    private var trustSymbol: String {
-        switch profile.trust {
-        case .pinned: "pin.fill"
-        case .enterpriseCA: "building.columns"
-        case .systemRoots: "checkmark.seal"
-        }
-    }
-
-    private var trustDescription: String {
-        switch profile.trust {
-        case .pinned: "Not paired"
-        case .enterpriseCA(let path): (path as NSString).lastPathComponent
-        case .systemRoots: profile.serverName
-        }
-    }
-
-    private func fingerprint(_ hex: String) -> String {
-        stride(from: 0, to: hex.count, by: 4).map { offset in
-            let start = hex.index(hex.startIndex, offsetBy: offset)
-            return String(hex[start..<hex.index(start, offsetBy: 4, limitedBy: hex.endIndex)!])
-        }.joined(separator: " ")
-    }
-}
-
-private struct CapabilityGrid: View {
+/// What the server supports, in words.
+private struct FeatureCard: View {
     let capabilities: Capabilities
 
-    private var items: [(String, String, Bool)] {
+    private var features: [(String, String, Bool)] {
         [
-            ("pencil", "Writes", capabilities.writable),
-            ("lock.rectangle.stack", "Byte-range locks", capabilities.supportsLocks),
-            ("arrow.left.arrow.right", "Atomic rename", capabilities.supportsAtomicRename),
-            ("arrow.triangle.2.circlepath", "Directory sync", capabilities.supportsDirectorySync),
-            ("square.dashed.inset.filled", "Preallocation", capabilities.supportsPreallocation),
-            ("arrow.turn.up.right", "Symbolic links", capabilities.supportsSymlinks),
-            ("tag", "Extended attributes", capabilities.supportsXattrs),
-            ("link", "Hard links", capabilities.supportsHardLinks),
-            ("cpu", "Special files", capabilities.supportsSpecialNodes),
-            ("doc.on.doc", "Server-side copy", capabilities.supportsCopyFileRange),
-            ("rectangle.split.3x1", "Sparse seek", capabilities.supportsSeekDataHole),
-            ("arrow.2.squarepath", "Exchange data", capabilities.supportsExchangeData),
-            ("character.cursor.ibeam", "Volume rename", capabilities.supportsVolumeRename),
-            ("clock.badge.checkmark", "Backup time", capabilities.supportsBackupTime),
-            ("list.bullet.rectangle", "Directory views", capabilities.supportsReaddirplus),
-            ("number", "Stable node IDs", capabilities.persistentNodeIds),
-            ("arrow.clockwise.circle", "Lock replay", capabilities.restartLockReplay),
-            ("bell", "Poll", capabilities.supportsPoll),
+            ("Writes", "Create, change, and delete files", capabilities.writable),
+            ("File locking", "Apps can lock byte ranges across clients", capabilities.supportsLocks),
+            ("Safe saves", "Atomic rename for save-in-place", capabilities.supportsAtomicRename),
+            ("Server-side copy", "Duplicates never cross the network", capabilities.supportsCopyFileRange),
+            ("Symbolic links", "Links are created and followed", capabilities.supportsSymlinks),
+            ("Hard links", "Several names for one file", capabilities.supportsHardLinks),
+            ("Tags and metadata", "Finder tags and extended attributes", capabilities.supportsXattrs),
+            ("Sparse files", "Holes are skipped when reading", capabilities.supportsSeekDataHole),
+            ("Preallocation", "Space reserved before writing", capabilities.supportsPreallocation),
+            ("Stable file IDs", "Aliases survive server restarts", capabilities.persistentNodeIds),
+            ("Lock recovery", "Locks restored after a reconnect", capabilities.restartLockReplay),
+            ("Fast listings", "Folders load in one round trip", capabilities.supportsReaddirplus),
         ]
     }
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 52), spacing: 10)], spacing: 10) {
-            ForEach(items, id: \.1) { symbol, name, supported in
-                Image(systemName: symbol)
-                    .font(.title3)
-                    .foregroundStyle(supported ? AnyShapeStyle(.tint) : AnyShapeStyle(.quaternary))
-                    .frame(width: 52, height: 52)
-                    .glassEffect(supported ? .regular.tint(.accentColor.opacity(0.15)) : .regular,
-                                 in: .rect(cornerRadius: 14))
-                    .help(name + (supported ? "" : " (unavailable)"))
-                    .accessibilityLabel(name)
-                    .accessibilityValue(supported ? "Supported" : "Unavailable")
-            }
-        }
-    }
-}
-
-/// The mount helper's own output, for diagnosing a mount.
-struct ActivityView: View {
-    let mount: MountController
-
-    var body: some View {
-        if mount.log.isEmpty {
-            Placard(symbol: "waveform.path.ecg", title: "Quiet")
-        } else {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(mount.log.enumerated()), id: \.offset) { index, line in
-                            Text(line)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(line.hasPrefix("Error") ? .red : .primary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(index)
+        Card {
+            CardTitle(text: "Features", symbol: "checklist")
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .topLeading), GridItem(.flexible(), alignment: .topLeading)],
+                      alignment: .leading, spacing: 10) {
+                ForEach(features, id: \.0) { name, detail, supported in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: supported ? "checkmark.circle.fill" : "minus.circle")
+                            .foregroundStyle(supported ? AnyShapeStyle(.green) : AnyShapeStyle(.tertiary))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(name).font(.callout.weight(.medium))
+                            Text(detail).font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    .padding(16)
+                    .opacity(supported ? 1 : 0.6)
                 }
-                .onChange(of: mount.log.count) { proxy.scrollTo(mount.log.count - 1, anchor: .bottom) }
             }
         }
     }
