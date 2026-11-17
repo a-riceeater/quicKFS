@@ -5,7 +5,7 @@ struct ServerDetail: View {
     let profile: ServerProfile
     let state: ServerState
     @Environment(AppModel.self) private var model
-    @SceneStorage("serverTab") private var tab: Tab = .files
+    @AppStorage("serverTab") private var tab: Tab = .files
 
     enum Tab: String, CaseIterable, Identifiable {
         case files, overview, activity, settings

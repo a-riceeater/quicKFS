@@ -36,6 +36,9 @@ enum Paths {
             try? manager.createDirectory(
                 at: directory, withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700])
+            // The core refuses caches and state other users could read, so
+            // tighten folders left behind by older builds too.
+            try? manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         }
     }
 

@@ -15,12 +15,6 @@ struct ServerSidebar: View {
             }
         }
         .listStyle(.sidebar)
-        .overlay {
-            if model.profiles.isEmpty {
-                Placard(symbol: "plus.circle.dashed", title: "Add a server")
-                    .onTapGesture { model.isAddingServer = true }
-            }
-        }
         .toolbar {
             ToolbarItem {
                 Button("Add Server", systemImage: "plus") { model.isAddingServer = true }

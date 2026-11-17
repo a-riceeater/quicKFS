@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import AppKit
 import SwiftUI
 
 struct RootView: View {
@@ -17,12 +18,10 @@ struct RootView: View {
                     if let id = model.selection, let profile = model.profile(id) {
                         ServerDetail(profile: profile, state: model.state(id))
                             .id(id)
+                    } else if model.profiles.isEmpty {
+                        Welcome()
                     } else {
-                        Placard(symbol: "externaldrive.badge.wifi", title: "No server selected") {
-                            Button("Add Server", systemImage: "plus") { model.isAddingServer = true }
-                                .buttonStyle(.glassProminent)
-                                .controlSize(.large)
-                        }
+                        Placard(symbol: "sidebar.left", title: "Select a server")
                     }
                 }
             }
@@ -36,6 +35,26 @@ struct RootView: View {
                 PasswordSheet(profile: profile, mountAfter: true)
             }
         }
+    }
+}
+
+/// First run: the app's mark and one action.
+private struct Welcome: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(spacing: 22) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 112, height: 112)
+                .shadow(color: .black.opacity(0.25), radius: 18, y: 8)
+            Text("quicKFS")
+                .font(.largeTitle.weight(.semibold))
+            Button("Add Server", systemImage: "plus") { model.isAddingServer = true }
+                .buttonStyle(.glassProminent)
+                .controlSize(.extraLarge)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

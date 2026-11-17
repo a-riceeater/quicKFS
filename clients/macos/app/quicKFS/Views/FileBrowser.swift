@@ -15,14 +15,17 @@ struct FileBrowser: View {
 
     var body: some View {
         Group {
-            switch connection.phase {
-            case .offline, .connecting where browser.entries.isEmpty:
-                Placard(symbol: "bolt.horizontal.circle", title: "Connecting")
-                    .overlay { ProgressView().offset(y: 60) }
-            case .failed(let error) where browser.entries.isEmpty:
-                Placard(symbol: "bolt.slash", title: "Unavailable", detail: error.message)
-            default:
+            if !browser.entries.isEmpty || connection.isOnline {
                 table
+            } else if case .failed(let error) = connection.phase {
+                Placard(symbol: "bolt.slash", title: "Unavailable", detail: error.message) {
+                    Button("Retry", systemImage: "arrow.clockwise") { Task { await browser.reload() } }
+                        .buttonStyle(.glass)
+                }
+            } else {
+                ProgressView()
+                    .controlSize(.large)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .task(id: connection.isOnline) {
