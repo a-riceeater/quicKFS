@@ -1,0 +1,67 @@
+# Generate the Xcode project with `xcodegen generate` from this directory.
+# The .xcodeproj is a build artifact and is not committed.
+name: quicKFS
+options:
+  bundleIdPrefix: org.quickfs
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.7.0
+settings:
+  base:
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    SWIFT_VERSION: 6.0
+    # The Rust core is built for arm64 only by default. Install the
+    # x86_64-apple-darwin target and list both here for a universal build.
+    ARCHS: arm64
+    SPARKLE_FEED_URL: https://github.com/a-riceeater/quicKFS/releases/latest/download/appcast.xml
+    # Set to the public EdDSA key printed by Sparkle's `generate_keys` to
+    # enable updates. Updates stay off while this is empty.
+    SPARKLE_PUBLIC_KEY: ""
+targets:
+  quicKFS:
+    type: application
+    platform: macOS
+    sources:
+      - path: quicKFS
+        excludes:
+          - "Bridge/*.h"
+      - path: quicKFS/Bridge
+        buildPhase: none
+    dependencies:
+      - package: Sparkle
+    preBuildScripts:
+      - name: Build quicKFS core
+        script: exec "${PROJECT_DIR}/scripts/build-core.sh"
+        basedOnDependencyAnalysis: false
+    postBuildScripts:
+      - name: Embed mount helper
+        script: exec "${PROJECT_DIR}/scripts/embed-helper.sh"
+        basedOnDependencyAnalysis: false
+    settings:
+      base:
+        PRODUCT_NAME: quicKFS
+        PRODUCT_BUNDLE_IDENTIFIER: org.quickfs.client
+        INFOPLIST_FILE: quicKFS/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: quicKFS/Resources/quicKFS.entitlements
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_OBJC_BRIDGING_HEADER: quicKFS/Bridge/quicKFS-Bridging-Header.h
+        LIBRARY_SEARCH_PATHS: $(BUILT_PRODUCTS_DIR)/quickfs-core
+        OTHER_LDFLAGS: -lquickfs_core_bridge -framework Security -framework SystemConfiguration -framework CoreFoundation
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SWIFT_STRICT_CONCURRENCY: complete
+        DEAD_CODE_STRIPPING: YES
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+      configs:
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
