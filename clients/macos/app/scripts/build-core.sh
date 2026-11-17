@@ -33,27 +33,38 @@ rust_target() {
 
 # Xcode exports dozens of toolchain variables meant for its own targets.
 # Run cargo in a clean environment so C build scripts (ring, aws-lc, zstd)
-# see the same toolchain as a terminal build, with the app's deployment target.
+# see the same toolchain as a terminal build. The deployment target is left at
+# Rust's default (older than the app's), so these artifacts are shared with
+# terminal builds instead of being rebuilt, and still link into the app.
 cargo_clean() {
     env -i HOME="$HOME" USER="${USER:-}" TMPDIR="${TMPDIR:-/tmp}" PATH="$CARGO_PATH" \
         SDKROOT="$MACOS_SDK" \
         ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
-        MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}" \
         cargo "$@"
 }
 
+HOST_ARCH="$(uname -m)"
 LIBRARIES=""
 HELPERS=""
 for ARCH in $ARCHS; do
-    TARGET="$(rust_target "$ARCH")"
+    # A native build shares target/<profile> with ordinary terminal builds
+    # instead of compiling the whole workspace a second time.
+    if [ "$ARCH" = "$HOST_ARCH" ]; then
+        TARGET_FLAG=""
+        OUT="$WORKSPACE/target/$PROFILE_DIR"
+    else
+        TARGET="$(rust_target "$ARCH")"
+        TARGET_FLAG="--target $TARGET"
+        OUT="$WORKSPACE/target/$TARGET/$PROFILE_DIR"
+    fi
     # shellcheck disable=SC2086
-    cargo_clean build --manifest-path "$WORKSPACE/Cargo.toml" --target "$TARGET" $PROFILE_FLAG \
+    cargo_clean build --manifest-path "$WORKSPACE/Cargo.toml" $TARGET_FLAG $PROFILE_FLAG \
         -p quickfs-core-bridge
     # shellcheck disable=SC2086
-    cargo_clean build --manifest-path "$WORKSPACE/Cargo.toml" --target "$TARGET" $PROFILE_FLAG \
+    cargo_clean build --manifest-path "$WORKSPACE/Cargo.toml" $TARGET_FLAG $PROFILE_FLAG \
         -p quickfs-filesystem-macfuse --features macfuse --bin quickfs-mount
-    LIBRARIES="$LIBRARIES $WORKSPACE/target/$TARGET/$PROFILE_DIR/libquickfs_core_bridge.a"
-    HELPERS="$HELPERS $WORKSPACE/target/$TARGET/$PROFILE_DIR/quickfs-mount"
+    LIBRARIES="$LIBRARIES $OUT/libquickfs_core_bridge.a"
+    HELPERS="$HELPERS $OUT/quickfs-mount"
 done
 
 # shellcheck disable=SC2086
