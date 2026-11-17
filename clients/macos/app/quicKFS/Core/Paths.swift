@@ -14,6 +14,9 @@ enum Paths {
 
     static var profiles: URL { applicationSupport.appendingPathComponent("servers.json") }
 
+    /// Per-mount link statistics written by the helper (`--stats-file`).
+    static var telemetry: URL { applicationSupport.appendingPathComponent("telemetry", isDirectory: true) }
+
     /// Persistent offline read cache for mounts.
     static let cache: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -32,7 +35,7 @@ enum Paths {
 
     static func prepare() {
         let manager = FileManager.default
-        for directory in [applicationSupport, cache] {
+        for directory in [applicationSupport, cache, telemetry] {
             try? manager.createDirectory(
                 at: directory, withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700])
