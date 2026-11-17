@@ -99,6 +99,8 @@ final class ServerConnection {
                 attempt += 1
                 if session == id { session = nil }
                 sampler?.cancel()
+                // Release the dead session's resources in the core.
+                Task { _ = try? await Core.call("disconnect", ["session": .uint(id)], as: EmptyReply.self) }
             }
         }
     }
