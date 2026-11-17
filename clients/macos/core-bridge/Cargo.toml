@@ -1,0 +1,38 @@
+[package]
+name = "quickfs-core-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C ABI over client-core for the native macOS app"
+
+[lib]
+name = "quickfs_core_bridge"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+futures.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+zeroize = { workspace = true, features = ["serde"] }
+quickfs-client-core = { path = "../../../crates/client-core" }
+quickfs-macos-support = { path = "../../../crates/macos-support" }
+quickfs-protocol = { path = "../../../crates/protocol" }
+quickfs-transport-quic = { path = "../../../crates/transport-quic" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The workspace forbids unsafe code outright. This crate is the one FFI
+# boundary, so it denies unsafe everywhere and allows it only inside `ffi.rs`
+# for the two C-string conversions the ABI requires.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
