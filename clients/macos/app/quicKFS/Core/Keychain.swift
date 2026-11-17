@@ -60,6 +60,11 @@ enum Keychain {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: profile.uuidString,
+            // The app is not sandboxed and has no keychain-access-group
+            // entitlement, so use the login keychain directly. Letting
+            // Security probe the data-protection keychain first can stall
+            // indefinitely for ad-hoc signed builds.
+            kSecUseDataProtectionKeychain as String: false,
         ]
     }
 }

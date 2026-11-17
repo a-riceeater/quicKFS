@@ -10,7 +10,7 @@ struct NodeInspector: View {
     @State private var linkTarget: String?
 
     var body: some View {
-        Group {
+        ZStack {
             if let node = browser.selected.first, browser.selected.count == 1 {
                 ScrollView {
                     content(detail?.id == node.id ? detail ?? node : node)

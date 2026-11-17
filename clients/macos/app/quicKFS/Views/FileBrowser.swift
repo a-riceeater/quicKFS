@@ -14,14 +14,14 @@ struct FileBrowser: View {
     @State private var dropTargeted = false
 
     var body: some View {
-        Group {
+        // A ZStack, not a Group: Group would copy `.task` onto each branch and
+        // re-run the load every time the view switches between states.
+        ZStack {
             if !browser.entries.isEmpty || connection.isOnline {
                 table
-            } else if case .failed(let error) = connection.phase {
-                Placard(symbol: "bolt.slash", title: "Unavailable", detail: error.message) {
-                    Button("Retry", systemImage: "arrow.clockwise") { Task { await browser.reload() } }
-                        .buttonStyle(.glass)
-                }
+            } else if case .failed = connection.phase {
+                // The detail view's banner carries the message and the actions.
+                Placard(symbol: "bolt.slash", title: "Unavailable")
             } else {
                 ProgressView()
                     .controlSize(.large)

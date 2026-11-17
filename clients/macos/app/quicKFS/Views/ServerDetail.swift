@@ -50,14 +50,14 @@ struct ServerDetail: View {
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 if let failure = state.failure {
-                    FailureBanner(message: failure) {
+                    FailureBanner(message: failure, fixSymbol: needsPassword ? "key.fill" : "wrench.and.screwdriver") {
                         if case .failed = state.mount.phase {
                             model.mount(profile.id)
                         } else {
-                            Task { try? await state.connection.connect() }
+                            Task { await state.browser.reload() }
                         }
                     } fix: {
-                        if case .failed(let error) = state.connection.phase, error.isAuthentication {
+                        if needsPassword {
                             model.passwordRequest = profile.id
                         } else {
                             tab = .settings
@@ -68,6 +68,11 @@ struct ServerDetail: View {
                 }
             }
             .animation(.smooth, value: state.failure)
+    }
+
+    private var needsPassword: Bool {
+        if case .failed(let error) = state.connection.phase { return error.isAuthentication }
+        return false
     }
 
     @ViewBuilder
@@ -118,6 +123,7 @@ private struct MountButton: View {
 
 private struct FailureBanner: View {
     let message: String
+    let fixSymbol: String
     let retry: () -> Void
     let fix: () -> Void
 
@@ -130,9 +136,9 @@ private struct FailureBanner: View {
                 .lineLimit(3)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Button("Fix", systemImage: "wrench.and.screwdriver", action: fix)
+            Button("Fix", systemImage: fixSymbol, action: fix)
                 .labelStyle(.iconOnly)
-                .help("Review settings")
+                .help(fixSymbol == "key.fill" ? "Enter password" : "Review settings")
             Button("Retry", systemImage: "arrow.clockwise", action: retry)
                 .buttonStyle(.glassProminent)
         }

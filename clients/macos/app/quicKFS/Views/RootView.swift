@@ -7,7 +7,7 @@ struct RootView: View {
 
     var body: some View {
         @Bindable var model = model
-        Group {
+        ZStack {
             if !model.macfuseInstalled {
                 MacFUSEGate()
             } else {
