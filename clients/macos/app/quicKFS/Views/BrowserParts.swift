@@ -29,36 +29,35 @@ struct PathBar: View {
                     .onExitCommand { editing = false }
                     .onChange(of: focused) { if !focused { editing = false } }
             } else {
-                ScrollView(.horizontal) {
-                    HStack(spacing: 2) {
-                        ForEach(Array(browser.path.enumerated()), id: \.offset) { index, crumb in
-                            if index > 0 {
-                                Image(systemName: "chevron.compact.right")
-                                    .foregroundStyle(.tertiary)
-                            }
-                            Button {
-                                Task { await browser.jump(to: crumb) }
-                            } label: {
-                                if index == 0 {
-                                    Image(systemName: "externaldrive")
-                                } else {
-                                    Text(crumb.name).lineLimit(1)
-                                }
-                            }
-                            .buttonStyle(.borderless)
-                            .foregroundStyle(index == browser.path.count - 1 ? .primary : .secondary)
+                HStack(spacing: 2) {
+                    ForEach(Array(browser.path.enumerated()), id: \.offset) { index, crumb in
+                        if index > 0 {
+                            Image(systemName: "chevron.compact.right")
+                                .foregroundStyle(.tertiary)
                         }
+                        Button {
+                            Task { await browser.jump(to: crumb) }
+                        } label: {
+                            if index == 0 {
+                                Image(systemName: "externaldrive")
+                            } else {
+                                Text(crumb.name).lineLimit(1).truncationMode(.middle)
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(index == browser.path.count - 1 ? .primary : .secondary)
+                        .layoutPriority(index == browser.path.count - 1 ? 1 : 0)
                     }
                 }
-                .scrollIndicators(.never)
-                .defaultScrollAnchor(.trailing)
-                Spacer(minLength: 0)
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .contentShape(.rect)
-                    .onTapGesture(count: 1) {
+                    .onTapGesture {
                         typed = browser.pathString
                         editing = true
                         focused = true
                     }
+                    .help("Go to path")
             }
             if browser.loading {
                 ProgressView().controlSize(.small).padding(.leading, 6)

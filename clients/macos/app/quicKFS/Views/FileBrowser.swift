@@ -95,6 +95,7 @@ struct FileBrowser: View {
             }
             .width(min: 60, ideal: 80)
         }
+        .alternatingRowBackgrounds(.disabled)
         .contextMenu(forSelectionType: UUID.self) { ids in
             rowMenu(browser.entries.filter { ids.contains($0.id) })
         } primaryAction: { ids in
