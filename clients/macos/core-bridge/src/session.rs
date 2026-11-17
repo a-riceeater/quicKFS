@@ -146,10 +146,8 @@ pub async fn list(session: &Session, node: Uuid) -> BridgeResult<Value> {
 
 pub async fn stat(session: &Session, node: Uuid) -> BridgeResult<Value> {
     let metadata = session.filesystem.get_metadata(node_id(node)).await?;
-    Ok(
-        serde_json::to_value(NodeInfo::from_metadata(&metadata, None))
-            .map_err(|error| BridgeError::invalid(error.to_string()))?,
-    )
+    serde_json::to_value(NodeInfo::from_metadata(&metadata, None))
+        .map_err(|error| BridgeError::invalid(error.to_string()))
 }
 
 pub async fn resolve(session: &Session, path: &str) -> BridgeResult<Value> {
