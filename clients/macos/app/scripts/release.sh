@@ -27,15 +27,13 @@ set -- -project quicKFS.xcodeproj -scheme quicKFS -configuration Release \
     SPARKLE_PUBLIC_KEY="${SPARKLE_PUBLIC_KEY:-}"
 [ -n "${VERSION:-}" ] && set -- "$@" MARKETING_VERSION="$VERSION"
 [ -n "${BUILD:-}" ] && set -- "$@" CURRENT_PROJECT_VERSION="$BUILD"
+# Library validation needs a shared Team ID, which ad-hoc signatures lack, so
+# only a real identity gets the hardened runtime that notarization requires.
 if [ "${SIGN_IDENTITY:--}" != "-" ]; then
-    set -- "$@" OTHER_CODE_SIGN_FLAGS="--timestamp"
-else
-    # Library validation needs a shared Team ID, which ad-hoc signatures lack,
-    # so a hardened ad-hoc app cannot load its embedded Sparkle framework.
-    # Notarized Developer ID builds keep the hardened runtime.
-    set -- "$@" ENABLE_HARDENED_RUNTIME=NO
+    set -- "$@" ENABLE_HARDENED_RUNTIME=YES OTHER_CODE_SIGN_FLAGS="--timestamp"
 fi
-xcodebuild "$@" build
+xcodebuild "$@" build | grep -E "error|warning: .*\.swift|BUILD (SUCCEEDED|FAILED)" || true
+[ -d "$DERIVED/Build/Products/Release/quicKFS.app" ] || exit 1
 
 APP="$DERIVED/Build/Products/Release/quicKFS.app"
 codesign --verify --deep --strict "$APP"

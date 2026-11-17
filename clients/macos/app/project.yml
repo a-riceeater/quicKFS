@@ -62,6 +62,6 @@ targets:
         SWIFT_STRICT_CONCURRENCY: complete
         DEAD_CODE_STRIPPING: YES
         LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
-      configs:
-        Release:
-          ENABLE_HARDENED_RUNTIME: YES
+        # Hardened runtime needs a real signing identity (ad-hoc builds cannot
+        # load the embedded Sparkle framework under library validation);
+        # scripts/release.sh enables it for Developer ID builds.
