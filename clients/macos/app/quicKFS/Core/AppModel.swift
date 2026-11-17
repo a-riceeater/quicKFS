@@ -35,6 +35,10 @@ final class AppModel {
     init() {
         Paths.prepare()
         load()
+        #if DEBUG
+        // Lets UI checks open the add flow without clicking: `-showAddServer`.
+        isAddingServer = ProcessInfo.processInfo.arguments.contains("-showAddServer")
+        #endif
     }
 
     var macfuseInstalled: Bool { environment?.macfuseInstalled ?? true }
@@ -76,7 +80,7 @@ final class AppModel {
     // MARK: Profiles
 
     func add(_ profile: ServerProfile, password: String) {
-        Keychain.setPassword(password, for: profile.id)
+        Keychain.store(password, for: profile.id)
         profiles.append(profile)
         save()
         selection = profile.id
@@ -95,7 +99,7 @@ final class AppModel {
     }
 
     func setPassword(_ password: String, for id: UUID) {
-        Keychain.setPassword(password, for: id)
+        Keychain.store(password, for: id)
         states[id]?.connection.disconnect()
     }
 
@@ -108,7 +112,7 @@ final class AppModel {
             await state.mount.shutdown()
         }
         if forgetIdentity { try? await forget(profile) }
-        Keychain.removePassword(for: id)
+        Keychain.remove(for: id)
         profiles.removeAll { $0.id == id }
         states[id] = nil
         if selection == id { selection = profiles.first?.id }
@@ -125,13 +129,22 @@ final class AppModel {
 
     // MARK: Mounts
 
-    func mount(_ id: UUID) {
-        guard let profile = profile(id) else { return }
-        guard let password = Keychain.password(for: id) else {
-            passwordRequest = id
-            return
+    /// Mount with `password`, or the saved one; asks when neither exists.
+    func mount(_ id: UUID, password: String? = nil) {
+        guard profile(id) != nil else { return }
+        let mount = state(id).mount
+        guard !mount.isActive else { return }
+        mount.prepare()
+        Task {
+            let secret: String?
+            if let password { secret = password } else { secret = await Keychain.load(for: id) }
+            guard let secret, let profile = profile(id) else {
+                mount.cancelPreparation()
+                passwordRequest = id
+                return
+            }
+            mount.mount(profile, password: secret)
         }
-        state(id).mount.mount(profile, password: password)
     }
 
     func unmount(_ id: UUID) { states[id]?.mount.unmount() }

@@ -181,6 +181,6 @@ struct PasswordSheet: View {
         guard !password.isEmpty else { return }
         model.setPassword(password, for: profile.id)
         dismiss()
-        if mountAfter { model.mount(profile.id) }
+        if mountAfter { model.mount(profile.id, password: password) }
     }
 }

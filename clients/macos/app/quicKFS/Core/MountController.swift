@@ -32,8 +32,17 @@ final class MountController {
     var isActive: Bool { phase == .starting || phase == .mounted || phase == .stopping }
     var isMounted: Bool { phase == .mounted }
 
+    /// Show the mount as starting while its password is fetched.
+    func prepare() {
+        if !isActive { phase = .starting }
+    }
+
+    func cancelPreparation() {
+        if phase == .starting && process == nil { phase = .idle }
+    }
+
     func mount(_ profile: ServerProfile, password: String) {
-        guard !isActive else { return }
+        guard process == nil else { return }
         let mountpoint = profile.mountpointURL
         do {
             try FileManager.default.createDirectory(at: mountpoint, withIntermediateDirectories: true)

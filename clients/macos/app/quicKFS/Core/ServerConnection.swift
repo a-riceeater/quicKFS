@@ -39,13 +39,11 @@ final class ServerConnection {
         if let session { return session }
         if let connectTask { return try await connectTask.value }
         let profile = profile()
-        guard let password = Keychain.password(for: profile.id) else {
-            let error = CoreError(code: "Unauthenticated", message: "Enter the password for \(profile.username).")
-            phase = .failed(error)
-            throw error
-        }
         phase = .connecting
         let task = Task<UInt64, Error> {
+            guard let password = await Keychain.load(for: profile.id) else {
+                throw CoreError(code: "Unauthenticated", message: "Enter the password for \(profile.username).")
+            }
             struct Reply: Decodable, Sendable { let session: UInt64; let capabilities: Capabilities }
             let reply: Reply = try await Core.call("connect", [
                 "state_dir": .string(Paths.state.path),
