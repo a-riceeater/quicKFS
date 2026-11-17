@@ -606,6 +606,14 @@ fn invalid_handle() -> ClientError {
 
 #[async_trait]
 impl RemoteFilesystem for ResilientFilesystem {
+    fn link_stats(&self) -> Option<crate::LinkStats> {
+        // Never wait: a reconnect holding the write lock simply yields no
+        // snapshot for this sample.
+        let slot = self.connection.try_read().ok()?;
+        let mut stats = slot.filesystem.link_stats()?;
+        stats.reconnects = slot.generation.saturating_sub(1);
+        Some(stats)
+    }
     async fn ping(&self, nonce: u64) -> Result<u64> {
         self.safe_call(move |filesystem| async move { filesystem.ping(nonce).await })
             .await

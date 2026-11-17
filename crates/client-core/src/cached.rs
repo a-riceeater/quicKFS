@@ -1363,6 +1363,9 @@ fn require_online_handle(state: &CachedHandle) -> Result<FileHandle> {
 
 #[async_trait]
 impl RemoteFilesystem for CachedFilesystem {
+    fn link_stats(&self) -> Option<crate::LinkStats> {
+        self.inner.link_stats()
+    }
     async fn ping(&self, nonce: u64) -> Result<u64> {
         self.inner.ping(nonce).await
     }

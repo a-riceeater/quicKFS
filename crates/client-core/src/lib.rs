@@ -83,9 +83,61 @@ pub struct CreatedFile {
     pub opened: OpenedFile,
 }
 
+/// A snapshot of the QUIC link under a filesystem, for diagnostics.
+///
+/// Byte and packet totals are cumulative for the current connection and
+/// restart from zero after a reconnect (`reconnects` increases), so a rate is
+/// the difference between two snapshots of the same connection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct LinkStats {
+    /// Smoothed round-trip time in microseconds.
+    pub rtt_us: u64,
+    /// Congestion window in bytes.
+    pub congestion_window: u64,
+    /// Current path MTU in bytes.
+    pub mtu: u16,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub datagrams_sent: u64,
+    pub datagrams_received: u64,
+    pub packets_sent: u64,
+    pub packets_lost: u64,
+    pub bytes_lost: u64,
+    pub congestion_events: u64,
+    /// Transports replaced since the filesystem first connected.
+    pub reconnects: u64,
+}
+
+impl LinkStats {
+    /// Read the live counters of an established QUIC client.
+    pub fn from_client(client: &QuicClient) -> Self {
+        let connection = client.connection();
+        let stats = connection.stats();
+        Self {
+            rtt_us: u64::try_from(connection.rtt().as_micros()).unwrap_or(u64::MAX),
+            congestion_window: stats.path.cwnd,
+            mtu: stats.path.current_mtu,
+            bytes_sent: stats.udp_tx.bytes,
+            bytes_received: stats.udp_rx.bytes,
+            datagrams_sent: stats.udp_tx.datagrams,
+            datagrams_received: stats.udp_rx.datagrams,
+            packets_sent: stats.path.sent_packets,
+            packets_lost: stats.path.lost_packets,
+            bytes_lost: stats.path.lost_bytes,
+            congestion_events: stats.path.congestion_events,
+            reconnects: 0,
+        }
+    }
+}
+
 #[async_trait]
 pub trait RemoteFilesystem: Send + Sync {
     async fn ping(&self, nonce: u64) -> Result<u64>;
+    /// Live link counters, when this filesystem sits on a QUIC transport.
+    /// Cheap and non-blocking; never performs a request.
+    fn link_stats(&self) -> Option<LinkStats> {
+        None
+    }
     async fn capabilities(&self) -> Result<FilesystemCapabilities> {
         Err(unsupported("capabilities"))
     }
@@ -561,6 +613,9 @@ fn response_error(r: Response) -> ClientError {
 }
 #[async_trait]
 impl RemoteFilesystem for NetworkFilesystem {
+    fn link_stats(&self) -> Option<LinkStats> {
+        Some(LinkStats::from_client(&self.transport))
+    }
     async fn ping(&self, nonce: u64) -> Result<u64> {
         match self.request(Request::Ping { nonce }).await?.0 {
             Response::Pong { nonce } => Ok(nonce),
@@ -1209,6 +1264,9 @@ impl<T> DelayedFilesystem<T> {
 }
 #[async_trait]
 impl<T: RemoteFilesystem> RemoteFilesystem for DelayedFilesystem<T> {
+    fn link_stats(&self) -> Option<LinkStats> {
+        self.inner.link_stats()
+    }
     async fn ping(&self, n: u64) -> Result<u64> {
         self.wait().await;
         self.inner.ping(n).await
