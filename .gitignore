@@ -6,9 +6,6 @@
 .DS_Store
 *.log
 /a.md
-/clients/macos/client-gui/node_modules/
-/clients/macos/client-gui/dist/
-/clients/macos/client-gui/src-tauri/gen/schemas/
 .claude
 .quickfs-cache
 /d.md

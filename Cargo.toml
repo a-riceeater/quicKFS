@@ -4,7 +4,6 @@ members = [
   "crates/*",
   "clients/macos/client-cli",
   "clients/macos/core-bridge",
-  "clients/macos/client-gui/src-tauri",
   "clients/macos/filesystem-macfuse",
   "clients/windows/client-cli",
   "clients/windows/filesystem-winfsp",
