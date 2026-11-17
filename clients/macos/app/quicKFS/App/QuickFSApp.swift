@@ -48,7 +48,7 @@ struct QuickFSApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
         .windowBackgroundDragBehavior(.enabled)
-        .defaultPosition(.topTrailing)
+        .defaultPosition(.center)
         .restorationBehavior(.disabled)
 
         Settings {

@@ -30,11 +30,16 @@ final class TransferItem: Identifiable {
     private(set) var link: LinkSnapshot?
     private var windowStart: (Date, UInt64)?
 
+    /// Every transfer this run, so a detail window can find its transfer
+    /// immediately (and keep showing it after the tray is cleared).
+    private(set) static var all: [UInt64: TransferItem] = [:]
+
     init(id: UInt64, title: String, direction: Direction, destination: URL?) {
         self.id = id
         self.title = title
         self.direction = direction
         self.destination = destination
+        Self.all[id] = self
     }
 
     var isRunning: Bool { status == nil || status?.state == .running }

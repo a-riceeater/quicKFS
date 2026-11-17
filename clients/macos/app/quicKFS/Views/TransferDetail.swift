@@ -269,8 +269,10 @@ struct TransferDetail: View {
 struct TransferWindow: View {
     static let id = "transfer"
     let transfer: UInt64?
-    @Environment(AppModel.self) private var model
-    @State private var item: TransferItem?
+
+    /// Resolved up front so the window's first layout is its final size;
+    /// growing after placement is what pushed it off screen.
+    private var item: TransferItem? { transfer.flatMap { TransferItem.all[$0] } }
 
     var body: some View {
         ZStack {
@@ -278,15 +280,11 @@ struct TransferWindow: View {
                 TransferDetail(item: item)
                     .padding(.top, 10)
             } else {
-                Placard(symbol: "arrow.up.arrow.down.circle", title: "Transfer cleared")
-                    .frame(width: 360, height: 220)
+                Placard(symbol: "arrow.up.arrow.down.circle", title: "Transfer unavailable")
+                    .frame(width: 600, height: 220)
             }
         }
         .containerBackground(.regularMaterial, for: .window)
-        .onAppear {
-            // Hold the item so the window survives the tray being cleared.
-            if item == nil, let transfer { item = model.transfer(transfer) }
-        }
         .background(WindowLevel())
     }
 }
@@ -296,8 +294,17 @@ private struct WindowLevel: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
-            view.window?.level = .floating
-            view.window?.isMovableByWindowBackground = true
+            guard let window = view.window else { return }
+            window.level = .floating
+            window.isMovableByWindowBackground = true
+            // Keep the whole window on screen, whatever size it settled at.
+            if let screen = window.screen ?? NSScreen.main {
+                let visible = screen.visibleFrame
+                if !visible.contains(window.frame) {
+                    window.setFrame(window.constrainFrameRect(window.frame, to: screen), display: true)
+                    if !visible.contains(window.frame) { window.center() }
+                }
+            }
         }
         return view
     }

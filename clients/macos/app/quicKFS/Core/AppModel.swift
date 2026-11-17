@@ -174,14 +174,6 @@ final class AppModel {
 
     var activeMounts: Int { states.values.filter { $0.mount.isActive }.count }
 
-    /// Find a transfer by its core id across every server's browser.
-    func transfer(_ id: UInt64) -> TransferItem? {
-        for state in states.values {
-            if let item = state.browser.transfers.first(where: { $0.id == id }) { return item }
-        }
-        return nil
-    }
-
     // MARK: Offline cache
 
     struct CacheUsage: Decodable, Sendable {
