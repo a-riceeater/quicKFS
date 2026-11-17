@@ -172,6 +172,11 @@ mod macos {
         /// mount without a terminal and supplies the Keychain credential here.
         #[arg(long)]
         password_stdin: bool,
+        /// Rewrite this file every second with a JSON snapshot of the mount's
+        /// QUIC link (round-trip time, congestion window, byte and packet
+        /// counters). The macOS app reads it to chart a mount's throughput.
+        #[arg(long, value_name = "PATH")]
+        stats_file: Option<PathBuf>,
     }
 
     pub fn run() -> Result<()> {
@@ -244,6 +249,9 @@ mod macos {
             ))
             .context("username/password authentication failed")?;
         let resilient: Arc<dyn RemoteFilesystem> = Arc::new(resilient);
+        if let Some(path) = cli.stats_file.clone() {
+            spawn_stats_writer(&runtime, Arc::clone(&resilient), path);
+        }
         let capabilities = runtime
             .block_on(resilient.capabilities())
             .context("failed to query filesystem capabilities")?;
@@ -325,6 +333,53 @@ mod macos {
              or use --ca-cert/--trust-system-roots for centrally managed PKI",
             )?;
         Ok(ServerTrust::pinned(fingerprint))
+    }
+
+    /// Publish link statistics for the app once a second. Each snapshot is
+    /// written to a private temporary file and renamed into place, so a
+    /// reader never sees a partial document. Failures are ignored: telemetry
+    /// must never disturb the mount.
+    fn spawn_stats_writer(
+        runtime: &tokio::runtime::Runtime,
+        filesystem: Arc<dyn RemoteFilesystem>,
+        path: PathBuf,
+    ) {
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis())
+                    .unwrap_or(0);
+                let snapshot = serde_json::json!({
+                    "pid": pid,
+                    "started_ms": started,
+                    "sampled_ms": now,
+                    "link": filesystem.link_stats(),
+                });
+                let _ = write_private_atomically(&path, snapshot.to_string().as_bytes());
+            }
+        });
+    }
+
+    fn write_private_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        drop(file);
+        std::fs::rename(&temporary, path)
     }
 
     /// Longest accepted stdin password line, so a misbehaving parent cannot
