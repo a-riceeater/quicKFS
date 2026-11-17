@@ -332,7 +332,7 @@ mod macos {
     const MAX_STDIN_PASSWORD_BYTES: u64 = 4_096;
 
     fn read_password_line(input: impl std::io::BufRead) -> Result<Zeroizing<String>> {
-        use std::io::{BufRead, Read as _};
+        use std::io::BufRead;
 
         let mut line = Zeroizing::new(Vec::new());
         input
@@ -353,22 +353,6 @@ mod macos {
         Ok(Zeroizing::new(text.to_owned()))
     }
 
-    #[cfg(test)]
-    #[allow(clippy::unwrap_used)]
-    mod tests {
-        use super::read_password_line;
-
-        #[test]
-        fn stdin_password_strips_line_endings_and_rejects_empty_or_huge_input() {
-            assert_eq!(
-                read_password_line(&b"secret\r\nignored"[..]).unwrap().as_str(),
-                "secret"
-            );
-            assert!(read_password_line(&b"\n"[..]).is_err());
-            assert!(read_password_line(&vec![b'a'; 5_000][..]).is_err());
-        }
-    }
-
     fn validate_mountpoint(path: &Path) -> Result<PathBuf> {
         let canonical = path
             .canonicalize()
@@ -384,6 +368,22 @@ mod macos {
             Err("mount name must contain 1-255 characters and no commas".into())
         } else {
             Ok(value.to_owned())
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod tests {
+        use super::read_password_line;
+
+        #[test]
+        fn stdin_password_strips_line_endings_and_rejects_empty_or_huge_input() {
+            assert_eq!(
+                read_password_line(&b"secret\r\nignored"[..]).unwrap().as_str(),
+                "secret"
+            );
+            assert!(read_password_line(&b"\n"[..]).is_err());
+            assert!(read_password_line(&vec![b'a'; 5_000][..]).is_err());
         }
     }
 }
