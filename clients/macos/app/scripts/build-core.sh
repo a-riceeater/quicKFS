@@ -33,12 +33,12 @@ rust_target() {
 
 # Xcode exports dozens of toolchain variables meant for its own targets.
 # Run cargo in a clean environment so C build scripts (ring, aws-lc, zstd)
-# see the same toolchain as a terminal build. The deployment target is left at
-# Rust's default (older than the app's), so these artifacts are shared with
-# terminal builds instead of being rebuilt, and still link into the app.
+# see the same toolchain as a terminal build. The deployment target matches the
+# app so C objects (ring, aws-lc, zstd) link without version warnings; a later
+# terminal build without it recompiles those crates once.
 cargo_clean() {
     env -i HOME="$HOME" USER="${USER:-}" TMPDIR="${TMPDIR:-/tmp}" PATH="$CARGO_PATH" \
-        SDKROOT="$MACOS_SDK" \
+        SDKROOT="$MACOS_SDK" MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}" \
         ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
         cargo "$@"
 }
