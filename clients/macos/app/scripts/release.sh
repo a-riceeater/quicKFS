@@ -32,8 +32,12 @@ set -- -project quicKFS.xcodeproj -scheme quicKFS -configuration Release \
 if [ "${SIGN_IDENTITY:--}" != "-" ]; then
     set -- "$@" ENABLE_HARDENED_RUNTIME=YES OTHER_CODE_SIGN_FLAGS="--timestamp"
 fi
-xcodebuild "$@" build | grep -E "error|warning: .*\.swift|BUILD (SUCCEEDED|FAILED)" || true
-[ -d "$DERIVED/Build/Products/Release/quicKFS.app" ] || exit 1
+LOG="$OUT/xcodebuild.log"
+if ! xcodebuild "$@" build > "$LOG" 2>&1; then
+    grep -E "error" "$LOG" | tail -20
+    echo "Build failed; full log: $LOG" >&2
+    exit 1
+fi
 
 APP="$DERIVED/Build/Products/Release/quicKFS.app"
 codesign --verify --deep --strict "$APP"
