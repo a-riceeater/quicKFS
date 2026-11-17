@@ -87,10 +87,11 @@ about HTTP.
   handshake and (server-side) Argon2. TLS session resumption / 0-RTT for
   reconnects would cut reconnect latency — but needs replay-safety analysis
   (0-RTT data is replayable; only idempotent ops may ride it).
-- **[P2] Congestion control & pacing review.** Transport uses quinn defaults.
-  Confirm the controller and pacer suit large sequential media reads on a
-  jittery WAN (observed cold ceilings swinging 30–65 Mbit/s); consider BBR if
-  quinn exposes it.
+- **[Done] Selectable congestion control.** The daemon's sending controller
+  is configurable (`--congestion-control cubic|newreno|bbr`, default cubic).
+  **[P2] Follow-up:** measure bbr against cubic on the ZeroTier/WAN path
+  (cold ceilings swung 30–65 Mbit/s under cubic) and decide whether it should
+  become the default once quinn's implementation is no longer experimental.
 - **[P2] QUIC DATAGRAM frames for unreliable/small signals.** Pings,
   keep-alives, and future server-push invalidations don't need stream
   reliability/ordering; datagrams would avoid stream setup cost.

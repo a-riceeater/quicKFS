@@ -56,6 +56,12 @@ state_dir = "/var/lib/quickfs"
 # Both gates must be open before any mutation is authorized.
 allow_writes = false
 
+# Congestion control for data the server sends, which is every file read:
+# "cubic" (default), "newreno", or "bbr". bbr holds throughput and latency far
+# better on lossy, relayed, or high-latency links (VPN, ZeroTier, Wi-Fi) but is
+# experimental in the QUIC stack, so it is opt-in.
+# congestion_control = "cubic"
+
 [limits]
 
 # Every value below is a resource bound. The defaults are the built-in ones;

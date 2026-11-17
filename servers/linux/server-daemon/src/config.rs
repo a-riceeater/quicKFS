@@ -17,6 +17,7 @@
 use anyhow::{Context, Result, bail};
 use quickfs_auth::{StatePaths, validate_server_state};
 use quickfs_common::{DEFAULT_MAX_READ_SIZE, DEFAULT_MAX_WRITE_SIZE};
+use quickfs_transport_quic::CongestionControl;
 use serde::Deserialize;
 use std::{
     fmt::Write as _,
@@ -85,6 +86,8 @@ pub struct ServerSection {
     pub export_root: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
     pub allow_writes: Option<bool>,
+    /// `cubic`, `newreno`, or `bbr`; see `ServeArgs::congestion_control`.
+    pub congestion_control: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -326,6 +329,12 @@ pub struct ServeArgs {
     pub max_concurrent_auth: Option<usize>,
     #[arg(long)]
     pub auth_attempts_per_minute: Option<usize>,
+    /// Congestion control for data the server sends (all file reads):
+    /// `cubic` (default), `newreno`, or `bbr`. `bbr` keeps throughput and
+    /// latency far better on lossy, relayed, or high-RTT links (VPN/ZeroTier,
+    /// Wi-Fi, cellular) but is experimental in the QUIC stack, so it is opt-in.
+    #[arg(long, env = "QUICKFS_CONGESTION_CONTROL")]
+    pub congestion_control: Option<CongestionControl>,
 }
 
 /// Every effective `serve` value, after precedence has been applied.
@@ -350,6 +359,7 @@ pub struct ServerConfig {
     pub max_concurrent_connections: usize,
     pub max_concurrent_auth: usize,
     pub auth_attempts_per_minute: usize,
+    pub congestion_control: CongestionControl,
     /// `logging.filter` from the file, if any. An explicit `RUST_LOG` wins.
     pub log_filter: Option<String>,
     /// The configuration file these values came from, when one was read.
@@ -402,6 +412,13 @@ pub fn resolve(args: &ServeArgs, file: Option<(PathBuf, FileConfig)>) -> Result<
         .context(
             "no export root configured; set server.export_root in the configuration file or pass --export-root",
         )?;
+    let congestion_control = match (args.congestion_control, file.server.congestion_control) {
+        (Some(value), _) => value,
+        (None, Some(text)) => text
+            .parse::<CongestionControl>()
+            .map_err(|error| anyhow::anyhow!("server.congestion_control: {error}"))?,
+        (None, None) => CongestionControl::default(),
+    };
     let limits = file.limits;
     Ok(ServerConfig {
         bind,
@@ -475,6 +492,7 @@ pub fn resolve(args: &ServeArgs, file: Option<(PathBuf, FileConfig)>) -> Result<
             .auth_attempts_per_minute
             .or(limits.auth_attempts_per_minute)
             .unwrap_or(DEFAULT_AUTH_ATTEMPTS_PER_MINUTE),
+        congestion_control,
         log_filter: file.logging.filter,
         source,
     })
@@ -779,6 +797,11 @@ pub fn print_effective(config: &ServerConfig) -> String {
         toml_string(&config.state_dir.display().to_string())
     );
     let _ = writeln!(out, "allow_writes = {}", config.allow_writes);
+    let _ = writeln!(
+        out,
+        "congestion_control = {}",
+        toml_string(&config.congestion_control.to_string())
+    );
     out.push_str("\n[limits]\n");
     for (name, value) in [
         ("max_read_size", config.max_read_size as u128),
@@ -1024,6 +1047,59 @@ filter = "info"
     }
 
     #[test]
+    fn congestion_control_resolves_from_cli_then_file_then_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let export = directory.path().join("export");
+        std::fs::create_dir(&export).unwrap();
+        let config = |control: &str| {
+            format!(
+                "[server]\nexport_root = {}\n{control}",
+                toml_string(&export.display().to_string()),
+            )
+        };
+
+        let path = write(directory.path(), &config(""));
+        let defaulted = resolve(
+            &args_with_config(&path),
+            Some((path.clone(), load(&path).unwrap())),
+        );
+        assert_eq!(
+            defaulted.unwrap().congestion_control,
+            CongestionControl::Cubic
+        );
+
+        let path = write(directory.path(), &config("congestion_control = \"bbr\"\n"));
+        let from_file = resolve(
+            &args_with_config(&path),
+            Some((path.clone(), load(&path).unwrap())),
+        );
+        assert_eq!(
+            from_file.unwrap().congestion_control,
+            CongestionControl::Bbr
+        );
+
+        let mut args = args_with_config(&path);
+        args.congestion_control = Some(CongestionControl::NewReno);
+        let from_cli = resolve(&args, Some((path.clone(), load(&path).unwrap())));
+        assert_eq!(
+            from_cli.unwrap().congestion_control,
+            CongestionControl::NewReno
+        );
+
+        let path = write(
+            directory.path(),
+            &config("congestion_control = \"vegas\"\n"),
+        );
+        let error = resolve(
+            &args_with_config(&path),
+            Some((path.clone(), load(&path).unwrap())),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("congestion_control"), "{error}");
+    }
+
+    #[test]
     fn precedence_runs_cli_over_environment_over_file_over_default() {
         let directory = tempfile::tempdir().unwrap();
         let export = directory.path().join("export");
@@ -1232,7 +1308,8 @@ filter = "info"
             "[server]\nexport_root = \"/srv/export\"\n",
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
-        let error = load(&path).unwrap_err().to_string();
+        // `{:#}` includes the cause; `to_string` is only the outer context.
+        let error = format!("{:#}", load(&path).unwrap_err());
         assert!(error.contains("writable by group"), "{error}");
     }
 
@@ -1246,7 +1323,7 @@ filter = "info"
         );
         let link = directory.path().join("link.toml");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let error = load(&link).unwrap_err().to_string();
+        let error = format!("{:#}", load(&link).unwrap_err());
         assert!(error.contains("symbolic link"), "{error}");
     }
 }

@@ -14,7 +14,7 @@ use quickfs_server_core::{Export, ExportSession};
 use quickfs_transport_quic::{
     RecvStream, SendStream, load_certificate_pem, load_certificates, load_private_key,
     load_private_key_pem, parse_certificates_pem, parse_private_key_pem, read_frame,
-    server_endpoint, validate_server_identity, write_frame,
+    server_endpoint_with, validate_server_identity, write_frame,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -522,12 +522,13 @@ where
             )
         })?,
     );
-    let endpoint = server_endpoint(c.bind, certificates, key).with_context(|| {
-        format!(
-            "failed to configure TLS or bind the QUIC server to '{}'",
-            c.bind
-        )
-    })?;
+    let endpoint = server_endpoint_with(c.bind, certificates, key, c.congestion_control)
+        .with_context(|| {
+            format!(
+                "failed to configure TLS or bind the QUIC server to '{}'",
+                c.bind
+            )
+        })?;
     let auth_root = Arc::new(state_root);
     let permits = Arc::new(Semaphore::new(c.max_concurrent_requests));
     let connection_permits = Arc::new(Semaphore::new(c.max_concurrent_connections));
@@ -1835,6 +1836,7 @@ mod tests {
             max_concurrent_connections: 32,
             max_concurrent_auth: 2,
             auth_attempts_per_minute: 100,
+            congestion_control: quickfs_transport_quic::CongestionControl::default(),
             log_filter: None,
             source: None,
         }

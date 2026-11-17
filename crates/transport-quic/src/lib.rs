@@ -34,6 +34,48 @@ const CONNECTION_RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
 const CONNECTION_SEND_WINDOW: u64 = 128 * 1024 * 1024;
 const SERVER_CONCURRENT_BIDI_STREAMS: u32 = 256;
 
+/// Congestion-control algorithm for an endpoint's *sending* direction.
+///
+/// For file reads the server is the sender, so this is chiefly a server
+/// setting. `Cubic` (quinn's default) is loss-based: it treats every lost
+/// packet as congestion, so on a lossy or relayed long-RTT link it settles far
+/// below the link rate, and it fills bottleneck queues until they overflow
+/// (bufferbloat), which delays every other request behind bulk data. `Bbr`
+/// models bottleneck bandwidth and RTT instead; it is marked experimental in
+/// quinn, so it is opt-in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CongestionControl {
+    #[default]
+    Cubic,
+    NewReno,
+    Bbr,
+}
+
+impl std::str::FromStr for CongestionControl {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "cubic" => Ok(Self::Cubic),
+            "newreno" | "new-reno" => Ok(Self::NewReno),
+            "bbr" => Ok(Self::Bbr),
+            other => Err(format!(
+                "unknown congestion control '{other}' (expected cubic, newreno, or bbr)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for CongestionControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Cubic => "cubic",
+            Self::NewReno => "newreno",
+            Self::Bbr => "bbr",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("I/O: {0}")]
@@ -163,7 +205,11 @@ impl QuicClient {
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|error| TransportError::Tls(error.to_string()))?,
         ));
-        config.transport_config(filesystem_transport_config(true, false));
+        config.transport_config(filesystem_transport_config(
+            true,
+            false,
+            CongestionControl::default(),
+        ));
         let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))?;
         endpoint.set_default_client_config(config);
         let connecting = endpoint
@@ -396,18 +442,30 @@ pub fn server_endpoint(
     certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<Endpoint, TransportError> {
+    server_endpoint_with(bind, certificates, key, CongestionControl::default())
+}
+
+/// [`server_endpoint`] with an explicit congestion controller for the server's
+/// sending direction (which carries all file-read data).
+pub fn server_endpoint_with(
+    bind: SocketAddr,
+    certificates: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    congestion: CongestionControl,
+) -> Result<Endpoint, TransportError> {
     install_crypto_provider();
     let crypto = server_crypto_config(certificates, key)?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(filesystem_transport_config(false, true));
+    config.transport_config(filesystem_transport_config(false, true, congestion));
     Ok(Endpoint::server(config, bind)?)
 }
 
 fn filesystem_transport_config(
     client_keep_alive: bool,
     accept_filesystem_streams: bool,
+    congestion: CongestionControl,
 ) -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
     config
@@ -417,6 +475,17 @@ fn filesystem_transport_config(
         .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
         .send_window(CONNECTION_SEND_WINDOW);
+    match congestion {
+        CongestionControl::Cubic => {}
+        CongestionControl::NewReno => {
+            config.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+        }
+        CongestionControl::Bbr => {
+            config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+    }
     if client_keep_alive {
         config.keep_alive_interval(Some(CLIENT_KEEP_ALIVE_INTERVAL));
     }
@@ -585,6 +654,30 @@ pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T,
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn congestion_control_names_round_trip_and_reject_unknowns() {
+        for control in [
+            CongestionControl::Cubic,
+            CongestionControl::NewReno,
+            CongestionControl::Bbr,
+        ] {
+            assert_eq!(
+                control.to_string().parse::<CongestionControl>(),
+                Ok(control)
+            );
+        }
+        assert_eq!(
+            "BBR".parse::<CongestionControl>(),
+            Ok(CongestionControl::Bbr)
+        );
+        assert_eq!(
+            "new-reno".parse::<CongestionControl>(),
+            Ok(CongestionControl::NewReno)
+        );
+        assert!("vegas".parse::<CongestionControl>().is_err());
+        assert_eq!(CongestionControl::default(), CongestionControl::Cubic);
+    }
 
     #[test]
     fn identity_inputs_are_regular_nonempty_and_bounded() {

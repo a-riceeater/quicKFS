@@ -44,6 +44,7 @@ bind = "0.0.0.0:4433"
 export_root = "/srv/quickfs/export"
 state_dir = "/var/lib/quickfs"
 allow_writes = false
+congestion_control = "cubic"
 
 [limits]
 max_read_size = 16777216
@@ -218,6 +219,7 @@ column gives where the same setting lives in `quickfs.toml`.
 | `--export-root <PATH>` | `QUICKFS_EXPORT_ROOT` | `server.export_root` | Required | Directory exposed as remote `/`. Must exist and be a directory; absolute in a configuration file. |
 | `--state-dir <PATH>` | `QUICKFS_STATE_DIR` | `server.state_dir` | `.quickfs` | Identity, accounts, and pairing state. Must not nest with the export root in either direction. |
 | `--allow-writes[=<BOOL>]` | `QUICKFS_ALLOW_WRITES` | `server.allow_writes` | `false` | Export-wide write gate; an account write grant is also required. |
+| `--congestion-control <ALGORITHM>` | `QUICKFS_CONGESTION_CONTROL` | `server.congestion_control` | `cubic` | Congestion controller for the server's sending direction, which carries every file read: `cubic`, `newreno`, or `bbr`. Cubic treats each loss as congestion, so on lossy or relayed long-RTT links (VPN, ZeroTier, Wi-Fi) it settles well below the link rate and fills queues; `bbr` models bandwidth and RTT instead but is experimental in quinn, so it is opt-in. Clients are unaffected. |
 | `--max-read-size <BYTES>` | — | `limits.max_read_size` | `16777216` | Largest permitted ranged read. |
 | `--max-write-size <BYTES>` | — | `limits.max_write_size` | `8388608` | Largest raw write/xattr payload. |
 | `--max-open-handles <COUNT>` | — | `limits.max_open_handles` | `1024` | Maximum tracked open files. |
