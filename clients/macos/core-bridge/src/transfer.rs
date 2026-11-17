@@ -154,6 +154,8 @@ pub fn status(id: u64) -> BridgeResult<Value> {
         "files": progress.files.load(Ordering::Relaxed),
         "files_total": progress.files_total.load(Ordering::Relaxed),
         "current": progress.current(),
+        "chunk_bytes": CHUNK_BYTES,
+        "pipeline_depth": PIPELINE_DEPTH,
     });
     let (state, error) = match lock_state(&transfer) {
         State::Running => ("running", None),
