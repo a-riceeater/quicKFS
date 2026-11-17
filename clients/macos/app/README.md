@@ -88,4 +88,8 @@ Updates use [Sparkle](https://sparkle-project.org). The updater stays off until 
 echo '{"op":"resolve","host":"10.0.0.74"}' | cargo run -q -p quickfs-core-bridge --example bridge-repl
 ```
 
-Debug builds also accept `-serverTab files|overview|activity|settings` and `-showAddServer` as launch arguments for UI checks.
+Debug builds also accept `-serverTab files|overview|console|settings`, `-showAddServer`, and `-seedPassword <password>` as launch arguments for UI checks. Set `QUICKFS_APP_DATA_DIR` to run against a throwaway folder instead of your real servers, pins, and cache:
+
+```sh
+QUICKFS_APP_DATA_DIR=/tmp/quickfs-test build/DerivedData/Build/Products/Debug/quicKFS.app/Contents/MacOS/quicKFS
+```

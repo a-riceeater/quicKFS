@@ -4,7 +4,14 @@ import Foundation
 /// Where the app keeps private state. The trust store and per-server caches
 /// live in directories the Rust core secures to 0700.
 enum Paths {
+    /// `QUICKFS_APP_DATA_DIR` moves all app data (servers, pins, cache,
+    /// telemetry) to another folder, so tests and experiments never touch a
+    /// person's real servers or pairing.
+    private static let overrideRoot: URL? = ProcessInfo.processInfo.environment["QUICKFS_APP_DATA_DIR"]
+        .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+
     static let applicationSupport: URL = {
+        if let overrideRoot { return overrideRoot }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("quicKFS", isDirectory: true)
     }()
@@ -19,6 +26,7 @@ enum Paths {
 
     /// Persistent offline read cache for mounts.
     static let cache: URL = {
+        if let overrideRoot { return overrideRoot.appendingPathComponent("cache", isDirectory: true) }
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("org.quickfs.client", isDirectory: true)
     }()
