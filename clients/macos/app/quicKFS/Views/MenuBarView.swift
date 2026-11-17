@@ -93,6 +93,15 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Storage") {
+                CacheControl()
+                LabeledContent("Location") {
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([Paths.cache])
+                    }
+                }
+            }
+
             Section("Updates") {
                 if updater.isConfigured {
                     Toggle("Check automatically", isOn: $updater.automaticallyChecks)

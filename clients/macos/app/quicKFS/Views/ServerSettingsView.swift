@@ -118,6 +118,7 @@ struct ServerSettingsView: View {
                             .frame(width: 70, alignment: .trailing)
                     }
                 }
+                CacheControl()
                 Picker("Read block", selection: $draft.mount.cacheBlockKiB) {
                     ForEach([1_024, 2_048, 4_096, 8_192, 16_384], id: \.self) { kib in
                         Text(Format.bytes(UInt64(kib) * 1024)).tag(kib)
