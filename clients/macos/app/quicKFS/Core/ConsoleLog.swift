@@ -38,6 +38,7 @@ struct ConsoleLine: Identifiable, Hashable, Sendable {
 final class ConsoleLog {
     private(set) var lines: [ConsoleLine] = []
     private var nextID: UInt64 = 0
+    private var inErrorChain = false
     /// Kernel tracing can emit thousands of lines a second; keep the newest.
     private let capacity = 5_000
 
@@ -61,15 +62,21 @@ final class ConsoleLog {
         }
         let lower = trimmed.lowercased()
         let level: ConsoleLine.Level
-        if lower.hasPrefix("error") || lower.contains("failed") || lower.contains("caused by") {
+        if lower.hasPrefix("error") || lower.hasPrefix("caused by") || lower.contains("failed")
+            || inErrorChain && (trimmed.first?.isNumber ?? false || line.hasPrefix(" "))
+        {
             level = .error
-        } else if lower.contains("warn") || lower.contains("retry") || lower.contains("remount") {
+        } else if lower.contains("warn") || lower.contains("retry") || lower.hasPrefix("remounting")
+            || lower.contains("unmounting")
+        {
             level = .warning
-        } else if lower.contains("ready") {
+        } else if lower.hasPrefix("quickfs mount is ready") || lower.hasPrefix("quickfs mount session ended") {
             level = .notice
         } else {
             level = .info
         }
+        // anyhow prints "Error: …", then "Caused by:" and indented causes.
+        inErrorChain = level == .error
         append(.mount, level, trimmed)
     }
 

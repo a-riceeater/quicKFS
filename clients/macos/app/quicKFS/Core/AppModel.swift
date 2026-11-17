@@ -42,6 +42,12 @@ final class AppModel {
         #if DEBUG
         // Lets UI checks open the add flow without clicking: `-showAddServer`.
         isAddingServer = ProcessInfo.processInfo.arguments.contains("-showAddServer")
+        // `-seedPassword <password>` saves it for every server, as the
+        // password sheet would, so UI checks need no typing.
+        let arguments = ProcessInfo.processInfo.arguments
+        if let index = arguments.firstIndex(of: "-seedPassword"), index + 1 < arguments.count {
+            for profile in profiles { Keychain.store(arguments[index + 1], for: profile.id) }
+        }
         #endif
     }
 

@@ -253,12 +253,20 @@ private struct TransferredCard: View {
             }
             .font(.title3.weight(.semibold))
             .monospacedDigit()
-            Text("\(telemetry.latest?.reconnects ?? 0) reconnects  ·  window \(Format.bytes(telemetry.latest?.congestionWindow ?? 0))")
+            Text(reconnects)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         }
         .help("Traffic measured while this view has been open")
+    }
+
+    private var reconnects: String {
+        switch telemetry.latest?.reconnects ?? 0 {
+        case 0: "No reconnects"
+        case 1: "1 reconnect"
+        case let count: "\(count) reconnects"
+        }
     }
 }
 
@@ -275,7 +283,8 @@ struct Sparkline: View {
         .chartXAxis(.hidden)
         .chartYAxis(.hidden)
         .frame(height: 28)
-        .opacity(values.count > 1 ? 1 : 0)
+        // A flat line at zero reads as a problem; show nothing instead.
+        .opacity(values.count > 1 && values.contains { $0 > 0 } ? 1 : 0)
     }
 }
 

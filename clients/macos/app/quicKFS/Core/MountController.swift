@@ -32,6 +32,9 @@ final class MountController {
     var traceKernel = false
     private(set) var tracing = false
     private var recentOutput: [String] = []
+    /// Bytes after the last newline: pipe reads split lines (and UTF-8
+    /// sequences) at arbitrary points.
+    private var partialLine = Data()
     private var process: Process?
     private var mountpoint: URL?
     private let log: ConsoleLog
@@ -70,7 +73,8 @@ final class MountController {
 
         let statsFile = Paths.telemetry.appendingPathComponent("\(profile.id.uuidString).json")
         try? FileManager.default.removeItem(at: statsFile)
-        let arguments = Self.arguments(for: profile, mountpoint: mountpoint) + ["--stats-file", statsFile.path]
+        let arguments = Self.arguments(for: profile, mountpoint: mountpoint)
+            + ["--stats-file", statsFile.path, "--exit-with-parent"]
         let process = Process()
         process.executableURL = Paths.mountHelper
         process.arguments = arguments
@@ -86,8 +90,8 @@ final class MountController {
         process.standardError = output
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in self?.ingest(text) }
+            guard !data.isEmpty else { return }
+            Task { @MainActor in self?.ingest(data) }
         }
         process.terminationHandler = { [weak self] finished in
             let status = finished.terminationStatus
@@ -96,6 +100,7 @@ final class MountController {
         }
 
         recentOutput.removeAll()
+        partialLine.removeAll()
         phase = .starting
         tracing = traceKernel
         self.mountpoint = mountpoint
@@ -147,9 +152,13 @@ final class MountController {
         log.append(.app, .error, message)
     }
 
-    private func ingest(_ text: String) {
-        for line in text.split(whereSeparator: \.isNewline) {
-            let line = String(line)
+    private func ingest(_ data: Data) {
+        partialLine.append(data)
+        while let newline = partialLine.firstIndex(of: 0x0A) {
+            let bytes = partialLine[partialLine.startIndex..<newline]
+            partialLine.removeSubrange(partialLine.startIndex...newline)
+            let line = String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .newlines)
+            guard !line.isEmpty else { continue }
             if line.contains(Self.readyMarker), phase == .starting {
                 phase = .mounted
                 mountedAt = .now
@@ -163,6 +172,10 @@ final class MountController {
     }
 
     private func finished(status: Int32, reason: Process.TerminationReason) {
+        if !partialLine.isEmpty {
+            partialLine.append(0x0A)
+            ingest(Data())
+        }
         process?.standardOutput.flatMap { $0 as? Pipe }?.fileHandleForReading.readabilityHandler = nil
         process = nil
         pid = nil
