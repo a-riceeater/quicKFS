@@ -46,9 +46,10 @@ struct ConsoleView: View {
             if showDetails {
                 HStack(alignment: .top, spacing: 12) {
                     Counters(telemetry: state.telemetry)
+                    ProtocolPanel(telemetry: state.telemetry)
                     Invocation(commandLine: state.mount.commandLine)
                 }
-                .frame(height: 118)
+                .frame(height: 132)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
@@ -332,6 +333,37 @@ private struct Counters: View {
         GridRow {
             Text(name).foregroundStyle(.secondary)
             Text(value).textSelection(.enabled)
+        }
+    }
+}
+
+private struct ProtocolPanel: View {
+    let telemetry: Telemetry
+
+    var body: some View {
+        DetailPanel(title: "quickfs protocol") {
+            if let proto = telemetry.latest?.protocol {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 3) {
+                    row("alpn / version", "\(proto.alpn) · \(ProtocolSnapshot.version(proto.clientVersion)) ↔ \(ProtocolSnapshot.version(proto.serverVersion))")
+                    row("compression", proto.compression
+                        ? String(format: "zstd · %llu frames · %.0f%% saved",
+                                 proto.compressedFramesSent + proto.compressedFramesReceived,
+                                 proto.compressionSavings * 100)
+                        : "off")
+                    row("streams", proto.streams.formatted())
+                    row("frames out / in", "\(proto.framesSent.formatted()) / \(proto.framesReceived.formatted())")
+                    row("data in / out", "\(Format.bytes(proto.dataBytesReceived)) / \(Format.bytes(proto.dataBytesSent))")
+                }
+            } else {
+                Text("no session").foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func row(_ name: String, _ value: String) -> some View {
+        GridRow {
+            Text(name).foregroundStyle(.secondary)
+            Text(value).textSelection(.enabled).lineLimit(1)
         }
     }
 }

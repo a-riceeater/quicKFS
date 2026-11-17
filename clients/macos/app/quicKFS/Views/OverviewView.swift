@@ -360,6 +360,10 @@ private struct ServerCard: View {
                     }
                 }
                 row("Volume", capabilities.map { $0.volumeName.isEmpty ? profile.name : $0.volumeName } ?? profile.name)
+                if let proto = state.telemetry.latest?.protocol {
+                    row("Protocol", "\(proto.alpn) · v\(ProtocolSnapshot.version(proto.serverVersion))"
+                        + (proto.compression ? " · zstd frames" : ""))
+                }
                 row("Largest request", capabilities.map {
                     "\(Format.bytes($0.maxReadSize)) read · \(Format.bytes($0.maxWriteSize)) write"
                 } ?? "Unknown")
