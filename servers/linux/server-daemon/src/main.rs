@@ -2062,6 +2062,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_reports_live_link_statistics() {
+        let server = TestServer::start(5_000).await;
+        let client = NetworkFilesystem::authenticate(
+            server.pinned_client().await,
+            "alice".into(),
+            "correct horse battery staple".into(),
+        )
+        .await
+        .unwrap();
+        let before = client.link_stats().unwrap();
+        client.list_directory(ROOT_NODE).await.unwrap();
+        let after = client.link_stats().unwrap();
+        assert!(after.bytes_received > before.bytes_received);
+        assert!(after.bytes_sent > before.bytes_sent);
+        assert!(after.datagrams_received >= before.datagrams_received);
+        assert!(after.congestion_window > 0);
+        assert!(after.mtu >= 1200);
+        assert_eq!(after.reconnects, 0);
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn client_metadata_batch_negotiates_and_maps_results() {
         // End to end through the high-level client: negotiation records the
         // server's 6.4 version, get_metadata_batch collapses the nodes into one
