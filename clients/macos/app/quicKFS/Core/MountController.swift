@@ -21,13 +21,26 @@ final class MountController {
     }
 
     private(set) var phase: Phase = .idle
-    private(set) var log: [String] = []
     private(set) var mountedAt: Date?
+    private(set) var pid: Int32?
+    /// The exact helper invocation, for the console. Holds no secrets: the
+    /// password travels on stdin.
+    private(set) var commandLine: String?
+    /// Where the running helper publishes link statistics.
+    private(set) var statsFile: URL?
+    /// Ask the next mount to stream every kernel request to the console.
+    var traceKernel = false
+    private(set) var tracing = false
+    private var recentOutput: [String] = []
     private var process: Process?
     private var mountpoint: URL?
+    private let log: ConsoleLog
 
-    private static let maxLogLines = 400
     private static let readyMarker = "quicKFS mount is ready at"
+
+    init(log: ConsoleLog) {
+        self.log = log
+    }
 
     var isActive: Bool { phase == .starting || phase == .mounted || phase == .stopping }
     var isMounted: Bool { phase == .mounted }
@@ -47,19 +60,23 @@ final class MountController {
         do {
             try FileManager.default.createDirectory(at: mountpoint, withIntermediateDirectories: true)
         } catch {
-            phase = .failed(error.localizedDescription)
+            fail(error.localizedDescription)
             return
         }
         guard FileManager.default.isExecutableFile(atPath: Paths.mountHelper.path) else {
-            phase = .failed("The mount helper is missing from this copy of quicKFS.")
+            fail("The mount helper is missing from this copy of quicKFS.")
             return
         }
 
+        let statsFile = Paths.telemetry.appendingPathComponent("\(profile.id.uuidString).json")
+        try? FileManager.default.removeItem(at: statsFile)
+        let arguments = Self.arguments(for: profile, mountpoint: mountpoint) + ["--stats-file", statsFile.path]
         let process = Process()
         process.executableURL = Paths.mountHelper
-        process.arguments = Self.arguments(for: profile, mountpoint: mountpoint)
+        process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment["QUICKFS_CLIENT_STATE_DIR"] = Paths.state.path
+        if traceKernel { environment["QUICKFS_FUSE_DEBUG"] = "1" }
         process.environment = environment
 
         let input = Pipe()
@@ -78,16 +95,23 @@ final class MountController {
             Task { @MainActor in self?.finished(status: status, reason: reason) }
         }
 
-        log.removeAll()
+        recentOutput.removeAll()
         phase = .starting
+        tracing = traceKernel
         self.mountpoint = mountpoint
+        self.statsFile = statsFile
+        commandLine = ([Paths.mountHelper.lastPathComponent] + arguments).map(Self.shellQuoted).joined(separator: " ")
+        log.append(.app, .info, "mounting \(profile.serverName) (\(profile.address)) at \(mountpoint.path)"
+            + (traceKernel ? " with kernel tracing" : ""))
         do {
             try process.run()
         } catch {
-            phase = .failed(error.localizedDescription)
+            fail(error.localizedDescription)
             return
         }
         self.process = process
+        pid = process.processIdentifier
+        log.append(.app, .debug, "helper started, pid \(process.processIdentifier)")
         let handle = input.fileHandleForWriting
         // The helper may exit before reading (for example on a trust error);
         // SIGPIPE is ignored app-wide, so this write simply fails.
@@ -99,6 +123,7 @@ final class MountController {
     func unmount() {
         guard let process, process.isRunning else { return }
         phase = .stopping
+        log.append(.app, .info, "ejecting (SIGINT to pid \(process.processIdentifier))")
         process.interrupt()
     }
 
@@ -117,6 +142,11 @@ final class MountController {
         if process.isRunning { process.terminate() }
     }
 
+    private func fail(_ message: String) {
+        phase = .failed(message)
+        log.append(.app, .error, message)
+    }
+
     private func ingest(_ text: String) {
         for line in text.split(whereSeparator: \.isNewline) {
             let line = String(line)
@@ -124,20 +154,29 @@ final class MountController {
                 phase = .mounted
                 mountedAt = .now
             }
-            log.append(line)
+            log.ingestHelperOutput(line)
+            if !line.hasPrefix("[") {
+                recentOutput.append(line)
+                if recentOutput.count > 60 { recentOutput.removeFirst(recentOutput.count - 60) }
+            }
         }
-        if log.count > Self.maxLogLines { log.removeFirst(log.count - Self.maxLogLines) }
     }
 
     private func finished(status: Int32, reason: Process.TerminationReason) {
         process?.standardOutput.flatMap { $0 as? Pipe }?.fileHandleForReading.readabilityHandler = nil
         process = nil
+        pid = nil
         mountedAt = nil
+        tracing = false
+        if let statsFile { try? FileManager.default.removeItem(at: statsFile) }
         let wasStopping = phase == .stopping || phase == .mounted
         if status == 0 || (wasStopping && (status == 130 || reason == .uncaughtSignal)) {
             phase = .idle
+            log.append(.app, .notice, "helper exited cleanly; volume detached")
         } else {
-            phase = .failed(Self.failureSummary(from: log) ?? "The mount ended unexpectedly.")
+            let summary = Self.failureSummary(from: recentOutput) ?? "The mount ended unexpectedly."
+            phase = .failed(summary)
+            log.append(.app, .error, "helper exited with status \(status): \(summary)")
         }
     }
 
@@ -151,6 +190,12 @@ final class MountController {
             return ([head] + rest).joined(separator: ": ")
         }
         return log.last
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_./:=@,+"))
+        if !value.isEmpty, value.unicodeScalars.allSatisfy(safe.contains) { return value }
+        return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     static func arguments(for profile: ServerProfile, mountpoint: URL) -> [String] {

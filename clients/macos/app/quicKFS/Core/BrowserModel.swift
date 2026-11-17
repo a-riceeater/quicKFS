@@ -47,6 +47,7 @@ final class BrowserModel {
     }
 
     let connection: ServerConnection
+    private let log: ConsoleLog
     private(set) var path: [Crumb] = [Crumb(node: RemoteNode.rootID, name: "/")]
     private(set) var forwardStack: [[Crumb]] = []
     private(set) var backStack: [[Crumb]] = []
@@ -58,8 +59,9 @@ final class BrowserModel {
     var sortOrder = [KeyPathComparator(\RemoteNode.displayName, comparator: .localizedStandard)]
     var showHidden = false
 
-    init(connection: ServerConnection) {
+    init(connection: ServerConnection, log: ConsoleLog) {
         self.connection = connection
+        self.log = log
     }
 
     var directory: UUID { path.last?.node ?? RemoteNode.rootID }
@@ -277,6 +279,7 @@ final class BrowserModel {
                 let reply: Reply = try await connection.request(op, fields)
                 let item = TransferItem(id: reply.transfer, title: title, direction: direction, destination: destination)
                 transfers.append(item)
+                log.append(.app, .info, "\(op) started: \(title)")
                 await poll(item)
             } catch let failure as CoreError {
                 error = failure
@@ -291,6 +294,19 @@ final class BrowserModel {
             else { return }
             item.update(status)
             if status.state != .running {
+                let seconds = Date.now.timeIntervalSince(item.startedAt)
+                switch status.state {
+                case .finished:
+                    let rate = seconds > 0 ? Double(status.bytes) / seconds : 0
+                    log.append(.app, .notice, String(format: "%@ finished: %@ · %@ in %.1f s · %@/s",
+                        item.direction == .download ? "download" : "upload", item.title,
+                        Format.bytes(status.bytes), seconds, Format.bytes(UInt64(rate))))
+                case .failed:
+                    log.append(.app, .error, "\(item.title) failed: \(status.error?.message ?? "unknown error")")
+                case .cancelled:
+                    log.append(.app, .warning, "\(item.title) cancelled")
+                case .running: break
+                }
                 if status.state == .failed, let failure = status.error { error = failure }
                 if item.direction != .download { await reload() }
                 return

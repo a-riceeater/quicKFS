@@ -24,11 +24,13 @@ final class ServerConnection {
     private var connectTask: Task<UInt64, Error>?
     private var sampler: Task<Void, Never>?
     private let profile: @MainActor () -> ServerProfile
+    private let log: ConsoleLog
 
     private static let latencySamples = 48
 
-    init(profile: @escaping @MainActor () -> ServerProfile) {
+    init(profile: @escaping @MainActor () -> ServerProfile, log: ConsoleLog) {
         self.profile = profile
+        self.log = log
     }
 
     var isOnline: Bool { phase == .online }
@@ -40,6 +42,8 @@ final class ServerConnection {
         if let connectTask { return try await connectTask.value }
         let profile = profile()
         phase = .connecting
+        log.append(.app, .info, "connecting to \(profile.serverName) at \(profile.address) as \(profile.username)")
+        let started = Date.now
         let task = Task<UInt64, Error> {
             guard let password = await Keychain.load(for: profile.id) else {
                 throw CoreError(code: "Unauthenticated", message: "Enter the password for \(profile.username).")
@@ -61,10 +65,17 @@ final class ServerConnection {
             let id = try await task.value
             session = id
             phase = .online
+            let elapsed = Date.now.timeIntervalSince(started) * 1000
+            log.append(.app, .notice, String(format: "session %llu authenticated in %.0f ms", id, elapsed))
+            if let capabilities {
+                log.append(.link, .info,
+                    "epoch \(capabilities.serverEpoch.uuidString.lowercased().prefix(8)) · \(capabilities.writable ? "read-write" : "read-only") · reads ≤ \(Format.bytes(capabilities.maxReadSize)) · writes ≤ \(Format.bytes(capabilities.maxWriteSize))")
+            }
             startSampling()
             return id
         } catch let error as CoreError {
             phase = .failed(error)
+            log.append(.app, .error, "connect failed [\(error.code)]: \(error.message)")
             throw error
         } catch {
             let wrapped = CoreError(code: "client", message: error.localizedDescription)
@@ -97,6 +108,7 @@ final class ServerConnection {
                 return try await Core.call(op, fields, as: type)
             } catch let error as CoreError where error.isConnectionLoss && attempt == 0 {
                 attempt += 1
+                log.append(.link, .warning, "session \(id) lost [\(error.code)]; reconnecting")
                 if session == id { session = nil }
                 sampler?.cancel()
                 // Release the dead session's resources in the core.

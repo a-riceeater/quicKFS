@@ -7,15 +7,19 @@ import Observation
 @Observable
 final class ServerState: Identifiable {
     let id: UUID
+    let log = ConsoleLog()
     let connection: ServerConnection
-    let mount = MountController()
+    let mount: MountController
     /// Kept per server so navigation and transfers survive switching views.
     let browser: BrowserModel
+    let telemetry: Telemetry
 
     init(id: UUID, profile: @escaping @MainActor () -> ServerProfile) {
         self.id = id
-        connection = ServerConnection(profile: profile)
-        browser = BrowserModel(connection: connection)
+        connection = ServerConnection(profile: profile, log: log)
+        mount = MountController(log: log)
+        browser = BrowserModel(connection: connection, log: log)
+        telemetry = Telemetry(connection: connection, mount: mount, log: log)
     }
 }
 
@@ -149,11 +153,49 @@ final class AppModel {
 
     func unmount(_ id: UUID) { states[id]?.mount.unmount() }
 
+    /// Eject, wait for the helper to exit, and mount again with current settings.
+    func remount(_ id: UUID) {
+        guard let state = states[id] else { return }
+        Task {
+            await state.mount.shutdown()
+            mount(id)
+        }
+    }
+
     func toggleMount(_ id: UUID) {
         if state(id).mount.isActive { unmount(id) } else { mount(id) }
     }
 
     var activeMounts: Int { states.values.filter { $0.mount.isActive }.count }
+
+    // MARK: Offline cache
+
+    struct CacheUsage: Decodable, Sendable {
+        let bytes: UInt64
+        let files: UInt64
+        let namespaces: UInt64
+    }
+
+    private(set) var cacheUsage: CacheUsage?
+
+    func refreshCacheUsage() async {
+        cacheUsage = try? await Core.call("cache_usage", ["cache_dir": .string(Paths.cache.path)])
+    }
+
+    /// Delete every server's cached data. Refused while anything is mounted,
+    /// because a live mount keeps its cache files open.
+    func clearCache() async throws -> UInt64 {
+        guard activeMounts == 0 else {
+            throw CoreError(code: "busy", message: "Eject all servers before clearing the cache.")
+        }
+        struct Reply: Decodable, Sendable { let freed: UInt64 }
+        let reply: Reply = try await Core.call("cache_clear", ["cache_dir": .string(Paths.cache.path)])
+        for state in states.values {
+            state.log.append(.app, .notice, "offline cache cleared (\(Format.bytes(reply.freed)) freed)")
+        }
+        await refreshCacheUsage()
+        return reply.freed
+    }
 
     func shutdown() async {
         await withTaskGroup(of: Void.self) { group in
