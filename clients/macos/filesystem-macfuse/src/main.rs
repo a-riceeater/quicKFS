@@ -167,6 +167,11 @@ mod macos {
         /// Select the macFUSE 5 FSKit backend when the kernel extension is unavailable.
         #[arg(long, value_enum, default_value_t)]
         macfuse_backend: Backend,
+        /// Read the password from the first line of standard input instead of
+        /// prompting on the controlling terminal. The macOS app launches the
+        /// mount without a terminal and supplies the Keychain credential here.
+        #[arg(long)]
+        password_stdin: bool,
     }
 
     pub fn run() -> Result<()> {
@@ -210,7 +215,11 @@ mod macos {
             .context("failed to read the authenticated server certificate identity")?;
         identity_check.close();
 
-        let password = Zeroizing::new(rpassword::prompt_password("Password: ")?);
+        let password = if cli.password_stdin {
+            read_password_line(std::io::stdin().lock())?
+        } else {
+            Zeroizing::new(rpassword::prompt_password("Password: ")?)
+        };
         // Reconnect after the potentially long prompt and reapply exactly the
         // same trust policy before transmitting the credential.
         let connection = AuthenticatedConnectionConfig::new(
@@ -316,6 +325,48 @@ mod macos {
              or use --ca-cert/--trust-system-roots for centrally managed PKI",
             )?;
         Ok(ServerTrust::pinned(fingerprint))
+    }
+
+    /// Longest accepted stdin password line, so a misbehaving parent cannot
+    /// make the mount buffer unbounded input before authenticating.
+    const MAX_STDIN_PASSWORD_BYTES: u64 = 4_096;
+
+    fn read_password_line(input: impl std::io::BufRead) -> Result<Zeroizing<String>> {
+        use std::io::{BufRead, Read as _};
+
+        let mut line = Zeroizing::new(Vec::new());
+        input
+            .take(MAX_STDIN_PASSWORD_BYTES + 1)
+            .read_until(b'\n', &mut line)
+            .context("failed to read the password from standard input")?;
+        if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_STDIN_PASSWORD_BYTES {
+            bail!("the standard-input password exceeds {MAX_STDIN_PASSWORD_BYTES} bytes");
+        }
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        if line.is_empty() {
+            bail!("no password was supplied on standard input");
+        }
+        let text = std::str::from_utf8(&line)
+            .context("the standard-input password is not valid UTF-8")?;
+        Ok(Zeroizing::new(text.to_owned()))
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod tests {
+        use super::read_password_line;
+
+        #[test]
+        fn stdin_password_strips_line_endings_and_rejects_empty_or_huge_input() {
+            assert_eq!(
+                read_password_line(&b"secret\r\nignored"[..]).unwrap().as_str(),
+                "secret"
+            );
+            assert!(read_password_line(&b"\n"[..]).is_err());
+            assert!(read_password_line(&vec![b'a'; 5_000][..]).is_err());
+        }
     }
 
     fn validate_mountpoint(path: &Path) -> Result<PathBuf> {
