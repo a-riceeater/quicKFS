@@ -23,11 +23,11 @@ final class ServerConnection {
     private var session: UInt64?
     private var connectTask: Task<UInt64, Error>?
     private var sampler: Task<Void, Never>?
-    private let profile: () -> ServerProfile
+    private let profile: @MainActor () -> ServerProfile
 
     private static let latencySamples = 48
 
-    init(profile: @escaping () -> ServerProfile) {
+    init(profile: @escaping @MainActor () -> ServerProfile) {
         self.profile = profile
     }
 
