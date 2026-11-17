@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
 use quickfs_protocol::{
-    ALPN_PROTOCOL, CodecError, Envelope, PROTOCOL_MAJOR, Request, Response, decode_frame,
-    encode_frame, parse_frame_header, version_major,
+    ALPN_PROTOCOL, CodecError, Envelope, PROTOCOL_MAJOR, PROTOCOL_VERSION, Request, Response,
+    decode_frame, decode_frame_measured, encode_frame, encode_frame_measured, parse_frame_header,
+    version_major,
 };
 use quinn::{Connection, Endpoint, TransportConfig, VarInt};
 pub use quinn::{RecvStream, SendStream};
@@ -17,7 +18,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -112,7 +113,54 @@ pub struct QuicClient {
     /// compression — e.g. [`quickfs_protocol::peer_supports_metadata_batch`] —
     /// without threading the version through every call site.
     server_version: AtomicU16,
+    counters: FrameCounters,
 }
+
+/// Running totals of quickfs protocol traffic on one client connection.
+#[derive(Default)]
+struct FrameCounters {
+    streams: AtomicU64,
+    frames_sent: AtomicU64,
+    frames_received: AtomicU64,
+    compressed_sent: AtomicU64,
+    compressed_received: AtomicU64,
+    wire_sent: AtomicU64,
+    wire_received: AtomicU64,
+    payload_sent: AtomicU64,
+    payload_received: AtomicU64,
+    data_sent: AtomicU64,
+    data_received: AtomicU64,
+}
+
+/// A snapshot of the quickfs protocol as negotiated and used on a connection,
+/// for diagnostics. Frames are the length-prefixed postcard control messages;
+/// "data" is the raw file bytes that follow `ReadRange`/`WriteRange` frames.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ProtocolStats {
+    pub alpn: &'static str,
+    /// This client's packed major.minor version.
+    pub client_version: u16,
+    /// The server's packed version from `HelloAck`; 0 before negotiation.
+    pub server_version: u16,
+    /// Whether outbound frames may be zstd-compressed (minor 6.3 and later).
+    pub compression: bool,
+    /// Request streams opened; each operation uses one bidirectional stream.
+    pub streams: u64,
+    pub frames_sent: u64,
+    pub frames_received: u64,
+    pub compressed_frames_sent: u64,
+    pub compressed_frames_received: u64,
+    /// Framed control bytes on the wire, including the four-byte prefix.
+    pub frame_bytes_sent: u64,
+    pub frame_bytes_received: u64,
+    /// The same frames before compression.
+    pub payload_bytes_sent: u64,
+    pub payload_bytes_received: u64,
+    /// Raw file data following data-carrying frames.
+    pub data_bytes_sent: u64,
+    pub data_bytes_received: u64,
+}
+
 impl QuicClient {
     pub async fn connect(
         server: SocketAddr,
@@ -224,6 +272,7 @@ impl QuicClient {
             timeout,
             compression: AtomicBool::new(false),
             server_version: AtomicU16::new(0),
+            counters: FrameCounters::default(),
         })
     }
 
@@ -259,12 +308,34 @@ impl QuicClient {
             .ok_or_else(|| TransportError::Tls("server certificate chain is empty".into()))?;
         Ok(certificate_sha256(certificate))
     }
+    /// Snapshot the protocol version, negotiated features, and traffic totals.
+    pub fn protocol_stats(&self) -> ProtocolStats {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let counters = &self.counters;
+        ProtocolStats {
+            alpn: std::str::from_utf8(ALPN_PROTOCOL).unwrap_or("quickfs"),
+            client_version: PROTOCOL_VERSION,
+            server_version: self.server_version(),
+            compression: self.compression.load(Ordering::Relaxed),
+            streams: load(&counters.streams),
+            frames_sent: load(&counters.frames_sent),
+            frames_received: load(&counters.frames_received),
+            compressed_frames_sent: load(&counters.compressed_sent),
+            compressed_frames_received: load(&counters.compressed_received),
+            frame_bytes_sent: load(&counters.wire_sent),
+            frame_bytes_received: load(&counters.wire_received),
+            payload_bytes_sent: load(&counters.payload_sent),
+            payload_bytes_received: load(&counters.payload_received),
+            data_bytes_sent: load(&counters.data_sent),
+            data_bytes_received: load(&counters.data_received),
+        }
+    }
     pub async fn stream(&self) -> Result<(SendStream, RecvStream), TransportError> {
-        Ok(
-            tokio::time::timeout(self.timeout, self.connection.open_bi())
-                .await
-                .map_err(|_| TransportError::Timeout)??,
-        )
+        let pair = tokio::time::timeout(self.timeout, self.connection.open_bi())
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+        self.counters.streams.fetch_add(1, Ordering::Relaxed);
+        Ok(pair)
     }
     pub async fn send_frame<T: Serialize>(
         &self,
@@ -272,23 +343,66 @@ impl QuicClient {
         value: &T,
     ) -> Result<(), TransportError> {
         let compress = self.compression.load(Ordering::Relaxed);
-        tokio::time::timeout(self.timeout, write_frame(send, value, compress))
+        let (prefix, body, payload) = encode_frame_measured(value, compress)?;
+        let body = Zeroizing::new(body);
+        let write = async {
+            send.write_all(&prefix.to_be_bytes()).await?;
+            send.write_all(&body).await?;
+            Ok::<(), TransportError>(())
+        };
+        tokio::time::timeout(self.timeout, write)
             .await
-            .map_err(|_| TransportError::Timeout)?
+            .map_err(|_| TransportError::Timeout)??;
+        let counters = &self.counters;
+        counters.frames_sent.fetch_add(1, Ordering::Relaxed);
+        if parse_frame_header(prefix).is_ok_and(|(compressed, _)| compressed) {
+            counters.compressed_sent.fetch_add(1, Ordering::Relaxed);
+        }
+        counters
+            .wire_sent
+            .fetch_add(4 + body.len() as u64, Ordering::Relaxed);
+        counters
+            .payload_sent
+            .fetch_add(4 + payload as u64, Ordering::Relaxed);
+        Ok(())
     }
     pub async fn send_all(&self, send: &mut SendStream, data: &[u8]) -> Result<(), TransportError> {
         tokio::time::timeout(self.timeout, send.write_all(data))
             .await
             .map_err(|_| TransportError::Timeout)??;
+        self.counters
+            .data_sent
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
     }
     pub async fn receive_frame<T: DeserializeOwned>(
         &self,
         recv: &mut RecvStream,
     ) -> Result<T, TransportError> {
-        tokio::time::timeout(self.timeout, read_frame(recv))
+        let read = async {
+            let mut prefix = [0; 4];
+            recv.read_exact(&mut prefix).await?;
+            let (compressed, size) = parse_frame_header(u32::from_be_bytes(prefix))?;
+            let mut body = Zeroizing::new(vec![0; size]);
+            recv.read_exact(&mut body).await?;
+            let (value, payload) = decode_frame_measured(compressed, &body)?;
+            Ok::<_, TransportError>((value, compressed, size, payload))
+        };
+        let (value, compressed, size, payload) = tokio::time::timeout(self.timeout, read)
             .await
-            .map_err(|_| TransportError::Timeout)?
+            .map_err(|_| TransportError::Timeout)??;
+        let counters = &self.counters;
+        counters.frames_received.fetch_add(1, Ordering::Relaxed);
+        if compressed {
+            counters.compressed_received.fetch_add(1, Ordering::Relaxed);
+        }
+        counters
+            .wire_received
+            .fetch_add(4 + size as u64, Ordering::Relaxed);
+        counters
+            .payload_received
+            .fetch_add(4 + payload as u64, Ordering::Relaxed);
+        Ok(value)
     }
     pub async fn receive_exact(
         &self,
@@ -298,6 +412,9 @@ impl QuicClient {
         tokio::time::timeout(self.timeout, recv.read_exact(data))
             .await
             .map_err(|_| TransportError::Timeout)??;
+        self.counters
+            .data_received
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
     }
     pub fn connection(&self) -> &Connection {
