@@ -177,8 +177,10 @@ struct TransferDetail: View {
                 row("control bytes", Format.bytes(control))
                 row(item.direction == .download ? "file data in" : "file data out",
                     Format.bytes(item.direction == .download ? item.protocolDelta(\.dataBytesReceived) : item.protocolDelta(\.dataBytesSent)))
-                if proto.compressionSavings > 0 {
-                    row("saved by zstd", String(format: "%.0f%% of control", proto.compressionSavings * 100))
+                // Savings for this transfer's frames only, not the whole session.
+                let payload = item.protocolDelta(\.payloadBytesSent) + item.protocolDelta(\.payloadBytesReceived)
+                if payload > control, control > 0 {
+                    row("saved by zstd", String(format: "%.0f%% of control", (1 - Double(control) / Double(payload)) * 100))
                 }
             } else {
                 Text("not negotiated yet").foregroundStyle(.tertiary)
