@@ -183,7 +183,7 @@ struct PinnedServer: Decodable, Hashable, Sendable {
     let sha256: String
 }
 
-struct Environment: Decodable, Sendable {
+struct CoreEnvironment: Decodable, Sendable {
     let macfuseInstalled: Bool
     let macfuseInstallUrl: String
     let maxClientReadSize: UInt64

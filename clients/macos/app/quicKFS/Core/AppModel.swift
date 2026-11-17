@@ -22,7 +22,7 @@ final class AppModel {
     private(set) var profiles: [ServerProfile] = []
     private(set) var states: [UUID: ServerState] = [:]
     private(set) var pins: [PinnedServer] = []
-    private(set) var environment: Environment?
+    private(set) var environment: CoreEnvironment?
     private(set) var environmentError: String?
     var selection: UUID?
     var isAddingServer = false
