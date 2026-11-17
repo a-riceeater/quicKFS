@@ -40,6 +40,17 @@ struct QuickFSApp: App {
         }
         .menuBarExtraStyle(.window)
 
+        // One floating, freely draggable window per transfer.
+        WindowGroup("Transfer", id: TransferWindow.id, for: UInt64.self) { $transfer in
+            TransferWindow(transfer: transfer)
+                .environment(model)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .windowBackgroundDragBehavior(.enabled)
+        .defaultPosition(.topTrailing)
+        .restorationBehavior(.disabled)
+
         Settings {
             SettingsView()
                 .environment(model)

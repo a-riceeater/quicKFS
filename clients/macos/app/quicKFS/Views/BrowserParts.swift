@@ -94,7 +94,7 @@ struct TransferTray: View {
 
 private struct TransferRow: View {
     let item: TransferItem
-    @State private var showingDetail = false
+    @Environment(\.openWindow) private var openWindow
     @State private var hovering = false
 
     var body: some View {
@@ -141,13 +141,10 @@ private struct TransferRow: View {
         .glassEffect(hovering ? .regular.tint(.accentColor.opacity(0.12)).interactive() : .regular.interactive(),
                      in: .rect(cornerRadius: 14))
         .onHover { hovering = $0 }
-        .onTapGesture { showingDetail = true }
-        .popover(isPresented: $showingDetail, arrowEdge: .leading) {
-            TransferDetail(item: item)
-        }
+        .onTapGesture { openWindow(id: TransferWindow.id, value: item.id) }
         .help("Show transfer details")
         #if DEBUG
-        .onAppear { if DebugHooks.showTransferDetail { showingDetail = true } }
+        .onAppear { if DebugHooks.showTransferDetail { openWindow(id: TransferWindow.id, value: item.id) } }
         #endif
         .animation(.smooth(duration: 0.15), value: hovering)
     }

@@ -263,6 +263,48 @@ struct TransferDetail: View {
     }
 }
 
+/// The window that hosts a transfer's details. It floats above the main
+/// window, is dragged by its background, and keeps the last state after the
+/// transfer ends.
+struct TransferWindow: View {
+    static let id = "transfer"
+    let transfer: UInt64?
+    @Environment(AppModel.self) private var model
+    @State private var item: TransferItem?
+
+    var body: some View {
+        ZStack {
+            if let item {
+                TransferDetail(item: item)
+                    .padding(.top, 10)
+            } else {
+                Placard(symbol: "arrow.up.arrow.down.circle", title: "Transfer cleared")
+                    .frame(width: 360, height: 220)
+            }
+        }
+        .containerBackground(.regularMaterial, for: .window)
+        .onAppear {
+            // Hold the item so the window survives the tray being cleared.
+            if item == nil, let transfer { item = model.transfer(transfer) }
+        }
+        .background(WindowLevel())
+    }
+}
+
+/// Keep transfer windows above the main window while they are open.
+private struct WindowLevel: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            view.window?.level = .floating
+            view.window?.isMovableByWindowBackground = true
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
 /// A titled monospaced grid used for the link and protocol columns.
 private struct DetailBlock<Content: View>: View {
     let title: String
