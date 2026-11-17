@@ -2,7 +2,15 @@
 import Foundation
 import Observation
 
-/// A long-running upload or download tracked by polling the core.
+/// One point on a transfer's speed chart.
+struct TransferRateSample: Identifiable, Sendable {
+    let id: Int
+    let elapsed: Double
+    let rate: Double
+}
+
+/// A long-running upload or download tracked by polling the core, with the
+/// link and protocol counters sampled while it runs.
 @MainActor
 @Observable
 final class TransferItem: Identifiable {
@@ -14,6 +22,13 @@ final class TransferItem: Identifiable {
     let destination: URL?
     private(set) var status: TransferStatus?
     private(set) var startedAt = Date.now
+    private(set) var finishedAt: Date?
+    private(set) var rates: [TransferRateSample] = []
+    private(set) var peakRate: Double = 0
+    /// Link counters when the transfer began and most recently.
+    private(set) var linkStart: LinkSnapshot?
+    private(set) var link: LinkSnapshot?
+    private var windowStart: (Date, UInt64)?
 
     init(id: UInt64, title: String, direction: Direction, destination: URL?) {
         self.id = id
@@ -24,17 +39,81 @@ final class TransferItem: Identifiable {
 
     var isRunning: Bool { status == nil || status?.state == .running }
 
-    /// Bytes per second since the transfer began.
+    var elapsed: TimeInterval { (finishedAt ?? .now).timeIntervalSince(startedAt) }
+
+    /// Average bytes per second over the whole transfer.
     var rate: Double {
         guard let status else { return 0 }
-        let elapsed = Date.now.timeIntervalSince(startedAt)
         return elapsed > 0.5 ? Double(status.bytes) / elapsed : 0
     }
 
-    func update(_ status: TransferStatus) { self.status = status }
+    /// The most recent one-second rate, or the average before there is one.
+    var currentRate: Double { isRunning ? (rates.last?.rate ?? rate) : 0 }
+
+    var remaining: TimeInterval? {
+        guard let status, isRunning, status.total > status.bytes else { return nil }
+        let recent = rates.suffix(5).map(\.rate)
+        let speed = recent.isEmpty ? rate : recent.reduce(0, +) / Double(recent.count)
+        return speed > 0 ? Double(status.total - status.bytes) / speed : nil
+    }
+
+    func update(_ status: TransferStatus) {
+        self.status = status
+        let now = Date.now
+        if let (since, bytes) = windowStart {
+            let span = now.timeIntervalSince(since)
+            if span >= 1 {
+                let rate = Double(status.bytes &- bytes) / span
+                rates.append(TransferRateSample(id: rates.count, elapsed: now.timeIntervalSince(startedAt), rate: rate))
+                peakRate = max(peakRate, rate)
+                windowStart = (now, status.bytes)
+            }
+        } else {
+            windowStart = (now, status.bytes)
+        }
+        if status.state != .running, finishedAt == nil { finishedAt = now }
+    }
+
+    func updateLink(_ snapshot: LinkSnapshot) {
+        if linkStart == nil || (link.map { snapshot.reconnects != $0.reconnects } ?? false) {
+            linkStart = snapshot
+        }
+        link = snapshot
+    }
+
+    /// Counter change since the transfer began, robust to a reconnect.
+    func delta(_ value: (LinkSnapshot) -> UInt64) -> UInt64 {
+        guard let link, let linkStart else { return 0 }
+        let now = value(link), then = value(linkStart)
+        return now >= then ? now - then : now
+    }
+
+    func protocolDelta(_ value: (ProtocolSnapshot) -> UInt64) -> UInt64 {
+        guard let now = link?.protocol, let then = linkStart?.protocol else { return 0 }
+        let a = value(now), b = value(then)
+        return a >= b ? a - b : a
+    }
 
     func cancel() {
         Task { _ = try? await Core.call("transfer_cancel", ["transfer": .uint(id)], as: EmptyReply.self) }
+    }
+
+    /// A plain-text report for pasting into an issue.
+    var summary: String {
+        var lines = ["quicKFS \(direction == .download ? "download" : direction == .upload ? "upload" : "write"): \(title)"]
+        if let status {
+            lines.append("state \(status.state.rawValue), \(Format.bytes(status.bytes)) of \(Format.bytes(status.total)), \(status.files)/\(status.filesTotal) files")
+        }
+        lines.append(String(format: "elapsed %.1f s, average %@/s, peak %@/s", elapsed, Format.bytes(UInt64(rate)), Format.bytes(UInt64(peakRate))))
+        if let link {
+            lines.append(String(format: "rtt %.2f ms, mtu %d, cwnd %@", Double(link.rttUs) / 1000, Int(link.mtu), Format.bytes(link.congestionWindow)))
+            lines.append("packets \(delta(\.packetsSent)) sent, \(delta(\.packetsLost)) lost, \(delta(\.congestionEvents)) congestion events")
+            if let proto = link.protocol {
+                lines.append("protocol \(proto.alpn) client \(ProtocolSnapshot.version(proto.clientVersion)) server \(ProtocolSnapshot.version(proto.serverVersion)) compression \(proto.compression ? "on" : "off")")
+                lines.append("streams \(protocolDelta(\.streams)), frames \(protocolDelta(\.framesSent))/\(protocolDelta(\.framesReceived)), data \(Format.bytes(protocolDelta(\.dataBytesReceived))) in / \(Format.bytes(protocolDelta(\.dataBytesSent))) out")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -287,13 +366,25 @@ final class BrowserModel {
         }
     }
 
+    private func sampleLink(into item: TransferItem) async {
+        struct Reply: Decodable, Sendable { let link: LinkSnapshot? }
+        if let reply: Reply = try? await connection.request("link_stats"), let link = reply.link {
+            item.updateLink(link)
+        }
+    }
+
     private func poll(_ item: TransferItem) async {
+        await sampleLink(into: item)
+        var tick = 0
         while true {
+            tick += 1
+            if tick % 5 == 0 { await sampleLink(into: item) }
             guard let status: TransferStatus = try? await Core.call(
                 "transfer_status", ["transfer": .uint(item.id)])
             else { return }
             item.update(status)
             if status.state != .running {
+                await sampleLink(into: item)
                 let seconds = Date.now.timeIntervalSince(item.startedAt)
                 switch status.state {
                 case .finished:

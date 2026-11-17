@@ -16,6 +16,40 @@ struct LinkSnapshot: Decodable, Equatable, Sendable {
     let bytesLost: UInt64
     let congestionEvents: UInt64
     let reconnects: UInt64
+    /// Absent from helpers older than the protocol counters.
+    let `protocol`: ProtocolSnapshot?
+}
+
+/// The quickfs protocol as negotiated and used on one connection.
+struct ProtocolSnapshot: Decodable, Equatable, Sendable {
+    let alpn: String
+    let clientVersion: UInt16
+    let serverVersion: UInt16
+    let compression: Bool
+    let streams: UInt64
+    let framesSent: UInt64
+    let framesReceived: UInt64
+    let compressedFramesSent: UInt64
+    let compressedFramesReceived: UInt64
+    let frameBytesSent: UInt64
+    let frameBytesReceived: UInt64
+    let payloadBytesSent: UInt64
+    let payloadBytesReceived: UInt64
+    let dataBytesSent: UInt64
+    let dataBytesReceived: UInt64
+
+    /// "6.4" from a packed major/minor word.
+    static func version(_ word: UInt16) -> String {
+        word == 0 ? "—" : "\(word >> 8).\(word & 0xff)"
+    }
+
+    /// Control bytes saved by frame compression, as a fraction of the
+    /// uncompressed size (both directions).
+    var compressionSavings: Double {
+        let payload = payloadBytesSent + payloadBytesReceived
+        let wire = frameBytesSent + frameBytesReceived
+        return payload == 0 || wire >= payload ? 0 : 1 - Double(wire) / Double(payload)
+    }
 }
 
 /// One second of link activity, derived from two snapshots.

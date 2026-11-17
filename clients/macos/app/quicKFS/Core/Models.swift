@@ -173,6 +173,11 @@ struct TransferStatus: Decodable, Sendable {
     let files: UInt64
     let filesTotal: UInt64
     let error: CoreError?
+    /// The file being copied now, relative to the transfer's root.
+    let current: String?
+    /// Bytes per pipelined request and how many requests stay in flight.
+    let chunkBytes: UInt64?
+    let pipelineDepth: Int?
 
     var fraction: Double { total == 0 ? 0 : min(1, Double(bytes) / Double(total)) }
 }
