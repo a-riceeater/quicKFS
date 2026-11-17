@@ -18,8 +18,7 @@ pub use ffi::{quickfs_bridge_call, quickfs_bridge_free};
 
 use model::{BridgeError, BridgeResult, Endpoint, TrustSpec, node_id};
 use quickfs_client_core::{
-    MAX_CLIENT_READ_SIZE, MAX_CLIENT_WRITE_SIZE, ensure_server_unpinned, list_trusted_server_pins,
-    lock_trust_store, parse_sha256_fingerprint, remove_trusted_server_pin, save_trusted_server_pin,
+    MAX_CLIENT_READ_SIZE, MAX_CLIENT_WRITE_SIZE, TrustStore, parse_sha256_fingerprint,
     verify_pairing,
 };
 use quickfs_transport_quic::{PairingClient, certificate_sha256, load_certificates};
@@ -240,7 +239,8 @@ async fn dispatch(
         })),
         Request::Resolve { host } => resolve(&host).await,
         Request::TrustList { state_dir } => {
-            let pins: Vec<Value> = list_trusted_server_pins(&state_dir)?
+            let pins: Vec<Value> = TrustStore::open(&state_dir)?
+                .list()?
                 .into_iter()
                 .map(|pin| {
                     json!({
@@ -259,8 +259,8 @@ async fn dispatch(
             code,
         } => pair(state_dir, server, pairing_id, code).await,
         Request::Forget { state_dir, server } => {
-            let lock = lock_trust_store(&state_dir)?;
-            remove_trusted_server_pin(&lock, server.address, &server.server_name)?;
+            let store = TrustStore::open(&state_dir)?;
+            store.lock()?.forget(server.address, &server.server_name)?;
             Ok(json!({}))
         }
         Request::TrustImport {
@@ -282,9 +282,10 @@ async fn dispatch(
                     ));
                 }
             };
-            let lock = lock_trust_store(&state_dir)?;
-            ensure_server_unpinned(&state_dir, server.address, &server.server_name)?;
-            save_trusted_server_pin(&lock, server.address, &server.server_name, fingerprint)?;
+            let store = TrustStore::open(&state_dir)?;
+            let guard = store.lock()?;
+            store.ensure_unpinned(server.address, &server.server_name)?;
+            guard.pin(server.address, &server.server_name, fingerprint)?;
             Ok(json!({ "sha256": hex::encode(fingerprint) }))
         }
         Request::Connect {
@@ -457,15 +458,17 @@ async fn pair(
     pairing_id: Uuid,
     code: Zeroizing<String>,
 ) -> BridgeResult<Value> {
-    ensure_server_unpinned(&state_dir, server.address, &server.server_name)?;
-    let lock = lock_trust_store(&state_dir)?;
-    ensure_server_unpinned(&state_dir, server.address, &server.server_name)?;
+    let store = TrustStore::open(&state_dir)?;
+    store.ensure_unpinned(server.address, &server.server_name)?;
+    // Recheck under the writer lock before consuming the one-time code.
+    let guard = store.lock()?;
+    store.ensure_unpinned(server.address, &server.server_name)?;
     let transport =
         PairingClient::connect(server.address, &server.server_name, PAIRING_TIMEOUT).await?;
     let verified = verify_pairing(&transport, pairing_id, &code).await;
     transport.close();
     let fingerprint = verified?;
-    save_trusted_server_pin(&lock, server.address, &server.server_name, fingerprint)?;
+    guard.pin(server.address, &server.server_name, fingerprint)?;
     Ok(json!({ "sha256": hex::encode(fingerprint) }))
 }
 

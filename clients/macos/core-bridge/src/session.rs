@@ -5,7 +5,7 @@
 use crate::model::{BridgeError, BridgeResult, Endpoint, NodeInfo, TrustSpec, entry_name, node_id};
 use quickfs_client_core::{
     AuthenticatedConnectionConfig, ReconnectPolicy, RemoteFilesystem, ResilientFilesystem,
-    ServerTrust, load_trusted_server_pin, resolve_path,
+    ResilientFilesystemOptions, ServerTrust, load_trusted_server_pin, resolve_path,
 };
 use quickfs_protocol::{
     AttributeChanges, FileAccess, FileOpenOptions, FilesystemCapabilities, Name, NodeId, NodeKind,
@@ -88,10 +88,14 @@ pub async fn connect(
     );
     let resilient = ResilientFilesystem::connect_authenticated(
         config,
-        ReconnectPolicy {
-            attempts: 3,
-            initial_backoff: Duration::from_millis(100),
-            maximum_backoff: Duration::from_secs(2),
+        ResilientFilesystemOptions {
+            reconnect: ReconnectPolicy {
+                attempts: 3,
+                initial_backoff: Duration::from_millis(100),
+                maximum_backoff: Duration::from_secs(2),
+            },
+            // One browsing or transfer step, including reconnect and retry.
+            operation_deadline: Duration::from_secs(120),
         },
     )
     .await?;
