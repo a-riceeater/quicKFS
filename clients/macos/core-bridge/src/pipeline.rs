@@ -25,6 +25,8 @@ pub const MAX_DEPTH_LIMIT: usize = 32;
 pub const DEFAULT_RETRY_WINDOW: Duration = Duration::from_secs(300);
 /// Completions the rate estimate looks back over.
 const RATE_SAMPLES: usize = 8;
+/// Shortest span of completions a rate is measured over.
+const MIN_RATE_SPAN: f64 = 0.25;
 /// Completions older than this no longer describe the link.
 const RATE_HORIZON: Duration = Duration::from_secs(20);
 
@@ -146,7 +148,9 @@ impl Pipeline {
         let (first, _) = self.completions.front()?;
         let (last, _) = self.completions.back()?;
         let span = last.duration_since(*first).as_secs_f64();
-        if self.completions.len() < 2 || span < 0.05 {
+        // A burst of chunks that arrived while the reader was busy would
+        // read as an absurd rate over a few milliseconds.
+        if self.completions.len() < 2 || span < MIN_RATE_SPAN {
             return None;
         }
         let bytes: u64 = self

@@ -54,6 +54,8 @@ const FIRST_RETRY_DELAY: Duration = Duration::from_millis(2_500);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// Closing a handle on a link that just failed must not hold up the retry.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Resizes this close together are reported as one.
+const SHAPE_SETTLE: Duration = Duration::from_secs(2);
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -140,6 +142,11 @@ pub struct Progress {
     /// In-flight bytes when the pipeline was last reported, so steady
     /// small adjustments do not flood the event list.
     logged_in_flight: AtomicU64,
+    /// A resize not yet reported, and when the shape last changed: a burst
+    /// of resizes is logged once, after it settles.
+    pending_shape: Mutex<Option<(Shape, Option<f64>, Instant)>>,
+    /// Connections replaced so far, to report reconnects as they happen.
+    reconnects: AtomicU64,
     checkpoint: Mutex<Checkpoint>,
 }
 
@@ -161,6 +168,8 @@ impl Progress {
             retry_at: Mutex::new(None),
             events: Mutex::new(VecDeque::new()),
             logged_in_flight: AtomicU64::new(0),
+            pending_shape: Mutex::new(None),
+            reconnects: AtomicU64::new(u64::MAX),
             checkpoint: Mutex::new(Checkpoint::default()),
         }
     }
@@ -190,9 +199,31 @@ impl Progress {
     }
 
     /// Bytes landed for good: count them and restart the retry window.
-    fn commit(&self, amount: u64) {
+    /// Returns how long it had been since the previous commit.
+    fn commit(&self, amount: u64) -> Duration {
         self.bytes.fetch_add(amount, Ordering::Relaxed);
-        *lock(&self.last_commit) = Instant::now();
+        let gap = std::mem::replace(&mut *lock(&self.last_commit), Instant::now()).elapsed();
+        self.settle_shape();
+        gap
+    }
+
+    /// Report a connection the resilient layer replaced underneath us, which
+    /// otherwise shows only as a pause.
+    fn note_link(&self, filesystem: &dyn RemoteFilesystem, gap: Duration) {
+        let Some(stats) = filesystem.link_stats() else {
+            return;
+        };
+        let before = self.reconnects.swap(stats.reconnects, Ordering::Relaxed);
+        if before != u64::MAX && stats.reconnects > before {
+            self.event(
+                Level::Warning,
+                format!(
+                    "Reconnected to the server after {} without data (connection {})",
+                    seconds(gap),
+                    stats.reconnects + 1
+                ),
+            );
+        }
     }
 
     fn touch(&self) {
@@ -203,28 +234,55 @@ impl Progress {
         lock(&self.last_commit).elapsed()
     }
 
-    fn show_shape(&self, shape: Shape, rate: Option<f64>, why: &str) {
+    /// Publish the pipeline's shape. `report` logs it at once (the first
+    /// shape, a cut after a failure); ordinary resizes are logged by
+    /// [`Self::settle_shape`] once they stop changing.
+    fn show_shape(&self, shape: Shape, rate: Option<f64>, report: Option<&str>) {
         *lock(&self.shape) = shape;
         if rate.is_some() {
             *lock(&self.link_rate) = rate;
         }
+        match report {
+            Some(why) => {
+                *lock(&self.pending_shape) = None;
+                self.log_shape(why, shape, rate);
+            }
+            None => *lock(&self.pending_shape) = Some((shape, rate, Instant::now())),
+        }
+    }
+
+    fn settle_shape(&self) {
+        let mut pending = lock(&self.pending_shape);
+        let Some((shape, rate, changed)) = *pending else {
+            return;
+        };
+        if changed.elapsed() < SHAPE_SETTLE {
+            return;
+        }
+        *pending = None;
+        drop(pending);
+        // A step from 8 to 7 requests is noise; report halving or doubling.
         let logged = self.logged_in_flight.load(Ordering::Relaxed);
         let now = shape.in_flight();
-        // Report the first shape, any cut, and growth past 2x.
-        if logged == 0 || now < logged || now >= logged * 2 {
-            self.logged_in_flight.store(now, Ordering::Relaxed);
-            let rate = rate.map_or(String::new(), |rate| {
-                format!(", link about {}/s", bytes(rate as u64))
-            });
-            self.event(
-                Level::Info,
-                format!(
-                    "{why}: {} x {} in flight{rate}",
-                    shape.depth,
-                    bytes(shape.chunk)
-                ),
-            );
+        if now * 2 <= logged || now >= logged * 2 {
+            self.log_shape("Settled", shape, rate);
         }
+    }
+
+    fn log_shape(&self, why: &str, shape: Shape, rate: Option<f64>) {
+        self.logged_in_flight
+            .store(shape.in_flight(), Ordering::Relaxed);
+        let rate = rate.map_or(String::new(), |rate| {
+            format!(", link about {}/s", bytes(rate as u64))
+        });
+        self.event(
+            Level::Info,
+            format!(
+                "{why}: {} x {} in flight{rate}",
+                shape.depth,
+                bytes(shape.chunk)
+            ),
+        );
     }
 
     fn save_partial(&self, partial: Partial) {
@@ -944,7 +1002,7 @@ async fn copy_to_local(
     progress: &Progress,
 ) -> BridgeResult<()> {
     let mut pipeline = Pipeline::new(*tuning, read_limit);
-    progress.show_shape(pipeline.shape(), None, "Starting");
+    progress.show_shape(pipeline.shape(), None, Some("Starting"));
     let handle = remote.handle;
     let mut failures = 0;
     loop {
@@ -980,12 +1038,13 @@ async fn copy_to_local(
                     local.write_all(&read.data).await?;
                     let landed = read.data.len() as u64;
                     *committed += landed;
-                    progress.commit(landed);
+                    let gap = progress.commit(landed);
+                    progress.note_link(filesystem, gap);
                     failures = 0;
                     if let Some(shape) =
                         pipeline.complete(landed, started.elapsed(), Instant::now().into_std())
                     {
-                        progress.show_shape(shape, pipeline.rate(), "Resized");
+                        progress.show_shape(shape, pipeline.rate(), None);
                     }
                     if landed < expected {
                         // The file shrank after open; what was read is the whole file.
@@ -1001,7 +1060,7 @@ async fn copy_to_local(
         drop(inflight);
         let error = BridgeError::from(error);
         if let Some(shape) = pipeline.fail() {
-            progress.show_shape(shape, None, "Cut back after a failure");
+            progress.show_shape(shape, None, Some("Cut back after a failure"));
         }
         let what = format!("Chunk at {}", bytes(offset));
         if !progress
@@ -1344,7 +1403,7 @@ async fn write_from_local(
     progress: &Progress,
 ) -> BridgeResult<FileHandle> {
     let mut pipeline = Pipeline::new(*tuning, write_limit);
-    progress.show_shape(pipeline.shape(), None, "Starting");
+    progress.show_shape(pipeline.shape(), None, Some("Starting"));
     let reopen = FileOpenOptions {
         access: FileAccess::ReadWrite,
         truncate: false,
@@ -1402,7 +1461,7 @@ async fn write_from_local(
         let _ = tokio::time::timeout(CLOSE_GRACE, filesystem.close_file(current)).await;
         let error = BridgeError::from(error);
         if let Some(shape) = pipeline.fail() {
-            progress.show_shape(shape, None, "Cut back after a failure");
+            progress.show_shape(shape, None, Some("Cut back after a failure"));
         }
         let what = format!("Write at {}", bytes(committed));
         match progress
@@ -1497,11 +1556,12 @@ async fn write_wave(
             return Err(BridgeError::invalid("the server reported a partial write").into());
         }
         *committed += result.written;
-        progress.commit(result.written);
+        let gap = progress.commit(result.written);
+        progress.note_link(filesystem, gap);
         if let Some(shape) =
             pipeline.complete(result.written, started.elapsed(), Instant::now().into_std())
         {
-            progress.show_shape(shape, pipeline.rate(), "Resized");
+            progress.show_shape(shape, pipeline.rate(), None);
         }
     }
 }
@@ -2038,6 +2098,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "AlreadyExists");
         assert_eq!(lock(&fs.files)[&FILE], b"old");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_resizes_is_reported_once_it_settles() {
+        let progress = Progress::new();
+        let shape = |depth, chunk| Shape { depth, chunk };
+        progress.show_shape(shape(2, MIB), None, Some("Starting"));
+        for depth in [2, 4, 8, 7, 8] {
+            progress.show_shape(shape(depth, 4 * MIB), Some(20e6), None);
+            progress.commit(1);
+        }
+        assert_eq!(events(&progress), ["Starting: 2 x 1.0 MB in flight"]);
+        tokio::time::advance(SHAPE_SETTLE).await;
+        progress.commit(1);
+        assert_eq!(
+            events(&progress)[1],
+            "Settled: 8 x 4.2 MB in flight, link about 20 MB/s"
+        );
+        // Small wobbles after that stay out of the log.
+        progress.show_shape(shape(7, 4 * MIB), Some(18e6), None);
+        tokio::time::advance(SHAPE_SETTLE).await;
+        progress.commit(1);
+        assert_eq!(events(&progress).len(), 2);
     }
 
     #[test]
