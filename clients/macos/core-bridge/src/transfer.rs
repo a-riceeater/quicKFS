@@ -34,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -54,6 +54,9 @@ const FIRST_RETRY_DELAY: Duration = Duration::from_millis(2_500);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// Closing a handle on a link that just failed must not hold up the retry.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Files smaller than this read through one connection: opening the file on
+/// every extra connection costs a round trip each, more than striping saves.
+const STRIPE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 /// Resizes this close together are reported as one.
 const SHAPE_SETTLE: Duration = Duration::from_secs(2);
 /// A link that keeps nudging the size between two steps is reported at
@@ -151,6 +154,8 @@ pub struct Progress {
     pending_shape: Mutex<Option<(Shape, Option<f64>, Instant)>>,
     /// Connections replaced so far, to report reconnects as they happen.
     reconnects: AtomicU64,
+    /// Connections the current file is striped across.
+    connections: AtomicUsize,
     checkpoint: Mutex<Checkpoint>,
 }
 
@@ -175,6 +180,7 @@ impl Progress {
             shape_logged_at: Mutex::new(None),
             pending_shape: Mutex::new(None),
             reconnects: AtomicU64::new(u64::MAX),
+            connections: AtomicUsize::new(1),
             checkpoint: Mutex::new(Checkpoint::default()),
         }
     }
@@ -283,10 +289,16 @@ impl Progress {
         let rate = rate.map_or(String::new(), |rate| {
             format!(", link about {}/s", bytes(rate as u64))
         });
+        let connections = self.connections.load(Ordering::Relaxed);
+        let across = if connections > 1 {
+            format!(" across {connections} connections")
+        } else {
+            String::new()
+        };
         self.event(
             Level::Info,
             format!(
-                "{why}: {} x {} in flight{rate}",
+                "{why}: {} x {} in flight{across}{rate}",
                 shape.depth,
                 bytes(shape.chunk)
             ),
@@ -617,6 +629,7 @@ pub fn status(id: u64) -> BridgeResult<Value> {
         "chunk_bytes": shape.chunk,
         "pipeline_depth": shape.depth,
         "adaptive": transfer.tuning.adaptive,
+        "connections": progress.connections.load(Ordering::Relaxed),
         "link_rate": *lock(&progress.link_rate),
         "retries": progress.retries.load(Ordering::Relaxed),
         "since_commit_ms": progress.since_commit().as_millis() as u64,
@@ -856,6 +869,18 @@ pub async fn download(
     };
     let first = lock(&progress.checkpoint).next;
     let read_limit = limit(session.capabilities.max_read_size, MAX_CLIENT_READ_SIZE);
+    let extras = if tuning.connections > 1 {
+        let (extras, shortfall) = session.extra_connections(tuning.connections - 1).await;
+        if let Some(shortfall) = shortfall {
+            progress.event(
+                Level::Warning,
+                format!("Using fewer connections: {shortfall}"),
+            );
+        }
+        extras
+    } else {
+        Vec::new()
+    };
     for (index, step) in plan.iter().enumerate().skip(first) {
         progress.check()?;
         match step {
@@ -884,7 +909,7 @@ pub async fn download(
                     destination: path,
                     overwrite,
                 };
-                download_file(filesystem, &tuning, &target, read_limit, &progress).await?;
+                download_file(filesystem, &extras, &tuning, &target, read_limit, &progress).await?;
                 progress.files.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -912,8 +937,46 @@ struct DownloadTarget<'a> {
     overwrite: bool,
 }
 
+/// Open the file on each extra connection. A connection that cannot open it,
+/// or sees a different revision, sits this file out rather than failing it.
+async fn open_lanes<'a>(
+    extras: &'a [Arc<dyn RemoteFilesystem>],
+    tuning: &Tuning,
+    node: NodeId,
+    revision: u64,
+    read_limit: u64,
+    progress: &Progress,
+) -> Vec<Lane<'a>> {
+    let opened =
+        futures::future::join_all(extras.iter().map(|filesystem| async move {
+            (filesystem.as_ref(), filesystem.open_file(node).await)
+        }))
+        .await;
+    let mut lanes = Vec::new();
+    for (filesystem, result) in opened {
+        match result {
+            Ok((handle, lane_revision, _)) if lane_revision == revision => {
+                lanes.push(Lane::new(filesystem, handle, tuning, read_limit));
+            }
+            Ok((handle, _, _)) => {
+                let _ = filesystem.close_file(handle).await;
+                progress.event(
+                    Level::Warning,
+                    "A connection saw a newer revision; it sits this file out",
+                );
+            }
+            Err(error) => progress.event(
+                Level::Warning,
+                format!("A connection could not open the file ({error}); it sits this file out"),
+            ),
+        }
+    }
+    lanes
+}
+
 async fn download_file(
     filesystem: &dyn RemoteFilesystem,
+    extras: &[Arc<dyn RemoteFilesystem>],
     tuning: &Tuning,
     target: &DownloadTarget<'_>,
     read_limit: u64,
@@ -984,21 +1047,24 @@ async fn download_file(
         }
     };
 
-    let remote = RemoteRead {
-        handle,
-        revision,
-        size,
-    };
+    let remote = RemoteRead { revision, size };
+    let mut lanes = vec![Lane::new(filesystem, handle, tuning, read_limit)];
+    if size - committed >= STRIPE_MIN_BYTES {
+        lanes.extend(open_lanes(extras, tuning, target.node, revision, read_limit, progress).await);
+    }
+    progress.connections.store(lanes.len(), Ordering::Relaxed);
     let copied = copy_to_local(
-        filesystem,
+        &mut lanes,
         tuning,
         &remote,
         &mut local,
         &mut committed,
-        read_limit,
         progress,
     )
     .await;
+    for lane in lanes.iter().skip(1) {
+        let _ = tokio::time::timeout(CLOSE_GRACE, lane.filesystem.close_file(lane.handle)).await;
+    }
     let copied = match copied {
         Ok(()) => {
             async {
@@ -1039,48 +1105,119 @@ async fn download_file(
 }
 
 struct RemoteRead {
-    handle: FileHandle,
     revision: u64,
     size: u64,
 }
 
+/// One connection a download reads through: the file's handle on it, its
+/// own pipeline (each connection has its own congestion window, so its own
+/// rate), and how many of its reads are still running.
+struct Lane<'a> {
+    filesystem: &'a dyn RemoteFilesystem,
+    handle: FileHandle,
+    pipeline: Pipeline,
+    running: Arc<AtomicU64>,
+}
+
+impl<'a> Lane<'a> {
+    fn new(
+        filesystem: &'a dyn RemoteFilesystem,
+        handle: FileHandle,
+        tuning: &Tuning,
+        limit: u64,
+    ) -> Self {
+        Self {
+            filesystem,
+            handle,
+            pipeline: Pipeline::new(*tuning, limit),
+            running: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// The lanes' shapes as one figure for status and the log: requests summed,
+/// the first lane's chunk size, and the rate summed.
+fn combined(lanes: &[Lane<'_>]) -> (Shape, Option<f64>) {
+    let depth = lanes.iter().map(|lane| lane.pipeline.shape().depth).sum();
+    let chunk = lanes.first().map_or(0, |lane| lane.pipeline.shape().chunk);
+    let rates: Vec<f64> = lanes
+        .iter()
+        .filter_map(|lane| lane.pipeline.rate())
+        .collect();
+    let rate = (!rates.is_empty()).then(|| rates.iter().sum());
+    (Shape { depth, chunk }, rate)
+}
+
 /// Read `remote` from `committed` to its end into `local`, which is
-/// positioned at `committed`. Chunks are written strictly in order, so after
-/// any failure `committed` is exactly what is safely on disk.
+/// positioned at `committed`, striping chunks across `lanes`. Chunks are
+/// written strictly in order, so after any failure `committed` is exactly
+/// what is safely on disk; a lane that runs ahead of a slow one buffers at
+/// most twice the total in flight before it waits.
 async fn copy_to_local(
-    filesystem: &dyn RemoteFilesystem,
+    lanes: &mut [Lane<'_>],
     tuning: &Tuning,
     remote: &RemoteRead,
     local: &mut tokio::fs::File,
     committed: &mut u64,
-    read_limit: u64,
     progress: &Progress,
 ) -> BridgeResult<()> {
-    let mut pipeline = Pipeline::new(*tuning, read_limit);
-    progress.show_shape(pipeline.shape(), None, Some("Starting"));
-    let handle = remote.handle;
+    let (shape, _) = combined(lanes);
+    progress.show_shape(shape, None, Some("Starting"));
     let mut failures = 0;
     loop {
         let mut next = *committed;
+        let mut queued = 0_u64;
         let mut inflight = FuturesOrdered::new();
-        let (offset, error) = loop {
-            let shape = pipeline.shape();
-            while inflight.len() < shape.depth && next < remote.size {
-                let offset = next;
-                let length = shape.chunk.min(remote.size - offset);
-                next += length;
-                inflight.push_back(async move {
-                    let started = Instant::now();
-                    let read = filesystem
-                        .read_range_versioned(handle, offset, length)
-                        .await;
-                    (offset, length, started, read)
-                });
+        let (lane, offset, error) = loop {
+            // Top each lane up to its own depth, round robin, within the
+            // buffering budget.
+            let budget = 2 * combined(lanes).0.in_flight();
+            loop {
+                let mut pushed = false;
+                for (index, lane) in lanes.iter().enumerate() {
+                    let shape = lane.pipeline.shape();
+                    if next >= remote.size
+                        || lane.running.load(Ordering::Acquire) >= shape.depth as u64
+                    {
+                        continue;
+                    }
+                    let length = shape.chunk.min(remote.size - next);
+                    if queued > 0 && queued + length > budget {
+                        continue;
+                    }
+                    let offset = next;
+                    next += length;
+                    queued += length;
+                    pushed = true;
+                    let (filesystem, handle) = (lane.filesystem, lane.handle);
+                    let running = Arc::clone(&lane.running);
+                    running.fetch_add(1, Ordering::AcqRel);
+                    inflight.push_back(async move {
+                        let started = Instant::now();
+                        let read = filesystem
+                            .read_range_versioned(handle, offset, length)
+                            .await;
+                        running.fetch_sub(1, Ordering::AcqRel);
+                        (
+                            index,
+                            offset,
+                            length,
+                            started.elapsed(),
+                            Instant::now(),
+                            read,
+                        )
+                    });
+                }
+                if !pushed {
+                    break;
+                }
             }
-            let Some((offset, expected, started, read)) = inflight.next().await else {
+            let Some((index, offset, expected, latency, finished, read)) = inflight.next().await
+            else {
                 return Ok(());
             };
             progress.check()?;
+            queued -= expected;
             match read {
                 Ok(read) => {
                     // A revision of zero means the implementation does not report one.
@@ -1094,30 +1231,43 @@ async fn copy_to_local(
                     let landed = read.data.len() as u64;
                     *committed += landed;
                     let gap = progress.commit(landed);
-                    progress.note_link(filesystem, gap);
+                    progress.note_link(lanes[0].filesystem, gap);
                     failures = 0;
-                    if let Some(shape) =
-                        pipeline.complete(landed, started.elapsed(), Instant::now().into_std())
+                    if lanes[index]
+                        .pipeline
+                        .complete(landed, latency, finished.into_std())
+                        .is_some()
                     {
-                        progress.show_shape(shape, pipeline.rate(), None);
+                        let (shape, rate) = combined(lanes);
+                        progress.show_shape(shape, rate, None);
                     }
                     if landed < expected {
                         // The file shrank after open; what was read is the whole file.
                         return Ok(());
                     }
                 }
-                Err(error) if transient(&error) => break (offset, error),
+                Err(error) if transient(&error) => break (index, offset, error),
                 Err(error) => return Err(error.into()),
             }
         };
         // Abandon the rest of the wave: reads are idempotent, and every byte
-        // past `committed` is read again.
+        // past `committed` is read again. Dropped reads never finish, so
+        // their lanes' counts start over.
         drop(inflight);
+        for lane in lanes.iter() {
+            lane.running.store(0, Ordering::Release);
+        }
         let error = BridgeError::from(error);
-        if let Some(shape) = pipeline.fail() {
+        if lanes[lane].pipeline.fail().is_some() {
+            let (shape, _) = combined(lanes);
             progress.show_shape(shape, None, Some("Cut back after a failure"));
         }
-        let what = format!("Chunk at {}", bytes(offset));
+        let through = if lanes.len() > 1 {
+            format!(" (connection {})", lane + 1)
+        } else {
+            String::new()
+        };
+        let what = format!("Chunk at {}{through}", bytes(offset));
         if !progress
             .wait_to_retry(tuning, &mut failures, &error, &what)
             .await?
@@ -1697,6 +1847,7 @@ mod tests {
         /// Land the next create but report the reply lost.
         lost_create_reply: AtomicBool,
         reads: Mutex<Vec<u64>>,
+        read_handles: Mutex<std::collections::HashSet<FileHandle>>,
         opens: AtomicUsize,
     }
 
@@ -1832,6 +1983,9 @@ mod tests {
             length: u64,
         ) -> quickfs_client_core::Result<RangeRead> {
             lock(&self.reads).push(offset);
+            lock(&self.read_handles).insert(handle);
+            // Yield once so concurrent reads interleave like real requests.
+            tokio::task::yield_now().await;
             if offset >= self.stall_from.load(Ordering::SeqCst) {
                 if self.stall_reads.load(Ordering::SeqCst) {
                     return Err(Self::stalled());
@@ -1913,9 +2067,9 @@ mod tests {
     }
 
     fn session(fs: Arc<FlakyFs>, tuning: Tuning) -> Arc<Session> {
-        Arc::new(Session {
-            filesystem: fs,
-            capabilities: FilesystemCapabilities {
+        Arc::new(Session::new(
+            fs,
+            FilesystemCapabilities {
                 server_epoch: Uuid::nil(),
                 writable: true,
                 supports_locks: false,
@@ -1942,7 +2096,7 @@ mod tests {
                 max_write_size: 8 * MIB,
             },
             tuning,
-        })
+        ))
     }
 
     fn content(length: u64) -> Vec<u8> {
@@ -1978,7 +2132,8 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), data);
         assert_eq!(fs.reads_at(0), 1, "committed chunks are never read again");
-        assert_eq!(progress.retries.load(Ordering::Relaxed), 3);
+        // Reads failing together in one wave cost a single retry.
+        assert!((1..=3).contains(&progress.retries.load(Ordering::Relaxed)));
         assert_eq!(progress.bytes.load(Ordering::Relaxed), 6 * MIB);
         let log = events(&progress);
         assert!(
@@ -1993,6 +2148,73 @@ mod tests {
         );
         // No hidden partial file is left behind.
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_stripes_across_connections_and_still_writes_in_order() {
+        let data = content(20 * MIB + 77);
+        let fs = Arc::new(FlakyFs::with_file(FILE, data.clone()));
+        fs.stall_from.store(9 * MIB, Ordering::SeqCst);
+        fs.failing_reads.store(2, Ordering::SeqCst);
+        let tuning = Tuning {
+            connections: 3,
+            ..Tuning::default()
+        };
+        let session = session(Arc::clone(&fs), tuning);
+        // Two extra connections, each its own handle onto the same server.
+        session.add_extra_connection(fs.clone()).await;
+        session.add_extra_connection(fs.clone()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("copy.bin");
+        let progress = Arc::new(Progress::new());
+        download(
+            session,
+            FILE,
+            destination.clone(),
+            false,
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), data);
+        assert_eq!(fs.reads_at(0), 1);
+        assert!((1..=2).contains(&progress.retries.load(Ordering::Relaxed)));
+        // The file was opened on all three connections and all three read.
+        assert_eq!(fs.opens.load(Ordering::SeqCst), 3);
+        assert_eq!(lock(&fs.read_handles).len(), 3);
+        assert_eq!(progress.connections.load(Ordering::Relaxed), 3);
+        assert!(
+            events(&progress)
+                .iter()
+                .any(|line| line.contains("across 3 connections"))
+        );
+        // Every extra handle was closed again.
+        assert!(lock(&fs.handles).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn small_files_skip_striping() {
+        let data = content(3 * MIB);
+        let fs = Arc::new(FlakyFs::with_file(FILE, data.clone()));
+        let tuning = Tuning {
+            connections: 4,
+            ..Tuning::default()
+        };
+        let session = session(Arc::clone(&fs), tuning);
+        session.add_extra_connection(fs.clone()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("copy.bin");
+        download(
+            session,
+            FILE,
+            destination.clone(),
+            false,
+            Arc::new(Progress::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), data);
+        assert_eq!(fs.opens.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
