@@ -412,9 +412,23 @@ fn resumable(error: &BridgeError) -> bool {
     }
 }
 
+/// The resilient layer's own per-request budget ran out: data may have been
+/// moving the whole time, just not fast enough for the request's size.
+fn client_deadline(error: &BridgeError) -> bool {
+    matches!(error, BridgeError::Client(ClientError::Server(ErrorCode::Timeout, message))
+        if message == CLIENT_DEADLINE_MESSAGE)
+}
+
+/// What `ResilientFilesystem` reports when one operation outlives its budget.
+const CLIENT_DEADLINE_MESSAGE: &str = "resilient operation deadline exceeded";
+
 /// What went wrong, in terms of the link rather than the code path.
 fn explain(error: &BridgeError, tuning: &Tuning) -> String {
     let stall = seconds(tuning.stall_timeout);
+    if client_deadline(error) {
+        return "one request took longer than its time limit, the link is too slow for its size"
+            .into();
+    }
     match error {
         BridgeError::Client(ClientError::Transport(TransportError::Timeout))
         | BridgeError::Transport(TransportError::Timeout) => {
@@ -443,6 +457,23 @@ fn explain(error: &BridgeError, tuning: &Tuning) -> String {
 fn hint(error: &BridgeError, tuning: &Tuning) -> Option<String> {
     let stall = seconds(tuning.stall_timeout);
     let window = seconds(tuning.retry_window);
+    if client_deadline(error) {
+        return Some(if tuning.adaptive {
+            format!(
+                "Requests kept outliving their time limit even at the smallest size, and nothing \
+                 landed for {window}. The link is barely moving data. Resume continues from \
+                 where this stopped."
+            )
+        } else {
+            format!(
+                "Each request is {} with {} in flight, more than this link can move within a \
+                 request's time limit. Turn on Size requests to the link (or lower Largest \
+                 request) in the server's Transfers settings, then Resume.",
+                bytes(tuning.max_chunk),
+                tuning.max_depth
+            )
+        });
+    }
     match error {
         BridgeError::Client(
             ClientError::Transport(_) | ClientError::Offline | ClientError::AmbiguousMutation,
@@ -2134,6 +2165,27 @@ mod tests {
     #[test]
     fn explanations_name_the_link_not_the_code_path() {
         let tuning = Tuning::default();
+        let deadline = BridgeError::Client(ClientError::Server(
+            ErrorCode::Timeout,
+            CLIENT_DEADLINE_MESSAGE.into(),
+        ));
+        assert!(explain(&deadline, &tuning).contains("too slow for its size"));
+        let fixed = Tuning {
+            adaptive: false,
+            ..tuning
+        };
+        assert!(
+            hint(&deadline, &fixed)
+                .unwrap()
+                .contains("Size requests to the link")
+        );
+        let server =
+            BridgeError::Client(ClientError::Server(ErrorCode::Timeout, "slow disk".into()));
+        assert!(
+            hint(&server, &tuning)
+                .unwrap()
+                .contains("server stayed busy")
+        );
         let stalled = BridgeError::Client(ClientError::Transport(TransportError::Timeout));
         assert_eq!(
             explain(&stalled, &tuning),
