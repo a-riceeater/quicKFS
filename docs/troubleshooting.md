@@ -268,6 +268,21 @@ The persistent cache has a bounded 256 MiB process-local hot range tier. Sequent
 
 Offsets and lengths are unsigned byte counts. Reads beyond EOF return fewer bytes rather than padding the response.
 
+## An app download or upload stalls, retries, or stops
+
+Open the transfer (click its row) and read the status line and **Activity**. The bridge records each resize, retry, and reconnect there, with how long nothing moved.
+
+- **"Retrying in N s, continuing from X"**: a request saw no data for the stall timeout, or the connection dropped. Nothing already committed is transferred again. Brief outages, such as switching networks, recover on their own.
+- **"Reconnected to the server after N s without data"**: the resilient layer replaced the connection underneath the transfer. It is the same kind of outage, recovered one layer down.
+- **The pipeline settles at 2 x 128 KiB**: the link is moving well under 100 KB/s. That is the link, not quicKFS. The transfer still runs at about the link's rate.
+- **STOPPED with Resume**: nothing landed for the retry window. Fix the path, then press Resume. It continues from the stopped byte.
+
+When a ping looks fine but transfers crawl, check the path rather than the client:
+
+1. On ZeroTier, run `zerotier-cli listpeers`. The server's `LEAF` row must show an IP path. A `-` path with latency `-1` means traffic is relayed through ZeroTier's root servers. Measured once: 13–20% loss, 100 ms to 1.7 s RTT, and about 25–50 KB/s to the server, while internet speed tests looked normal. Relaying usually means the current network's NAT or firewall is blocking UDP hole punching. Toggling the network, or waiting, often restores a direct path.
+2. A relayed or asymmetric path can be much worse in one direction. Downloads use the server's uplink and the downstream half of the path, uploads the reverse, so uploads can run acceptably while downloads stall. The transfer window's packet-loss figures count only what this Mac sent, so they understate loss on the download direction.
+3. On a link that really is slow, raise **Stall timeout** if single requests still stall, or **Keep retrying for** if outages last minutes. Server settings → Transfers, applied on the next connection.
+
 ## A copy reports `fcopyfile failed: Network is down` or the destination is missing
 
 Current macFUSE releases may implement an ordinary copy with ranged reads and writes rather than the optional native `copy_file_range` callback. `ENETDOWN` means the resilient read exhausted its authenticated reconnect path and the requested revision was not already cached; it is not a special `.RW2` or file-size rejection. Keep the mount in the foreground and inspect its first transport error, then compare a direct read using the same endpoint, name, state directory, and account.

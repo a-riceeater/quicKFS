@@ -28,11 +28,26 @@ SwiftUI app ── JSON over a C ABI ──► quickfs-core-bridge (static libra
 | `read` | Quick Look (Space or double-click), first 1 MiB |
 | `write --offset --sync` | Context menu: Overwrite from File |
 | `create`, `mkdir`, `truncate`, `remove`, `rename` | New menu, Resize, Delete (recursive), Rename, drag onto a folder to move |
-| (none) | Upload and download files or whole folders, chmod in the inspector |
+| (none) | Upload and download files or whole folders with retry and Resume, chmod in the inspector |
+| (none) | Server settings → Transfers: stall timeout, retry window, adaptive request sizing |
 | `quickfs-mount` flags | Server settings: mount point, volume name, backend, cache, read-ahead, timeouts, reconnect |
 | `QUICKFS_FUSE_DEBUG=1` | Console: Trace, then Remount |
 | (none) | Overview: live throughput, latency, loss, totals; Console: event stream, QUIC counters, helper invocation |
 | (none) | Settings: offline cache size and Clear (only while nothing is mounted) |
+
+## Transfers
+
+Downloads and uploads in the browser run in the bridge (`core-bridge/src/transfer.rs`) and are built to survive slow, lossy, or briefly dead links such as a relayed ZeroTier path.
+
+- **Idle timeouts, not deadlines.** Each request phase fails only after the server's *stall timeout* passes with no bytes moving (`crates/transport-quic`). A slow link that keeps delivering never trips it.
+- **Requests sized to the link.** Every request shares one QUIC connection, so a chunk takes about `bytes in flight / link rate`. The adaptive pipeline (`core-bridge/src/pipeline.rs`) measures the rate that chunks complete at and keeps about a quarter of the stall timeout's worth of data in flight (2 to 10 s). It starts at 2 x 256 KiB, can double each completion up to the configured maximum (8 x 4 MiB by default), and cuts to a quarter after a failure. Measured over a 60 KB/s, 250 ms link, it settles at 2 x 128 KiB and moves 58 KB/s. A fixed 8 x 4 MiB pipeline never finishes a chunk there.
+- **Retry from the last committed byte.** Chunks are written strictly in order. After a stall or dropped connection, the transfer backs off (2.5 s doubling to 30 s), lets the resilient layer reconnect, and continues from the first byte not yet on disk (downloads) or not yet acknowledged in order (uploads). Committed data is never re-read or re-sent. Retrying positional writes is idempotent; a create whose reply was lost is recognised by the empty file it left.
+- **Resume.** If nothing lands for the *retry window* (5 min by default), the transfer stops as resumable instead of failing outright. A download keeps its hidden `.name.<id>.qkfs-partial` file; an upload keeps its written prefix and position. **Resume** continues from there (a download starts its current file over if that file's revision changed on the server). **Discard**, or clearing a forgotten row, deletes a download's partial file. A folder transfer also skips the files it already finished.
+- **Explanations.** The transfer window shows one status line (what is in flight and the measured link rate, or why it is waiting and what happens next), an Activity log (resizes, retries, reconnects with how long nothing moved, resumes), and, on failure, a plain-language hint. **Copy Report** includes all of it.
+
+Server settings → Transfers sets the stall timeout, the retry window, adaptive sizing, and the largest request and pipeline depth. They take effect on the next connection.
+
+Bridge contract: `connect` takes an optional `timeout_ms` (the stall timeout) and `transfer: {adaptive, max_depth, max_chunk_bytes, retry_window_ms}`. Missing fields keep their defaults, and out-of-range values are clamped. `transfer_status` adds `pipeline_depth`, `chunk_bytes` (live), `adaptive`, `link_rate`, `retries`, `since_commit_ms`, `retry_in_ms`, `stall_timeout_ms`, `retry_window_ms`, `events[] {at_ms, level, message}`, and, once failed, `resumable` and `hint`. `transfer_resume` continues a resumable transfer. `transfer_cancel` on one discards its partial data.
 
 ## Building
 
