@@ -281,7 +281,8 @@ When a ping looks fine but transfers crawl, check the path rather than the clien
 
 1. On ZeroTier, run `zerotier-cli listpeers`. The server's `LEAF` row must show an IP path. A `-` path with latency `-1` means traffic is relayed through ZeroTier's root servers. Measured once: 13–20% loss, 100 ms to 1.7 s RTT, and about 25–50 KB/s to the server, while internet speed tests looked normal. Relaying usually means the current network's NAT or firewall is blocking UDP hole punching. Toggling the network, or waiting, often restores a direct path.
 2. A relayed or asymmetric path can be much worse in one direction. Downloads use the server's uplink and the downstream half of the path, uploads the reverse, so uploads can run acceptably while downloads stall. The transfer window's packet-loss figures count only what this Mac sent, so they understate loss on the download direction.
-3. On a link that really is slow, raise **Stall timeout** if single requests still stall, or **Keep retrying for** if outages last minutes. Server settings → Transfers, applied on the next connection.
+3. On a lossy path, the server's congestion controller matters most. The default, Cubic, treats every lost packet as congestion and backs off, so random loss collapses it. In a simulated 250 ms link with 13% loss it moved 17 KB/s, while `--congestion-control bbr` on the server moved 788 KB/s over the same single connection. BBR is experimental in quinn and competes harder with other traffic on a shared link, so it stays opt-in. Next, raise **Connections per download** (Server settings → Transfers) to 2–4. Each connection has its own congestion window.
+4. On a link that really is slow, raise **Stall timeout** if single requests still stall, or **Keep retrying for** if outages last minutes. Server settings → Transfers, applied on the next connection.
 
 ## A copy reports `fcopyfile failed: Network is down` or the destination is missing
 
