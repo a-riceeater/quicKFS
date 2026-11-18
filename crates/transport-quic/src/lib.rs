@@ -819,9 +819,12 @@ mod tests {
         let key = PrivateKeyDer::from(rustls::pki_types::PrivatePkcs8KeyDer::from(
             signing_key.serialize_der(),
         ));
-        let server =
-            server_endpoint("127.0.0.1:0".parse().unwrap(), vec![certificate.clone()], key)
-                .unwrap();
+        let server = server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![certificate.clone()],
+            key,
+        )
+        .unwrap();
         let address = server.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let connection = server.accept().await.unwrap().await.unwrap();
@@ -848,17 +851,18 @@ mod tests {
         // 16 pieces 150 ms apart: about six idle periods in total, but never
         // one idle period without a byte.
         let pieces = (0..16_u8).map(|value| vec![value; 4096]).collect();
-        let (client, server) =
-            trickling_server(idle, pieces, Duration::from_millis(150)).await;
+        let (client, server) = trickling_server(idle, pieces, Duration::from_millis(150)).await;
         let (mut send, mut recv) = client.stream().await.unwrap();
         client.send_all(&mut send, b"go").await.unwrap();
         let started = std::time::Instant::now();
         let mut body = vec![0; 16 * 4096];
         client.receive_exact(&mut recv, &mut body).await.unwrap();
         assert!(started.elapsed() > idle * 4);
-        assert!(body.chunks(4096).enumerate().all(|(index, piece)| piece
-            .iter()
-            .all(|byte| usize::from(*byte) == index)));
+        assert!(
+            body.chunks(4096)
+                .enumerate()
+                .all(|(index, piece)| piece.iter().all(|byte| usize::from(*byte) == index))
+        );
         assert_eq!(client.protocol_stats().data_bytes_received, 16 * 4096);
         server.abort();
     }

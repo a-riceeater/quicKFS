@@ -149,7 +149,12 @@ impl Pipeline {
         if self.completions.len() < 2 || span < 0.05 {
             return None;
         }
-        let bytes: u64 = self.completions.iter().skip(1).map(|(_, bytes)| bytes).sum();
+        let bytes: u64 = self
+            .completions
+            .iter()
+            .skip(1)
+            .map(|(_, bytes)| bytes)
+            .sum();
         Some(bytes as f64 / span)
     }
 
@@ -171,9 +176,9 @@ impl Pipeline {
         // Until two completions give a span, one chunk's own latency is the
         // only measure: it took `latency` to move `bytes` while sharing the
         // link with the rest of the pipeline.
-        let rate = self.rate().unwrap_or_else(|| {
-            self.shape.in_flight() as f64 / latency.as_secs_f64().max(0.001)
-        });
+        let rate = self
+            .rate()
+            .unwrap_or_else(|| self.shape.in_flight() as f64 / latency.as_secs_f64().max(0.001));
         let wanted = rate * self.tuning.target_latency().as_secs_f64();
         // Grow at most 2x per completion so one lucky sample cannot flood a
         // link; shrink immediately.
@@ -244,9 +249,21 @@ mod tests {
     #[test]
     fn fast_link_reaches_the_full_pipeline() {
         let mut pipeline = Pipeline::new(tuning(), 16 * MIB);
-        assert_eq!(pipeline.shape(), Shape { depth: 2, chunk: MIB });
+        assert_eq!(
+            pipeline.shape(),
+            Shape {
+                depth: 2,
+                chunk: MIB
+            }
+        );
         let shape = settle(&mut pipeline, 25e6, 12);
-        assert_eq!(shape, Shape { depth: 8, chunk: 4 * MIB });
+        assert_eq!(
+            shape,
+            Shape {
+                depth: 8,
+                chunk: 4 * MIB
+            }
+        );
     }
 
     #[test]
@@ -273,8 +290,20 @@ mod tests {
     fn failure_cuts_in_flight_to_a_quarter() {
         let mut pipeline = Pipeline::new(tuning(), 16 * MIB);
         settle(&mut pipeline, 25e6, 12);
-        assert_eq!(pipeline.fail(), Some(Shape { depth: 2, chunk: 4 * MIB }));
-        assert_eq!(pipeline.fail(), Some(Shape { depth: 2, chunk: MIB }));
+        assert_eq!(
+            pipeline.fail(),
+            Some(Shape {
+                depth: 2,
+                chunk: 4 * MIB
+            })
+        );
+        assert_eq!(
+            pipeline.fail(),
+            Some(Shape {
+                depth: 2,
+                chunk: MIB
+            })
+        );
         assert_eq!(pipeline.rate(), None);
     }
 
@@ -286,7 +315,13 @@ mod tests {
         };
         let mut pipeline = Pipeline::new(tuning, 16 * MIB);
         let shape = settle(&mut pipeline, 30e3, 12);
-        assert_eq!(shape, Shape { depth: 8, chunk: 4 * MIB });
+        assert_eq!(
+            shape,
+            Shape {
+                depth: 8,
+                chunk: 4 * MIB
+            }
+        );
         assert_eq!(pipeline.fail(), None);
     }
 
@@ -299,7 +334,13 @@ mod tests {
         };
         let mut pipeline = Pipeline::new(tuning, 2 * MIB);
         let shape = settle(&mut pipeline, 100e6, 12);
-        assert_eq!(shape, Shape { depth: 3, chunk: 2 * MIB });
+        assert_eq!(
+            shape,
+            Shape {
+                depth: 3,
+                chunk: 2 * MIB
+            }
+        );
     }
 
     #[test]
