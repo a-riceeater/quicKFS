@@ -9,10 +9,22 @@ struct PreviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var loader: PreviewLoader
     @AppStorage("previewShowsHex") private var showsHex = false
+    /// Room the parent window leaves for the sheet. Sheets open at their
+    /// minimum size, so the size is set outright from this.
+    @State private var room: CGSize
+
+    private static let previewWidth: CGFloat = 960
+    private static let hexWidth: CGFloat = 560
 
     init(node: RemoteNode, connection: ServerConnection) {
         self.connection = connection
         _loader = State(initialValue: PreviewLoader(node: node, connection: connection))
+        let window = (NSApp.mainWindow ?? NSApp.keyWindow)?.frame.size ?? CGSize(width: 1280, height: 860)
+        _room = State(initialValue: CGSize(width: max(640, window.width - 80), height: max(440, window.height - 110)))
+    }
+
+    private var width: CGFloat {
+        min(room.width, Self.previewWidth + (showsHex ? Self.hexWidth : 0))
     }
 
     private var node: RemoteNode { loader.node }
@@ -26,13 +38,13 @@ struct PreviewSheet: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if showsHex {
                     Divider()
-                    HexPanel(dump: loader.hexDump, failed: loader.headFailed, length: PreviewLoader.headLength)
-                        .frame(width: 470)
+                    HexPanel(rows: loader.hexRows, failed: loader.headFailed, length: PreviewLoader.headLength)
+                        .frame(width: min(Self.hexWidth, width * 0.6))
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
         }
-        .frame(minWidth: 760, idealWidth: 980, minHeight: 480, idealHeight: 680)
+        .frame(width: width, height: min(room.height, 760))
         .task { await loader.open() }
         .onDisappear { loader.close() }
     }
@@ -114,24 +126,23 @@ private struct LoadingStatus: View {
                         ProgressView().progressViewStyle(.linear)
                     }
                 }
-                .frame(width: 320)
                 HStack {
                     Text(amount)
-                    Spacer()
-                    if loader.rate > 0 { Text("\(Format.bytes(UInt64(loader.rate)))/s") }
+                    Spacer(minLength: 12)
+                    if loader.displayRate > 0 { Text("\(Format.bytes(UInt64(loader.displayRate)))/s") }
                 }
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 320)
+                .lineLimit(1)
                 Text(detail)
-                    .font(.caption)
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(warning == nil ? .tertiary : .secondary)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
-                    .frame(width: 320)
             }
+            .frame(maxWidth: 340)
         }
-        .padding()
+        .padding(.horizontal, 28)
     }
 
     private var amount: String {
@@ -139,7 +150,7 @@ private struct LoadingStatus: View {
         return "\(Format.bytes(status.bytes)) of \(Format.bytes(max(status.total, loader.node.size)))"
     }
 
-    /// The latest retry or warning from the transfer, if it is still current.
+    /// A retry in progress, or the latest warning while no data is landing.
     private var warning: String? {
         guard let status = loader.status else { return nil }
         if let wait = status.retryInMs {
@@ -156,38 +167,60 @@ private struct LoadingStatus: View {
         var parts: [String] = []
         if let remaining = loader.remaining, remaining >= 1 {
             parts.append("\(PreviewSheet.duration(remaining)) left")
+        } else if let started = loader.started {
+            parts.append(PreviewSheet.duration(Date.now.timeIntervalSince(started)))
         }
         if let connections = loader.status?.connections, connections > 1 {
             parts.append("\(connections) connections")
-        }
-        if parts.isEmpty, let started = loader.started {
-            parts.append("\(PreviewSheet.duration(Date.now.timeIntervalSince(started)))")
         }
         return parts.joined(separator: " · ")
     }
 }
 
-/// The file's first bytes as a hex dump, beside the preview.
+/// The file's first bytes as a hex dump beside the preview: offset, hex in
+/// two groups of eight, and the printable text, one row per 16 bytes. Rows
+/// never wrap; a narrow panel scrolls sideways instead.
 private struct HexPanel: View {
-    let dump: String?
+    let rows: [HexRow]?
     let failed: Bool
     let length: UInt64
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("First \(Format.bytes(length))")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
+            HStack(spacing: 0) {
+                // Column widths in characters, matching each row's layout:
+                // offset and bytes are each followed by two spaces.
+                Text("Offset").frame(width: 10 * Self.advance, alignment: .leading)
+                Text("Bytes").frame(width: 50 * Self.advance, alignment: .leading)
+                Text("Text")
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: Self.size, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
             Divider()
-            if let dump {
-                ScrollView {
-                    Text(dump.isEmpty ? "Empty file" : dump)
-                        .font(.system(size: 10.5, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
+            if let rows {
+                if rows.isEmpty {
+                    Placard(symbol: "doc", title: "Empty file")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView([.vertical, .horizontal]) {
+                        Text(Self.dump(rows))
+                            .font(.system(size: Self.size, design: .monospaced))
+                            .lineSpacing(2)
+                            .textSelection(.enabled)
+                            .fixedSize()
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+                    }
+                    Divider()
+                    Text("First \(Format.bytes(min(length, UInt64(rows.count) * 16)))")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 7)
                 }
             } else if failed {
                 Placard(symbol: "number", title: "Unavailable")
@@ -197,6 +230,32 @@ private struct HexPanel: View {
             }
         }
         .background(.background.secondary)
+    }
+
+    private static let size: CGFloat = 11
+    /// Width of one monospaced character at `size`.
+    private static let advance: CGFloat = {
+        let font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        return ("0" as NSString).size(withAttributes: [.font: font]).width
+    }()
+
+    /// One selectable block, with offsets and text dimmer than the bytes.
+    private static func dump(_ rows: [HexRow]) -> AttributedString {
+        var result = AttributedString()
+        let dim = Color(nsColor: .tertiaryLabelColor)
+        let soft = Color(nsColor: .secondaryLabelColor)
+        for (index, row) in rows.enumerated() {
+            var offset = AttributedString(row.offset + "  ")
+            offset.foregroundColor = dim
+            var hex = AttributedString(row.hex + "  ")
+            hex.foregroundColor = Color(nsColor: .labelColor)
+            var text = AttributedString(row.text + (index == rows.count - 1 ? "" : "\n"))
+            text.foregroundColor = soft
+            result += offset
+            result += hex
+            result += text
+        }
+        return result
     }
 }
 

@@ -35,8 +35,8 @@ final class PreviewLoader {
     private(set) var status: TransferStatus?
     /// Recent throughput in bytes/s, from the last couple of seconds.
     private(set) var rate: Double = 0
-    /// The first `headLength` bytes as a hex dump, formatted once.
-    private(set) var hexDump: String?
+    /// The first `headLength` bytes as hex dump rows, formatted once.
+    private(set) var hexRows: [HexRow]?
     private(set) var headFailed = false
     private(set) var started: Date?
     private(set) var elapsed: TimeInterval?
@@ -57,10 +57,18 @@ final class PreviewLoader {
         return status.fraction
     }
 
-    /// Seconds left at the recent rate, once there is one.
+    /// Throughput to show: bytes landed over the last two seconds, or while
+    /// that window sees no whole chunk land, the rate the core measures
+    /// chunks completing at.
+    var displayRate: Double {
+        if rate > 0 { return rate }
+        return status?.linkRate ?? 0
+    }
+
+    /// Seconds left at the shown rate, once there is one.
     var remaining: TimeInterval? {
-        guard let status, rate > 0, status.total > status.bytes else { return nil }
-        return Double(status.total - status.bytes) / rate
+        guard let status, displayRate > 0, status.total > status.bytes else { return nil }
+        return Double(status.total - status.bytes) / displayRate
     }
 
     /// Start loading: the hex head always, the whole file if it is small
@@ -129,23 +137,29 @@ final class PreviewLoader {
         do {
             let reply: Reply = try await connection.request(
                 "read", ["node": .uuid(node.node), "offset": 0, "length": .uint(Self.headLength)])
-            hexDump = Self.hexDump(Data(hex: reply.data))
+            hexRows = Self.hexRows(Data(hex: reply.data))
         } catch {
             headFailed = true
         }
     }
 
-    nonisolated static func hexDump(_ data: Data) -> String {
-        var lines: [String] = []
+    /// Sixteen bytes per row: offset, hex in two groups of eight, and the
+    /// printable characters.
+    nonisolated static func hexRows(_ data: Data) -> [HexRow] {
         let bytes = [UInt8](data)
-        lines.reserveCapacity(bytes.count / 16 + 1)
-        for start in stride(from: 0, to: bytes.count, by: 16) {
+        return stride(from: 0, to: bytes.count, by: 16).map { start in
             let chunk = bytes[start..<min(start + 16, bytes.count)]
-            let hex = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
-            let ascii = String(chunk.map { (0x20..<0x7f).contains($0) ? Character(UnicodeScalar($0)) : "." })
-            lines.append(String(format: "%08x  ", start) + hex.padding(toLength: 48, withPad: " ", startingAt: 0) + " " + ascii)
+            var hex = ""
+            for (index, byte) in chunk.enumerated() {
+                if index > 0 { hex += index == 8 ? "  " : " " }
+                hex += String(format: "%02x", byte)
+            }
+            let text = String(chunk.map { (0x20..<0x7f).contains($0) ? Character(UnicodeScalar($0)) : "." })
+            return HexRow(
+                offset: String(format: "%08x", start),
+                hex: hex.padding(toLength: 48, withPad: " ", startingAt: 0),
+                text: text)
         }
-        return lines.joined(separator: "\n")
     }
 
     private func download() async {
@@ -248,4 +262,11 @@ final class PreviewLoader {
             if Date.now.timeIntervalSince(modified) > 86_400 { try? manager.removeItem(at: entry) }
         }
     }
+}
+
+/// One line of the hex view.
+struct HexRow: Equatable, Sendable {
+    let offset: String
+    let hex: String
+    let text: String
 }
