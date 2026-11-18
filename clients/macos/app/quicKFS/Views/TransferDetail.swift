@@ -187,7 +187,7 @@ struct TransferDetail: View {
             if idle >= max(5, stall / 2) {
                 return ("hourglass", .orange,
                         "Nothing has landed for \(Int(idle)) s",
-                        "A request fails after \(Int(stall)) s with no data moving, then retries for up to \(duration(window)).")
+                        "A request fails after \(Int(stall)) s with no data moving, then retries for up to \(Self.span(window)).")
             }
             guard let depth = status.pipelineDepth, let chunk = status.chunkBytes, depth > 0 else {
                 return ("ellipsis", .secondary, "Starting", nil)
@@ -375,6 +375,11 @@ struct TransferDetail: View {
                 .foregroundStyle(alert ? .orange : .primary)
                 .textSelection(.enabled)
         }
+    }
+
+    /// A setting-sized span in words ("90 s", "5 min"), not a clock reading.
+    private static func span(_ seconds: Double) -> String {
+        seconds < 120 ? "\(Int(seconds)) s" : "\(Int((seconds / 60).rounded())) min"
     }
 
     /// Request sizes are powers of two, so show them as such ("4 MiB").
