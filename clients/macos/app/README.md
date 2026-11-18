@@ -25,7 +25,7 @@ SwiftUI app ── JSON over a C ABI ──► quickfs-core-bridge (static libra
 | `forget` | Server settings: Forget Identity, then Pair |
 | `ping`, `capabilities`, `filesystem-stats` | Overview: latency graph, capability tiles, storage ring |
 | `list`, `stat` | Files browser and inspector (⌘I) |
-| `read` | Quick Look (Space or double-click), first 1 MiB |
+| `read`, `download` | Quick Look (Space or double-click): the whole file is fetched with live progress into a temporary folder removed on close, shown with the system previewers; the first 16 KiB as hex in a side panel. Files over 256 MiB load on request. |
 | `write --offset --sync` | Context menu: Overwrite from File |
 | `create`, `mkdir`, `truncate`, `remove`, `rename` | New menu, Resize, Delete (recursive), Rename, drag onto a folder to move |
 | (none) | Upload and download files or whole folders with retry and Resume, chmod in the inspector |
