@@ -869,18 +869,23 @@ pub async fn download(
     };
     let first = lock(&progress.checkpoint).next;
     let read_limit = limit(session.capabilities.max_read_size, MAX_CLIENT_READ_SIZE);
-    let extras = if tuning.connections > 1 {
-        let (extras, shortfall) = session.extra_connections(tuning.connections - 1).await;
-        if let Some(shortfall) = shortfall {
-            progress.event(
-                Level::Warning,
-                format!("Using fewer connections: {shortfall}"),
-            );
-        }
-        extras
-    } else {
-        Vec::new()
-    };
+    // Extra connections log in in the background; each joins the file being
+    // read as soon as it is up, so nothing waits on the logins.
+    let (extras_ready, extras) = tokio::sync::watch::channel(Vec::new());
+    if tuning.connections > 1 {
+        let session = Arc::clone(&session);
+        let progress = Arc::clone(&progress);
+        tokio::spawn(async move {
+            let (opened, shortfall) = session.extra_connections(tuning.connections - 1).await;
+            if let Some(shortfall) = shortfall {
+                progress.event(
+                    Level::Warning,
+                    format!("Using fewer connections: {shortfall}"),
+                );
+            }
+            let _ = extras_ready.send(opened);
+        });
+    }
     for (index, step) in plan.iter().enumerate().skip(first) {
         progress.check()?;
         match step {
@@ -909,7 +914,15 @@ pub async fn download(
                     destination: path,
                     overwrite,
                 };
-                download_file(filesystem, &extras, &tuning, &target, read_limit, &progress).await?;
+                download_file(
+                    &session.filesystem,
+                    &extras,
+                    &tuning,
+                    &target,
+                    read_limit,
+                    &progress,
+                )
+                .await?;
                 progress.files.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -939,19 +952,18 @@ struct DownloadTarget<'a> {
 
 /// Open the file on each extra connection. A connection that cannot open it,
 /// or sees a different revision, sits this file out rather than failing it.
-async fn open_lanes<'a>(
-    extras: &'a [Arc<dyn RemoteFilesystem>],
+async fn open_lanes(
+    extras: &[Arc<dyn RemoteFilesystem>],
     tuning: &Tuning,
     node: NodeId,
     revision: u64,
     read_limit: u64,
     progress: &Progress,
-) -> Vec<Lane<'a>> {
-    let opened =
-        futures::future::join_all(extras.iter().map(|filesystem| async move {
-            (filesystem.as_ref(), filesystem.open_file(node).await)
-        }))
-        .await;
+) -> Vec<Lane> {
+    let opened = futures::future::join_all(extras.iter().map(|filesystem| async move {
+        (Arc::clone(filesystem), filesystem.open_file(node).await)
+    }))
+    .await;
     let mut lanes = Vec::new();
     for (filesystem, result) in opened {
         match result {
@@ -975,13 +987,14 @@ async fn open_lanes<'a>(
 }
 
 async fn download_file(
-    filesystem: &dyn RemoteFilesystem,
-    extras: &[Arc<dyn RemoteFilesystem>],
+    primary: &Arc<dyn RemoteFilesystem>,
+    extras: &tokio::sync::watch::Receiver<Vec<Arc<dyn RemoteFilesystem>>>,
     tuning: &Tuning,
     target: &DownloadTarget<'_>,
     read_limit: u64,
     progress: &Progress,
 ) -> BridgeResult<()> {
+    let filesystem = primary.as_ref();
     let destination = target.destination;
     if !target.overwrite && tokio::fs::symlink_metadata(destination).await.is_ok() {
         return Err(BridgeError::Io(std::io::Error::new(
@@ -1048,13 +1061,17 @@ async fn download_file(
     };
 
     let remote = RemoteRead { revision, size };
-    let mut lanes = vec![Lane::new(filesystem, handle, tuning, read_limit)];
-    if size - committed >= STRIPE_MIN_BYTES {
-        lanes.extend(open_lanes(extras, tuning, target.node, revision, read_limit, progress).await);
-    }
-    progress.connections.store(lanes.len(), Ordering::Relaxed);
+    let mut lanes = vec![Lane::new(Arc::clone(primary), handle, tuning, read_limit)];
+    let mut joiner = (size - committed >= STRIPE_MIN_BYTES).then(|| Joiner {
+        extras: extras.clone(),
+        joined: 0,
+        node: target.node,
+        limit: read_limit,
+    });
+    progress.connections.store(1, Ordering::Relaxed);
     let copied = copy_to_local(
         &mut lanes,
+        joiner.as_mut(),
         tuning,
         &remote,
         &mut local,
@@ -1112,16 +1129,16 @@ struct RemoteRead {
 /// One connection a download reads through: the file's handle on it, its
 /// own pipeline (each connection has its own congestion window, so its own
 /// rate), and how many of its reads are still running.
-struct Lane<'a> {
-    filesystem: &'a dyn RemoteFilesystem,
+struct Lane {
+    filesystem: Arc<dyn RemoteFilesystem>,
     handle: FileHandle,
     pipeline: Pipeline,
     running: Arc<AtomicU64>,
 }
 
-impl<'a> Lane<'a> {
+impl Lane {
     fn new(
-        filesystem: &'a dyn RemoteFilesystem,
+        filesystem: Arc<dyn RemoteFilesystem>,
         handle: FileHandle,
         tuning: &Tuning,
         limit: u64,
@@ -1135,9 +1152,17 @@ impl<'a> Lane<'a> {
     }
 }
 
+/// Extra connections still to join a file's lanes as they come up.
+struct Joiner {
+    extras: tokio::sync::watch::Receiver<Vec<Arc<dyn RemoteFilesystem>>>,
+    joined: usize,
+    node: NodeId,
+    limit: u64,
+}
+
 /// The lanes' shapes as one figure for status and the log: requests summed,
 /// the first lane's chunk size, and the rate summed.
-fn combined(lanes: &[Lane<'_>]) -> (Shape, Option<f64>) {
+fn combined(lanes: &[Lane]) -> (Shape, Option<f64>) {
     let depth = lanes.iter().map(|lane| lane.pipeline.shape().depth).sum();
     let chunk = lanes.first().map_or(0, |lane| lane.pipeline.shape().chunk);
     let rates: Vec<f64> = lanes
@@ -1154,7 +1179,8 @@ fn combined(lanes: &[Lane<'_>]) -> (Shape, Option<f64>) {
 /// what is safely on disk; a lane that runs ahead of a slow one buffers at
 /// most twice the total in flight before it waits.
 async fn copy_to_local(
-    lanes: &mut [Lane<'_>],
+    lanes: &mut Vec<Lane>,
+    mut joiner: Option<&mut Joiner>,
     tuning: &Tuning,
     remote: &RemoteRead,
     local: &mut tokio::fs::File,
@@ -1169,6 +1195,35 @@ async fn copy_to_local(
         let mut queued = 0_u64;
         let mut inflight = FuturesOrdered::new();
         let (lane, offset, error) = loop {
+            // Bring in extra connections that finished logging in. Compared
+            // by count: the channel closes once its one value is sent.
+            if let Some(joiner) = joiner.as_deref_mut() {
+                let fresh: Vec<_> = joiner
+                    .extras
+                    .borrow()
+                    .iter()
+                    .skip(joiner.joined)
+                    .cloned()
+                    .collect();
+                if !fresh.is_empty() {
+                    joiner.joined += fresh.len();
+                    let opened = open_lanes(
+                        &fresh,
+                        tuning,
+                        joiner.node,
+                        remote.revision,
+                        joiner.limit,
+                        progress,
+                    )
+                    .await;
+                    if !opened.is_empty() {
+                        lanes.extend(opened);
+                        progress.connections.store(lanes.len(), Ordering::Relaxed);
+                        let (shape, rate) = combined(lanes);
+                        progress.show_shape(shape, rate, Some("Joined"));
+                    }
+                }
+            }
             // Top each lane up to its own depth, round robin, within the
             // buffering budget.
             let budget = 2 * combined(lanes).0.in_flight();
@@ -1189,7 +1244,7 @@ async fn copy_to_local(
                     next += length;
                     queued += length;
                     pushed = true;
-                    let (filesystem, handle) = (lane.filesystem, lane.handle);
+                    let (filesystem, handle) = (Arc::clone(&lane.filesystem), lane.handle);
                     let running = Arc::clone(&lane.running);
                     running.fetch_add(1, Ordering::AcqRel);
                     inflight.push_back(async move {
@@ -1231,7 +1286,7 @@ async fn copy_to_local(
                     let landed = read.data.len() as u64;
                     *committed += landed;
                     let gap = progress.commit(landed);
-                    progress.note_link(lanes[0].filesystem, gap);
+                    progress.note_link(lanes[0].filesystem.as_ref(), gap);
                     failures = 0;
                     if lanes[index]
                         .pipeline
