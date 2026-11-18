@@ -507,6 +507,8 @@ struct Transfer {
     tuning: Tuning,
     job: Job,
     hint: Mutex<Option<String>>,
+    /// The failure in plain words, for the app's headline.
+    reason: Mutex<Option<String>>,
 }
 
 static TRANSFERS: Mutex<Option<HashMap<u64, Arc<Transfer>>>> = Mutex::new(None);
@@ -539,6 +541,7 @@ where
         tuning,
         job: Arc::new(move |progress| Box::pin(job(progress))),
         hint: Mutex::new(None),
+        reason: Mutex::new(None),
     });
     let id = NEXT_TRANSFER.fetch_add(1, Ordering::Relaxed);
     with_transfers(|transfers| {
@@ -576,6 +579,7 @@ fn run(runtime: &tokio::runtime::Runtime, record: Arc<Transfer>) {
                     discard_partial(progress).await;
                 }
                 *lock(&record.hint) = hint(&error, &record.tuning);
+                *lock(&record.reason) = Some(sentence(&explain(&error, &record.tuning)));
                 progress.event(Level::Error, format!("Failed: {error}"));
                 State::Failed(error.code(), error.to_string(), resumable)
             }
@@ -637,6 +641,9 @@ pub fn status(id: u64) -> BridgeResult<Value> {
     if let Some(hint) = lock(&transfer.hint).clone() {
         reply["hint"] = json!(hint);
     }
+    if let Some(reason) = lock(&transfer.reason).clone() {
+        reply["reason"] = json!(reason);
+    }
     Ok(reply)
 }
 
@@ -653,6 +660,7 @@ pub fn resume(runtime: &tokio::runtime::Runtime, id: u64) -> BridgeResult<Value>
         *state = State::Running;
     }
     *lock(&record.hint) = None;
+    *lock(&record.reason) = None;
     record.progress.event(Level::Info, "Resuming");
     record.progress.touch();
     run(runtime, Arc::clone(&record));
@@ -694,6 +702,14 @@ async fn discard_partial(progress: &Progress) {
     if let Some(Partial::Download { path, .. }) = progress.take_partial() {
         let _ = tokio::fs::remove_file(path).await;
     }
+}
+
+/// Capitalise an explanation for use as a headline.
+fn sentence(text: &str) -> String {
+    let mut characters = text.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
 }
 
 fn bytes(amount: u64) -> String {
@@ -2200,6 +2216,13 @@ mod tests {
                 .contains("changed on the server")
         );
         assert_eq!(bytes(3 * MIB), "3.1 MB");
+        assert_eq!(
+            sentence(&explain(
+                &BridgeError::Client(ClientError::Offline),
+                &tuning
+            )),
+            "Could not reconnect to the server"
+        );
         assert_eq!(seconds(Duration::from_secs(300)), "5 min");
     }
 }

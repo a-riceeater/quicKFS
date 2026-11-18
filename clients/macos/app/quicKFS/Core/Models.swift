@@ -237,6 +237,8 @@ struct TransferStatus: Decodable, Sendable {
     let resumable: Bool?
     /// Plain-language advice for a failure.
     let hint: String?
+    /// The failure in plain words ("Could not reconnect to the server").
+    let reason: String?
 
     var fraction: Double { total == 0 ? 0 : min(1, Double(bytes) / Double(total)) }
 }

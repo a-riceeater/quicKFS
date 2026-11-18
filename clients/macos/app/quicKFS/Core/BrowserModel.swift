@@ -127,7 +127,8 @@ final class TransferItem: Identifiable {
                 chunkBytes: status.chunkBytes, pipelineDepth: status.pipelineDepth,
                 adaptive: status.adaptive, linkRate: status.linkRate, retries: status.retries,
                 sinceCommitMs: 0, retryInMs: nil, stallTimeoutMs: status.stallTimeoutMs,
-                retryWindowMs: status.retryWindowMs, events: status.events, resumable: nil, hint: nil)
+                retryWindowMs: status.retryWindowMs, events: status.events, resumable: nil, hint: nil,
+                reason: nil)
         }
     }
 
@@ -458,7 +459,9 @@ final class BrowserModel {
                     log.append(.app, .warning, "\(item.title) cancelled")
                 case .running: break
                 }
-                if status.state == .failed, let failure = status.error { error = failure }
+                // A resumable stop is explained in its own row and window; an
+                // alert on top would only interrupt.
+                if status.state == .failed, status.resumable != true, let failure = status.error { error = failure }
                 if item.direction != .download { await reload() }
                 return
             }

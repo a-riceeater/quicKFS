@@ -169,7 +169,8 @@ struct TransferDetail: View {
         let lastIssue = status.events?.last { $0.level != "info" }?.message
         switch status.state {
         case .failed:
-            return ("xmark.octagon.fill", .red, status.error?.message ?? "Failed", status.hint)
+            return (item.canResume ? "pause.circle.fill" : "xmark.octagon.fill", item.canResume ? .orange : .red,
+                    status.reason ?? status.error?.message ?? "Failed", status.hint)
         case .cancelled:
             return ("xmark.circle", .secondary, "Cancelled", nil)
         case .finished:
