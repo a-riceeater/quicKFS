@@ -119,11 +119,12 @@ impl Pipeline {
     pub fn new(tuning: Tuning, limit: u64) -> Self {
         let max_chunk = tuning.max_chunk.min(limit).max(1);
         let shape = if tuning.adaptive {
-            // Start at 2 x 1 MiB: a fast link reaches full size after one
-            // completion, a slow one never queues more than it can move.
+            // Start at 2 x 256 KiB: at 60 KB/s the first chunk still lands in
+            // about 8 s, and a fast link doubles to full size within a few
+            // milliseconds of completions.
             Shape {
                 depth: 2.min(tuning.max_depth),
-                chunk: (1024 * 1024).min(max_chunk),
+                chunk: (256 * 1024).min(max_chunk),
             }
         } else {
             Shape {
@@ -257,7 +258,7 @@ mod tests {
             pipeline.shape(),
             Shape {
                 depth: 2,
-                chunk: MIB
+                chunk: MIB / 4
             }
         );
         let shape = settle(&mut pipeline, 25e6, 12);

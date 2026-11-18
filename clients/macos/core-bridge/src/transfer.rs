@@ -56,6 +56,9 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Resizes this close together are reported as one.
 const SHAPE_SETTLE: Duration = Duration::from_secs(2);
+/// A link that keeps nudging the size between two steps is reported at
+/// most this often.
+const SHAPE_REPORT_SPACING: Duration = Duration::from_secs(15);
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -142,6 +145,7 @@ pub struct Progress {
     /// In-flight bytes when the pipeline was last reported, so steady
     /// small adjustments do not flood the event list.
     logged_in_flight: AtomicU64,
+    shape_logged_at: Mutex<Option<Instant>>,
     /// A resize not yet reported, and when the shape last changed: a burst
     /// of resizes is logged once, after it settles.
     pending_shape: Mutex<Option<(Shape, Option<f64>, Instant)>>,
@@ -168,6 +172,7 @@ impl Progress {
             retry_at: Mutex::new(None),
             events: Mutex::new(VecDeque::new()),
             logged_in_flight: AtomicU64::new(0),
+            shape_logged_at: Mutex::new(None),
             pending_shape: Mutex::new(None),
             reconnects: AtomicU64::new(u64::MAX),
             checkpoint: Mutex::new(Checkpoint::default()),
@@ -256,7 +261,9 @@ impl Progress {
         let Some((shape, rate, changed)) = *pending else {
             return;
         };
-        if changed.elapsed() < SHAPE_SETTLE {
+        let spaced =
+            lock(&self.shape_logged_at).is_none_or(|at| at.elapsed() >= SHAPE_REPORT_SPACING);
+        if changed.elapsed() < SHAPE_SETTLE || !spaced {
             return;
         }
         *pending = None;
@@ -272,6 +279,7 @@ impl Progress {
     fn log_shape(&self, why: &str, shape: Shape, rate: Option<f64>) {
         self.logged_in_flight
             .store(shape.in_flight(), Ordering::Relaxed);
+        *lock(&self.shape_logged_at) = Some(Instant::now());
         let rate = rate.map_or(String::new(), |rate| {
             format!(", link about {}/s", bytes(rate as u64))
         });
@@ -2110,7 +2118,7 @@ mod tests {
             progress.commit(1);
         }
         assert_eq!(events(&progress), ["Starting: 2 x 1.0 MB in flight"]);
-        tokio::time::advance(SHAPE_SETTLE).await;
+        tokio::time::advance(SHAPE_REPORT_SPACING).await;
         progress.commit(1);
         assert_eq!(
             events(&progress)[1],
@@ -2118,7 +2126,7 @@ mod tests {
         );
         // Small wobbles after that stay out of the log.
         progress.show_shape(shape(7, 4 * MIB), Some(18e6), None);
-        tokio::time::advance(SHAPE_SETTLE).await;
+        tokio::time::advance(SHAPE_REPORT_SPACING).await;
         progress.commit(1);
         assert_eq!(events(&progress).len(), 2);
     }
