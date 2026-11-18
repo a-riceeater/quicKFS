@@ -173,9 +173,12 @@ struct TransferDetail: View {
         case .cancelled:
             return ("xmark.circle", .secondary, "Cancelled", nil)
         case .finished:
-            let retried = status.retries ?? 0
+            // Retries and reconnects alike: every warning in the log was
+            // something the link did that the transfer rode out.
+            let interruptions = status.events?.filter { $0.level == "warning" }.count ?? Int(status.retries ?? 0)
             return ("checkmark.circle", .secondary,
-                    retried == 0 ? "Finished without interruptions" : "Finished after \(retried) \(retried == 1 ? "retry" : "retries")",
+                    interruptions == 0 ? "Finished without interruptions"
+                        : "Finished after riding out \(interruptions) \(interruptions == 1 ? "interruption" : "interruptions")",
                     nil)
         case .running:
             if let wait = status.retryInMs {
