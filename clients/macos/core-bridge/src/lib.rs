@@ -12,6 +12,7 @@
 mod cache;
 mod ffi;
 mod model;
+mod pipeline;
 mod session;
 mod transfer;
 
