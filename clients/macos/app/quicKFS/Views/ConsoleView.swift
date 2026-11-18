@@ -214,14 +214,32 @@ private struct LiveIndicator: View {
                 .frame(width: 8, height: 8)
                 .shadow(color: source == .none ? .clear : .green, radius: pulse ? 6 : 1)
                 .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true), value: pulse)
-            Text(source == .mount ? "MNT" : source == .session ? "SES" : "OFF")
+            Text(label)
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .foregroundStyle(.secondary)
         }
         .frame(width: 40, height: 64)
         .glassEffect(.regular, in: .rect(cornerRadius: 12))
         .onAppear { pulse = true }
-        .help(source == .mount ? "Live from the mounted volume" : source == .session ? "Live from this window's session" : "No live link")
+        .help(help)
+    }
+
+    private var label: String {
+        switch source {
+        case .both: "ALL"
+        case .mount: "MNT"
+        case .session: "SES"
+        case .none: "OFF"
+        }
+    }
+
+    private var help: String {
+        switch source {
+        case .both: "Live from this window's session and the mounted volume"
+        case .mount: "Live from the mounted volume"
+        case .session: "Live from this window's session"
+        case .none: "No live link"
+        }
     }
 }
 

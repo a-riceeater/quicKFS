@@ -64,33 +64,37 @@ struct TelemetrySample: Identifiable, Sendable {
 
 /// Live link telemetry for one server.
 ///
-/// While the server is mounted it reads the helper's `--stats-file`, which
-/// covers all Finder and application traffic; otherwise it samples the
-/// app's own browsing session. Counters restart with each new connection, so
-/// totals are accumulated from per-sample deltas and a counter that goes
-/// backwards is treated as a reconnect rather than negative traffic.
+/// Each second it samples both links the app may have open: its own
+/// browsing session, and while mounted, the helper's connection (asked over
+/// the helper's pipes, so nothing is written to disk). Throughput and loss
+/// add the two together; round-trip time, window, and MTU follow whichever
+/// link carried more traffic in the last second, so an idle link cannot
+/// freeze the figures. Counters restart with each new connection, so totals
+/// are accumulated from per-sample deltas and a counter that goes backwards
+/// is treated as a reconnect rather than negative traffic.
 @MainActor
 @Observable
 final class Telemetry {
-    enum Source: Equatable { case none, session, mount }
+    enum Source: Equatable { case none, session, mount, both }
 
     private(set) var source: Source = .none
+    /// Cumulative counters of the link the figures currently follow.
     private(set) var latest: LinkSnapshot?
     private(set) var samples: [TelemetrySample] = []
     private(set) var totalReceived: UInt64 = 0
     private(set) var totalSent: UInt64 = 0
-    private(set) var mountPID: Int32?
-    private(set) var mountStarted: Date?
 
-    private var previous: (LinkSnapshot, Date, Source)?
-    private var nextID = 0
-    private var watchers = 0
-    private var task: Task<Void, Never>?
+    @ObservationIgnored private var mixer = LinkMixer()
+    @ObservationIgnored private var nextID = 0
+    @ObservationIgnored private var watchers = 0
+    @ObservationIgnored private var task: Task<Void, Never>?
     private let connection: ServerConnection
     private let mount: MountController
     private let log: ConsoleLog
 
     static let window = 120
+    /// A mount reply older than this no longer counts as live.
+    private static let mountReplyLifetime: TimeInterval = 3
 
     init(connection: ServerConnection, mount: MountController, log: ConsoleLog) {
         self.connection = connection
@@ -101,6 +105,8 @@ final class Telemetry {
     var current: TelemetrySample? { samples.last }
     var peakReceive: Double { samples.map(\.receiveRate).max() ?? 0 }
     var peakSend: Double { samples.map(\.sendRate).max() ?? 0 }
+    /// When the running mount helper started, from its own report.
+    var mountStarted: Date? { mount.isMounted ? mount.linkReading?.helperStarted : nil }
 
     /// Standard deviation of recent round-trip times, in milliseconds.
     var jitterMs: Double {
@@ -139,64 +145,144 @@ final class Telemetry {
     }
 
     private func sample() async {
-        var snapshot: LinkSnapshot?
-        var source = Source.none
-        if mount.isMounted, let url = mount.statsFile {
-            struct StatsFile: Decodable { let pid: Int32; let startedMs: UInt64; let link: LinkSnapshot? }
-            if let data = try? Data(contentsOf: url) {
-                let decoder = JSONDecoder()
-                decoder.keyDecodingStrategy = .convertFromSnakeCase
-                if let file = try? decoder.decode(StatsFile.self, from: data) {
-                    snapshot = file.link
-                    mountPID = file.pid
-                    mountStarted = Date(timeIntervalSince1970: Double(file.startedMs) / 1000)
-                    source = .mount
-                }
-            }
-        } else if connection.isOnline {
+        // Ask the helper first: its reply usually arrives while the session
+        // request is in flight, so both readings describe the same second.
+        mount.requestLinkStats()
+        var readings: [LinkMixer.Link: LinkMixer.Reading] = [:]
+        if connection.isOnline {
             struct Reply: Decodable, Sendable { let link: LinkSnapshot? }
-            if let reply: Reply = try? await connection.request("link_stats") {
-                snapshot = reply.link
-                source = .session
+            if let reply: Reply = try? await connection.request("link_stats"), let link = reply.link {
+                readings[.session] = .init(snapshot: link, at: .now)
             }
         }
-        if !mount.isMounted { mountPID = nil; mountStarted = nil }
-        guard let snapshot else {
-            self.source = .none
-            return
+        if mount.isMounted, let reading = mount.linkReading,
+           Date.now.timeIntervalSince(reading.at) < Self.mountReplyLifetime {
+            readings[.mount] = .init(snapshot: reading.link, at: reading.at)
         }
-        record(snapshot, source: source)
-    }
-
-    private func record(_ snapshot: LinkSnapshot, source: Source) {
-        let now = Date.now
-        defer {
-            previous = (snapshot, now, source)
-            latest = snapshot
-            self.source = source
+        let mixed = mixer.mix(readings)
+        for event in mixed.events { log.append(.link, event.warning ? .warning : .debug, event.message) }
+        source = switch (readings[.session] != nil, readings[.mount] != nil) {
+        case (true, true): .both
+        case (true, false): .session
+        case (false, true): .mount
+        case (false, false): .none
         }
-        guard let (last, lastDate, lastSource) = previous, lastSource == source else { return }
-        if snapshot.reconnects > last.reconnects {
-            log.append(.link, .warning, "transport replaced (reconnect #\(snapshot.reconnects))")
-        }
-        let restarted = snapshot.bytesReceived < last.bytesReceived || snapshot.bytesSent < last.bytesSent
-        let received = restarted ? snapshot.bytesReceived : snapshot.bytesReceived - last.bytesReceived
-        let sent = restarted ? snapshot.bytesSent : snapshot.bytesSent - last.bytesSent
-        let packets = restarted ? snapshot.packetsSent : snapshot.packetsSent - last.packetsSent
-        let lost = restarted ? snapshot.packetsLost : snapshot.packetsLost &- last.packetsLost
-        if !restarted, snapshot.congestionEvents > last.congestionEvents {
-            log.append(.link, .debug, "congestion event; window \(Format.bytes(snapshot.congestionWindow))")
-        }
-        totalReceived &+= received
-        totalSent &+= sent
-        let elapsed = max(0.25, now.timeIntervalSince(lastDate))
+        latest = mixed.followed
+        guard let tick = mixed.tick else { return }
+        totalReceived &+= tick.received
+        totalSent &+= tick.sent
         nextID += 1
         samples.append(TelemetrySample(
-            id: nextID, date: now,
-            receiveRate: Double(received) / elapsed,
-            sendRate: Double(sent) / elapsed,
-            rttMs: Double(snapshot.rttUs) / 1000,
-            lossFraction: packets == 0 ? 0 : min(1, Double(lost) / Double(packets))))
+            id: nextID, date: .now, receiveRate: tick.receiveRate, sendRate: tick.sendRate,
+            rttMs: tick.rttMs, lossFraction: tick.lossFraction))
         if samples.count > Self.window { samples.removeFirst(samples.count - Self.window) }
+    }
+}
+
+/// Folds per-link counter readings into one figure per second.
+///
+/// Throughput and loss are summed across links. Round-trip time and the
+/// cumulative counters follow the link that moved the most bytes, and stay
+/// on it while every link is idle, so the figures never jump to a link that
+/// is merely sitting open. A link missing from a tick is forgotten, so a new
+/// connection (a new mount, a session that came back) starts from its own
+/// baseline instead of being diffed against the old one.
+struct LinkMixer {
+    enum Link: Hashable { case session, mount }
+
+    struct Reading {
+        let snapshot: LinkSnapshot
+        /// When the counters were read; a reading no newer than the last one
+        /// for its link carries no new traffic.
+        let at: Date
+    }
+
+    struct Tick {
+        let received: UInt64
+        let sent: UInt64
+        let receiveRate: Double
+        let sendRate: Double
+        let rttMs: Double
+        let lossFraction: Double
+    }
+
+    struct Event {
+        let warning: Bool
+        let message: String
+    }
+
+    struct Mixed {
+        /// Counters of the link the figures follow.
+        let followed: LinkSnapshot?
+        /// Nil until some link has two readings to compare.
+        let tick: Tick?
+        let events: [Event]
+    }
+
+    private struct Delta {
+        let received: UInt64
+        let sent: UInt64
+        let packets: UInt64
+        let lost: UInt64
+        let elapsed: TimeInterval
+        var bytes: UInt64 { received &+ sent }
+    }
+
+    private var previous: [Link: Reading] = [:]
+    private(set) var following: Link = .session
+
+    mutating func mix(_ readings: [Link: Reading]) -> Mixed {
+        for link in previous.keys where readings[link] == nil { previous[link] = nil }
+        var events: [Event] = []
+        var deltas: [Link: Delta] = [:]
+        for (link, reading) in readings {
+            if let last = previous[link] {
+                guard reading.at > last.at else { continue }
+                deltas[link] = Self.delta(link, from: last, to: reading, events: &events)
+            }
+            previous[link] = reading
+        }
+
+        if let busiest = deltas.max(by: { $0.value.bytes < $1.value.bytes }), busiest.value.bytes > 0 {
+            following = busiest.key
+        } else if readings[following] == nil {
+            following = readings[.session] != nil ? .session : .mount
+        }
+        let followed = readings[following]?.snapshot
+
+        guard !deltas.isEmpty, let followed else {
+            return Mixed(followed: followed, tick: nil, events: events)
+        }
+        let packets = deltas.values.reduce(0) { $0 &+ $1.packets }
+        let lost = deltas.values.reduce(0) { $0 &+ $1.lost }
+        let tick = Tick(
+            received: deltas.values.reduce(0) { $0 &+ $1.received },
+            sent: deltas.values.reduce(0) { $0 &+ $1.sent },
+            receiveRate: deltas.values.reduce(0) { $0 + Double($1.received) / $1.elapsed },
+            sendRate: deltas.values.reduce(0) { $0 + Double($1.sent) / $1.elapsed },
+            rttMs: Double(followed.rttUs) / 1000,
+            lossFraction: packets == 0 ? 0 : min(1, Double(lost) / Double(packets)))
+        return Mixed(followed: followed, tick: tick, events: events)
+    }
+
+    private static func delta(_ link: Link, from last: Reading, to reading: Reading,
+                              events: inout [Event]) -> Delta {
+        let old = last.snapshot
+        let new = reading.snapshot
+        let name = link == .mount ? "mount" : "session"
+        if new.reconnects > old.reconnects {
+            events.append(Event(warning: true, message: "\(name) transport replaced (reconnect #\(new.reconnects))"))
+        }
+        let restarted = new.bytesReceived < old.bytesReceived || new.bytesSent < old.bytesSent
+        if !restarted, new.congestionEvents > old.congestionEvents {
+            events.append(Event(warning: false,
+                message: "\(name) congestion event; window \(Format.bytes(new.congestionWindow))"))
+        }
+        return Delta(
+            received: restarted ? new.bytesReceived : new.bytesReceived - old.bytesReceived,
+            sent: restarted ? new.bytesSent : new.bytesSent - old.bytesSent,
+            packets: restarted ? new.packetsSent : new.packetsSent &- old.packetsSent,
+            lost: restarted ? new.packetsLost : new.packetsLost &- old.packetsLost,
+            elapsed: max(0.25, reading.at.timeIntervalSince(last.at)))
     }
 }

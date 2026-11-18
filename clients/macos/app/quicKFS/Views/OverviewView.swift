@@ -192,16 +192,30 @@ private struct SourceBadge: View {
         if source != .none {
             HStack(spacing: 5) {
                 Circle().fill(.green).frame(width: 6, height: 6)
-                Text(source == .mount ? "MOUNT" : "SESSION")
+                Text(label)
             }
             .font(.caption2.weight(.semibold).monospaced())
             .foregroundStyle(.secondary)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
             .glassEffect(.regular, in: .capsule)
-            .help(source == .mount
-                ? "All Finder and app traffic through the mounted volume"
-                : "This window's own connection to the server")
+            .help(help)
+        }
+    }
+
+    private var label: String {
+        switch source {
+        case .both: "SESSION + MOUNT"
+        case .mount: "MOUNT"
+        default: "SESSION"
+        }
+    }
+
+    private var help: String {
+        switch source {
+        case .both: "This window's connection and the mounted volume, added together"
+        case .mount: "All Finder and app traffic through the mounted volume"
+        default: "This window's own connection to the server"
         }
     }
 }
