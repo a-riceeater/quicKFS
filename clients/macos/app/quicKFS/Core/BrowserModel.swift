@@ -125,7 +125,8 @@ final class TransferItem: Identifiable {
                 state: .running, bytes: status.bytes, total: status.total, files: status.files,
                 filesTotal: status.filesTotal, error: nil, current: status.current,
                 chunkBytes: status.chunkBytes, pipelineDepth: status.pipelineDepth,
-                adaptive: status.adaptive, linkRate: status.linkRate, retries: status.retries,
+                adaptive: status.adaptive, connections: status.connections, linkRate: status.linkRate,
+                retries: status.retries,
                 sinceCommitMs: 0, retryInMs: nil, stallTimeoutMs: status.stallTimeoutMs,
                 retryWindowMs: status.retryWindowMs, events: status.events, resumable: nil, hint: nil,
                 reason: nil)

@@ -60,6 +60,9 @@ struct TransferOptions: Codable, Hashable, Sendable {
     var adaptive = true
     var maxDepth = 8
     var maxChunkKiB = 4_096
+    /// Separate connections a large download stripes across. More helps on
+    /// lossy links, at one extra login on the server each.
+    var connections = 1
 
     init() {}
 
@@ -71,6 +74,7 @@ struct TransferOptions: Codable, Hashable, Sendable {
         adaptive = (try? values.decodeIfPresent(Bool.self, forKey: .adaptive)) ?? defaults.adaptive
         maxDepth = (try? values.decodeIfPresent(Int.self, forKey: .maxDepth)) ?? defaults.maxDepth
         maxChunkKiB = (try? values.decodeIfPresent(Int.self, forKey: .maxChunkKiB)) ?? defaults.maxChunkKiB
+        connections = (try? values.decodeIfPresent(Int.self, forKey: .connections)) ?? defaults.connections
     }
 
     var timeoutMs: JSONValue { .uint(UInt64(max(1, stallTimeoutSeconds)) * 1_000) }
@@ -81,6 +85,7 @@ struct TransferOptions: Codable, Hashable, Sendable {
             "max_depth": .uint(UInt64(max(1, maxDepth))),
             "max_chunk_bytes": .uint(UInt64(max(128, maxChunkKiB)) * 1_024),
             "retry_window_ms": .uint(UInt64(max(1, retryMinutes)) * 60_000),
+            "connections": .uint(UInt64(min(4, max(1, connections)))),
         ]
     }
 }
@@ -223,6 +228,8 @@ struct TransferStatus: Decodable, Sendable {
     let chunkBytes: UInt64?
     let pipelineDepth: Int?
     let adaptive: Bool?
+    /// Connections the current file is striped across.
+    let connections: Int?
     /// The rate chunks are completing at, in bytes/s.
     let linkRate: Double?
     let retries: UInt64?

@@ -197,9 +197,10 @@ struct TransferDetail: View {
                 return ("ellipsis", .secondary, "Starting", nil)
             }
             let rate = status.linkRate.map { " at \(Rate.parts($0).0) \(Rate.parts($0).1)" } ?? ""
+            let across = (status.connections ?? 1) > 1 ? " over \(status.connections ?? 1) connections" : ""
             let small = status.adaptive != false && (chunk < 4 << 20 || depth < 8)
             return (small ? "tortoise" : "bolt.horizontal", .secondary,
-                    "\(depth) × \(Self.binary(chunk)) in flight\(rate)",
+                    "\(depth) × \(Self.binary(chunk)) in flight\(across)\(rate)",
                     small && (status.linkRate ?? .infinity) < 2_000_000
                         ? "Requests are kept small so each finishes in seconds on this link." : nil)
         }
@@ -252,7 +253,10 @@ struct TransferDetail: View {
     // MARK: Link
 
     private var linkSection: some View {
-        DetailBlock(title: "QUIC link", symbol: "antenna.radiowaves.left.and.right") {
+        // Link counters come from the session's first connection only.
+        let connections = item.status?.connections ?? 1
+        return DetailBlock(title: connections > 1 ? "QUIC link 1 of \(connections)" : "QUIC link",
+                           symbol: "antenna.radiowaves.left.and.right") {
             if let link = item.link {
                 let sent = item.delta(\.packetsSent)
                 let lost = item.delta(\.packetsLost)
@@ -288,6 +292,9 @@ struct TransferDetail: View {
                 row("compression", proto.compression ? "zstd ≥ 1 KiB" : "off")
                 if let chunk = item.status?.chunkBytes, let depth = item.status?.pipelineDepth, depth > 0 {
                     row("pipeline", "\(depth) × \(Self.binary(chunk))\(item.status?.adaptive == false ? " fixed" : "")")
+                }
+                if let connections = item.status?.connections, connections > 1 {
+                    row("connections", "\(connections)")
                 }
                 if let retries = item.status?.retries, retries > 0 {
                     row("retries", "\(retries)", alert: true)

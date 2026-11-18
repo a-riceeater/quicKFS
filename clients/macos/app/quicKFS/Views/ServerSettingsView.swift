@@ -169,6 +169,10 @@ struct ServerSettingsView: View {
                     LabeledContent("Keep retrying for", value: "\(draft.transfer.retryMinutes) min")
                 }
                 .help("How long a download or upload keeps retrying while nothing lands, before it stops and offers Resume.")
+                Stepper(value: $draft.transfer.connections, in: 1...4) {
+                    LabeledContent("Connections per download", value: "\(draft.transfer.connections)")
+                }
+                .help("Large downloads stripe across this many connections. On a lossy or relayed link each connection slows down on its own, so several together move more. Each one is an extra login on the server.")
                 Toggle("Size requests to the link", isOn: $draft.transfer.adaptive)
                     .help("Keep only a few seconds of data in flight, so slow or relayed links do not time out.")
                 Stepper(value: $draft.transfer.maxDepth, in: 1...32) {
