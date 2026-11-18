@@ -101,6 +101,11 @@ pub enum TransportError {
 pub struct QuicClient {
     endpoint: Endpoint,
     connection: Connection,
+    /// Idle limit for every request phase: a phase fails only after this
+    /// long passes with no progress (no bytes arriving, or none accepted for
+    /// sending). A slow link that keeps delivering never trips it; a stalled
+    /// one fails one idle period after its last byte. Connecting and opening
+    /// a stream have no partial progress, so for them it is a plain deadline.
     timeout: Duration,
     /// Whether outbound frames may be compressed. Off until the `Hello`/`HelloAck`
     /// handshake learns the peer advertises at least `MINOR_FRAME_COMPRESSION`, so
@@ -345,14 +350,8 @@ impl QuicClient {
         let compress = self.compression.load(Ordering::Relaxed);
         let (prefix, body, payload) = encode_frame_measured(value, compress)?;
         let body = Zeroizing::new(body);
-        let write = async {
-            send.write_all(&prefix.to_be_bytes()).await?;
-            send.write_all(&body).await?;
-            Ok::<(), TransportError>(())
-        };
-        tokio::time::timeout(self.timeout, write)
-            .await
-            .map_err(|_| TransportError::Timeout)??;
+        write_all_idle(send, &prefix.to_be_bytes(), self.timeout, |_| {}).await?;
+        write_all_idle(send, &body, self.timeout, |_| {}).await?;
         let counters = &self.counters;
         counters.frames_sent.fetch_add(1, Ordering::Relaxed);
         if parse_frame_header(prefix).is_ok_and(|(compressed, _)| compressed) {
@@ -367,30 +366,22 @@ impl QuicClient {
         Ok(())
     }
     pub async fn send_all(&self, send: &mut SendStream, data: &[u8]) -> Result<(), TransportError> {
-        tokio::time::timeout(self.timeout, send.write_all(data))
-            .await
-            .map_err(|_| TransportError::Timeout)??;
-        self.counters
-            .data_sent
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-        Ok(())
+        let counter = &self.counters.data_sent;
+        write_all_idle(send, data, self.timeout, |amount| {
+            counter.fetch_add(amount as u64, Ordering::Relaxed);
+        })
+        .await
     }
     pub async fn receive_frame<T: DeserializeOwned>(
         &self,
         recv: &mut RecvStream,
     ) -> Result<T, TransportError> {
-        let read = async {
-            let mut prefix = [0; 4];
-            recv.read_exact(&mut prefix).await?;
-            let (compressed, size) = parse_frame_header(u32::from_be_bytes(prefix))?;
-            let mut body = Zeroizing::new(vec![0; size]);
-            recv.read_exact(&mut body).await?;
-            let (value, payload) = decode_frame_measured(compressed, &body)?;
-            Ok::<_, TransportError>((value, compressed, size, payload))
-        };
-        let (value, compressed, size, payload) = tokio::time::timeout(self.timeout, read)
-            .await
-            .map_err(|_| TransportError::Timeout)??;
+        let mut prefix = [0; 4];
+        read_exact_idle(recv, &mut prefix, self.timeout, |_| {}).await?;
+        let (compressed, size) = parse_frame_header(u32::from_be_bytes(prefix))?;
+        let mut body = Zeroizing::new(vec![0; size]);
+        read_exact_idle(recv, &mut body, self.timeout, |_| {}).await?;
+        let (value, payload) = decode_frame_measured::<T>(compressed, &body)?;
         let counters = &self.counters;
         counters.frames_received.fetch_add(1, Ordering::Relaxed);
         if compressed {
@@ -409,13 +400,13 @@ impl QuicClient {
         recv: &mut RecvStream,
         data: &mut [u8],
     ) -> Result<(), TransportError> {
-        tokio::time::timeout(self.timeout, recv.read_exact(data))
-            .await
-            .map_err(|_| TransportError::Timeout)??;
-        self.counters
-            .data_received
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-        Ok(())
+        // Counted as bytes land, so link counters show a slow body arriving
+        // instead of jumping only when the whole chunk is complete.
+        let counter = &self.counters.data_received;
+        read_exact_idle(recv, data, self.timeout, |amount| {
+            counter.fetch_add(amount as u64, Ordering::Relaxed);
+        })
+        .await
     }
     pub fn connection(&self) -> &Connection {
         &self.connection
@@ -424,6 +415,49 @@ impl QuicClient {
         self.connection.close(0u32.into(), b"client shutdown");
         let _ = &self.endpoint;
     }
+}
+
+/// Read exactly `data.len()` bytes, failing only when nothing arrives for
+/// `idle`. `RecvStream::read` is cancel safe, so a timed-out read loses no
+/// bytes; the caller abandons the stream on error anyway.
+async fn read_exact_idle(
+    recv: &mut RecvStream,
+    data: &mut [u8],
+    idle: Duration,
+    mut progress: impl FnMut(usize),
+) -> Result<(), TransportError> {
+    let mut filled = 0;
+    while filled < data.len() {
+        match tokio::time::timeout(idle, recv.read(&mut data[filled..])).await {
+            Err(_) => return Err(TransportError::Timeout),
+            Ok(Err(error)) => return Err(quinn::ReadExactError::ReadError(error).into()),
+            Ok(Ok(None)) => return Err(quinn::ReadExactError::FinishedEarly(filled).into()),
+            Ok(Ok(Some(amount))) => {
+                filled += amount;
+                progress(amount);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write all of `data`, failing only when the stream accepts nothing for
+/// `idle` (flow control or congestion holding every byte back).
+async fn write_all_idle(
+    send: &mut SendStream,
+    data: &[u8],
+    idle: Duration,
+    mut progress: impl FnMut(usize),
+) -> Result<(), TransportError> {
+    let mut sent = 0;
+    while sent < data.len() {
+        let amount = tokio::time::timeout(idle, send.write(&data[sent..]))
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+        sent += amount;
+        progress(amount);
+    }
+    Ok(())
 }
 
 /// A deliberately restricted connection that accepts an initially untrusted
@@ -771,6 +805,80 @@ pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T,
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A loopback server that answers one stream by sending `pieces` with
+    /// `gap` between them, then holds the stream open without finishing it.
+    async fn trickling_server(
+        idle: Duration,
+        pieces: Vec<Vec<u8>>,
+        gap: Duration,
+    ) -> (QuicClient, tokio::task::JoinHandle<()>) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = CertificateDer::from(cert.der().to_vec());
+        let key = PrivateKeyDer::from(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            signing_key.serialize_der(),
+        ));
+        let server =
+            server_endpoint("127.0.0.1:0".parse().unwrap(), vec![certificate.clone()], key)
+                .unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut go = [0; 2];
+            recv.read_exact(&mut go).await.unwrap();
+            for piece in pieces {
+                send.write_all(&piece).await.unwrap();
+                tokio::time::sleep(gap).await;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop((send, connection, server));
+        });
+        let fingerprint = certificate_sha256(&certificate);
+        let client = QuicClient::connect_pinned(address, "localhost", fingerprint, idle)
+            .await
+            .unwrap();
+        (client, task)
+    }
+
+    #[tokio::test]
+    async fn slow_body_that_keeps_arriving_outlives_the_idle_limit() {
+        let idle = Duration::from_millis(400);
+        // 16 pieces 150 ms apart: about six idle periods in total, but never
+        // one idle period without a byte.
+        let pieces = (0..16_u8).map(|value| vec![value; 4096]).collect();
+        let (client, server) =
+            trickling_server(idle, pieces, Duration::from_millis(150)).await;
+        let (mut send, mut recv) = client.stream().await.unwrap();
+        client.send_all(&mut send, b"go").await.unwrap();
+        let started = std::time::Instant::now();
+        let mut body = vec![0; 16 * 4096];
+        client.receive_exact(&mut recv, &mut body).await.unwrap();
+        assert!(started.elapsed() > idle * 4);
+        assert!(body.chunks(4096).enumerate().all(|(index, piece)| piece
+            .iter()
+            .all(|byte| usize::from(*byte) == index)));
+        assert_eq!(client.protocol_stats().data_bytes_received, 16 * 4096);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_body_fails_one_idle_period_after_its_last_byte() {
+        let idle = Duration::from_millis(300);
+        let (client, server) =
+            trickling_server(idle, vec![vec![7; 4096]], Duration::from_millis(1)).await;
+        let (mut send, mut recv) = client.stream().await.unwrap();
+        client.send_all(&mut send, b"go").await.unwrap();
+        let started = std::time::Instant::now();
+        let mut body = vec![0; 64 * 1024];
+        let result = client.receive_exact(&mut recv, &mut body).await;
+        assert!(matches!(result, Err(TransportError::Timeout)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        // The partial body is still counted as it arrived.
+        assert_eq!(client.protocol_stats().data_bytes_received, 4096);
+        server.abort();
+    }
 
     #[test]
     fn congestion_control_names_round_trip_and_reject_unknowns() {
