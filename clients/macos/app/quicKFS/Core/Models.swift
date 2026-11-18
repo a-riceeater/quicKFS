@@ -49,6 +49,42 @@ struct MountOptions: Codable, Hashable, Sendable {
     var mountAtLaunch = false
 }
 
+/// How downloads and uploads in the browser pace and retry themselves. Every
+/// field decodes leniently so adding one never drops a saved server.
+struct TransferOptions: Codable, Hashable, Sendable {
+    /// Seconds without any data moving before a request counts as stalled.
+    var stallTimeoutSeconds = 30
+    /// Minutes a transfer keeps retrying while nothing lands.
+    var retryMinutes = 5
+    /// Size the pipeline to the measured link instead of always the maxima.
+    var adaptive = true
+    var maxDepth = 8
+    var maxChunkKiB = 4_096
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = TransferOptions()
+        stallTimeoutSeconds = (try? values.decodeIfPresent(Int.self, forKey: .stallTimeoutSeconds)) ?? defaults.stallTimeoutSeconds
+        retryMinutes = (try? values.decodeIfPresent(Int.self, forKey: .retryMinutes)) ?? defaults.retryMinutes
+        adaptive = (try? values.decodeIfPresent(Bool.self, forKey: .adaptive)) ?? defaults.adaptive
+        maxDepth = (try? values.decodeIfPresent(Int.self, forKey: .maxDepth)) ?? defaults.maxDepth
+        maxChunkKiB = (try? values.decodeIfPresent(Int.self, forKey: .maxChunkKiB)) ?? defaults.maxChunkKiB
+    }
+
+    var timeoutMs: JSONValue { .uint(UInt64(max(1, stallTimeoutSeconds)) * 1_000) }
+
+    var request: JSONValue {
+        [
+            "adaptive": .bool(adaptive),
+            "max_depth": .uint(UInt64(max(1, maxDepth))),
+            "max_chunk_bytes": .uint(UInt64(max(128, maxChunkKiB)) * 1_024),
+            "retry_window_ms": .uint(UInt64(max(1, retryMinutes)) * 60_000),
+        ]
+    }
+}
+
 /// A saved server. Passwords live in the Keychain, never in this record.
 struct ServerProfile: Codable, Identifiable, Hashable, Sendable {
     var id = UUID()
@@ -61,6 +97,13 @@ struct ServerProfile: Codable, Identifiable, Hashable, Sendable {
     var username: String
     var trust: TrustMode = .pinned
     var mount = MountOptions()
+    /// Optional so profiles saved before transfer settings existed still decode.
+    var transfers: TransferOptions?
+
+    var transfer: TransferOptions {
+        get { transfers ?? TransferOptions() }
+        set { transfers = newValue }
+    }
 
     var endpoint: JSONValue {
         ["address": .string(address), "server_name": .string(serverName)]
@@ -175,11 +218,35 @@ struct TransferStatus: Decodable, Sendable {
     let error: CoreError?
     /// The file being copied now, relative to the transfer's root.
     let current: String?
-    /// Bytes per pipelined request and how many requests stay in flight.
+    /// Bytes per pipelined request and how many requests stay in flight,
+    /// as the adaptive pipeline has sized them right now.
     let chunkBytes: UInt64?
     let pipelineDepth: Int?
+    let adaptive: Bool?
+    /// The rate chunks are completing at, in bytes/s.
+    let linkRate: Double?
+    let retries: UInt64?
+    /// Time since data last landed for good.
+    let sinceCommitMs: UInt64?
+    /// Set while the transfer waits to retry after a failure.
+    let retryInMs: UInt64?
+    let stallTimeoutMs: UInt64?
+    let retryWindowMs: UInt64?
+    let events: [TransferEvent]?
+    /// A failed transfer that can continue from where it stopped.
+    let resumable: Bool?
+    /// Plain-language advice for a failure.
+    let hint: String?
 
     var fraction: Double { total == 0 ? 0 : min(1, Double(bytes) / Double(total)) }
+}
+
+/// One line of a transfer's own log: retries, resizes, resumes.
+struct TransferEvent: Decodable, Hashable, Sendable {
+    let atMs: UInt64
+    /// "info", "warning", or "error".
+    let level: String
+    let message: String
 }
 
 struct PinnedServer: Decodable, Hashable, Sendable {

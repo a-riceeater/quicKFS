@@ -55,6 +55,8 @@ final class ServerConnection {
                 "trust": profile.trust.request,
                 "username": .string(profile.username),
                 "password": .string(password),
+                "timeout_ms": profile.transfer.timeoutMs,
+                "transfer": profile.transfer.request,
             ])
             await MainActor.run { self.capabilities = reply.capabilities }
             return reply.session

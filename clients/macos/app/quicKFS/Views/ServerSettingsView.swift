@@ -160,6 +160,36 @@ struct ServerSettingsView: View {
                 }
             }
 
+            Section {
+                Stepper(value: $draft.transfer.stallTimeoutSeconds, in: 10...300, step: 5) {
+                    LabeledContent("Stall timeout", value: "\(draft.transfer.stallTimeoutSeconds) s")
+                }
+                .help("A request fails after this long with no data moving. Slow but steady links never hit it.")
+                Stepper(value: $draft.transfer.retryMinutes, in: 1...60) {
+                    LabeledContent("Keep retrying for", value: "\(draft.transfer.retryMinutes) min")
+                }
+                .help("How long a download or upload keeps retrying while nothing lands, before it stops and offers Resume.")
+                Toggle("Size requests to the link", isOn: $draft.transfer.adaptive)
+                    .help("Keep only a few seconds of data in flight, so slow or relayed links do not time out.")
+                Stepper(value: $draft.transfer.maxDepth, in: 1...32) {
+                    LabeledContent(draft.transfer.adaptive ? "Most requests in flight" : "Requests in flight",
+                                   value: "\(draft.transfer.maxDepth)")
+                }
+                Picker(draft.transfer.adaptive ? "Largest request" : "Request size", selection: $draft.transfer.maxChunkKiB) {
+                    ForEach([256, 512, 1_024, 2_048, 4_096, 8_192, 16_384], id: \.self) { kib in
+                        Text(Format.bytes(UInt64(kib) * 1024)).tag(kib)
+                    }
+                }
+                Button("Restore Defaults") { draft.transfers = nil }
+                    .disabled(draft.transfers == nil || draft.transfer == TransferOptions())
+            } header: {
+                Text("Transfers")
+            } footer: {
+                Text("Applies to downloads and uploads in the browser from the next connection.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             if let failure {
                 Section { Text(failure).foregroundStyle(.red).textSelection(.enabled) }
             }
