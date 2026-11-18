@@ -18,6 +18,7 @@ use quickfs_transport_quic::load_certificates;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -37,6 +38,104 @@ pub struct Session {
     pub capabilities: FilesystemCapabilities,
     /// How this session's downloads and uploads size and retry themselves.
     pub tuning: Tuning,
+    /// Extra authenticated connections that downloads stripe chunks across,
+    /// opened on first use and kept for the session's life.
+    extra: tokio::sync::Mutex<Vec<Arc<dyn RemoteFilesystem>>>,
+    /// What an extra connection needs to log in, held in zeroizing memory
+    /// like the resilient layer's own reconnect copy.
+    login: Option<Login>,
+}
+
+struct Login {
+    server: SocketAddr,
+    server_name: String,
+    trust: ServerTrust,
+    username: String,
+    password: Zeroizing<String>,
+    timeout: Duration,
+}
+
+impl Login {
+    async fn connect(&self) -> BridgeResult<Arc<dyn RemoteFilesystem>> {
+        let config = AuthenticatedConnectionConfig::new(
+            self.server,
+            self.server_name.clone(),
+            self.trust.clone(),
+            self.username.clone(),
+            self.password.to_string(),
+            self.timeout,
+        );
+        let resilient =
+            ResilientFilesystem::connect_authenticated(config, resilient_options()).await?;
+        Ok(Arc::new(resilient))
+    }
+}
+
+fn resilient_options() -> ResilientFilesystemOptions {
+    ResilientFilesystemOptions {
+        reconnect: ReconnectPolicy {
+            attempts: 3,
+            initial_backoff: Duration::from_millis(100),
+            maximum_backoff: Duration::from_secs(2),
+        },
+        // One browsing or transfer step, including reconnect and retry.
+        operation_deadline: Duration::from_secs(120),
+    }
+}
+
+impl Session {
+    /// A session with no way to open extra connections, for tests.
+    #[cfg(test)]
+    pub fn new(
+        filesystem: Arc<dyn RemoteFilesystem>,
+        capabilities: FilesystemCapabilities,
+        tuning: Tuning,
+    ) -> Self {
+        Self {
+            filesystem,
+            capabilities,
+            tuning,
+            extra: tokio::sync::Mutex::new(Vec::new()),
+            login: None,
+        }
+    }
+
+    /// Up to `wanted` extra connections, opening missing ones in parallel.
+    /// Each costs the server one password hash, so they are kept and reused.
+    /// When some cannot be opened the rest still serve, and the second value
+    /// says why there are fewer.
+    pub async fn extra_connections(
+        &self,
+        wanted: usize,
+    ) -> (Vec<Arc<dyn RemoteFilesystem>>, Option<String>) {
+        let mut extra = self.extra.lock().await;
+        let mut shortfall = None;
+        if extra.len() < wanted
+            && let Some(login) = &self.login
+        {
+            let missing = wanted - extra.len();
+            let opened = futures::future::join_all((0..missing).map(|_| login.connect())).await;
+            let mut failure = None;
+            for result in opened {
+                match result {
+                    Ok(filesystem) => extra.push(filesystem),
+                    Err(error) => failure = Some(error.to_string()),
+                }
+            }
+            if let Some(error) = failure {
+                shortfall = Some(format!(
+                    "opened {} of {wanted} extra connections ({error})",
+                    extra.len().min(wanted)
+                ));
+            }
+        }
+        (extra.iter().take(wanted).cloned().collect(), shortfall)
+    }
+
+    #[cfg(test)]
+    pub async fn add_extra_connection(&self, filesystem: Arc<dyn RemoteFilesystem>) {
+        self.extra.lock().await.push(filesystem);
+    }
 }
 
 static SESSIONS: Mutex<Option<HashMap<u64, Arc<Session>>>> = Mutex::new(None);
@@ -86,28 +185,15 @@ pub async fn connect(
     let trust = server_trust(state_dir, endpoint, trust)?;
     let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
     let tuning = Tuning::from_request(transfer, timeout);
-    let config = AuthenticatedConnectionConfig::new(
-        endpoint.address,
-        endpoint.server_name.clone(),
+    let login = Login {
+        server: endpoint.address,
+        server_name: endpoint.server_name.clone(),
         trust,
         username,
-        password.to_string(),
+        password,
         timeout,
-    );
-    let resilient = ResilientFilesystem::connect_authenticated(
-        config,
-        ResilientFilesystemOptions {
-            reconnect: ReconnectPolicy {
-                attempts: 3,
-                initial_backoff: Duration::from_millis(100),
-                maximum_backoff: Duration::from_secs(2),
-            },
-            // One browsing or transfer step, including reconnect and retry.
-            operation_deadline: Duration::from_secs(120),
-        },
-    )
-    .await?;
-    let filesystem: Arc<dyn RemoteFilesystem> = Arc::new(resilient);
+    };
+    let filesystem = login.connect().await?;
     let capabilities = filesystem.capabilities().await?;
     let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let reply = json!({ "session": id, "capabilities": capabilities });
@@ -118,6 +204,8 @@ pub async fn connect(
                 filesystem,
                 capabilities,
                 tuning,
+                extra: tokio::sync::Mutex::new(Vec::new()),
+                login: Some(login),
             }),
         )
     });

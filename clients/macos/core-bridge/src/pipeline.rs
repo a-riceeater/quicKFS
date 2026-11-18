@@ -23,6 +23,9 @@ pub const DEFAULT_MAX_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_DEPTH: usize = 8;
 pub const MAX_DEPTH_LIMIT: usize = 32;
 pub const DEFAULT_RETRY_WINDOW: Duration = Duration::from_secs(300);
+/// Most connections one download stripes across. Each costs the server a
+/// login (one password hash) and counts against its per-IP login rate.
+pub const MAX_CONNECTIONS: usize = 4;
 /// Completions the rate estimate looks back over.
 const RATE_SAMPLES: usize = 8;
 /// Shortest span of completions a rate is measured over.
@@ -43,6 +46,10 @@ pub struct Tuning {
     pub retry_window: Duration,
     /// The connection's idle limit, used to pick a safe per-chunk latency.
     pub stall_timeout: Duration,
+    /// Separate QUIC connections a download stripes chunks across. Each has
+    /// its own congestion window, so on a lossy path where one connection's
+    /// rate collapses, several together move proportionally more.
+    pub connections: usize,
 }
 
 impl Default for Tuning {
@@ -53,6 +60,7 @@ impl Default for Tuning {
             max_chunk: DEFAULT_MAX_CHUNK_BYTES,
             retry_window: DEFAULT_RETRY_WINDOW,
             stall_timeout: Duration::from_secs(30),
+            connections: 1,
         }
     }
 }
@@ -65,6 +73,7 @@ pub struct TuningRequest {
     pub max_depth: Option<usize>,
     pub max_chunk_bytes: Option<u64>,
     pub retry_window_ms: Option<u64>,
+    pub connections: Option<usize>,
 }
 
 impl Tuning {
@@ -85,6 +94,10 @@ impl Tuning {
                 .retry_window_ms
                 .map_or(defaults.retry_window, Duration::from_millis),
             stall_timeout,
+            connections: request
+                .connections
+                .unwrap_or(defaults.connections)
+                .clamp(1, MAX_CONNECTIONS),
         }
     }
 
@@ -356,6 +369,7 @@ mod tests {
                 max_depth: Some(0),
                 max_chunk_bytes: Some(1),
                 retry_window_ms: Some(5_000),
+                connections: Some(9),
             }),
             Duration::from_secs(60),
         );
@@ -363,6 +377,7 @@ mod tests {
         assert_eq!(tuning.max_depth, 1);
         assert_eq!(tuning.max_chunk, MIN_CHUNK_BYTES);
         assert_eq!(tuning.retry_window, Duration::from_secs(5));
+        assert_eq!(tuning.connections, MAX_CONNECTIONS);
         assert_eq!(tuning.target_latency(), Duration::from_secs(10));
     }
 }
