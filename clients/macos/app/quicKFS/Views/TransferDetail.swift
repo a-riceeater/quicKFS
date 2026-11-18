@@ -7,13 +7,16 @@ import SwiftUI
 /// while it ran, and how the quickfs protocol carried it.
 struct TransferDetail: View {
     let item: TransferItem
+    @State private var showActivity = false
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             VStack(alignment: .leading, spacing: 14) {
                 header
                 speed
+                situation
                 chart
+                activity
                 Divider()
                 HStack(alignment: .top, spacing: 18) {
                     linkSection
@@ -129,6 +132,119 @@ struct TransferDetail: View {
         }
     }
 
+    // MARK: What is happening
+
+    /// One line, always present so the window never changes height on its
+    /// own: what the pipeline is doing, or what went wrong and what happens next.
+    private var situation: some View {
+        let (symbol, color, text, detail) = situationParts
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: symbol)
+                .foregroundStyle(color)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(text)
+                    .font(.callout.weight(color == .secondary ? .regular : .medium))
+                    .foregroundStyle(color == .secondary ? .secondary : .primary)
+                    .lineLimit(2)
+                if let detail {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: 34, alignment: .topLeading)
+    }
+
+    private var situationParts: (String, Color, String, String?) {
+        guard let status = item.status else {
+            return ("ellipsis", .secondary, "Starting", nil)
+        }
+        let stall = Double(status.stallTimeoutMs ?? 30_000) / 1000
+        let window = Double(status.retryWindowMs ?? 300_000) / 1000
+        let lastIssue = status.events?.last { $0.level != "info" }?.message
+        switch status.state {
+        case .failed:
+            return ("xmark.octagon.fill", .red, status.error?.message ?? "Failed", status.hint)
+        case .cancelled:
+            return ("xmark.circle", .secondary, "Cancelled", nil)
+        case .finished:
+            let retried = status.retries ?? 0
+            return ("checkmark.circle", .secondary,
+                    retried == 0 ? "Finished without interruptions" : "Finished after \(retried) \(retried == 1 ? "retry" : "retries")",
+                    nil)
+        case .running:
+            if let wait = status.retryInMs {
+                return ("arrow.triangle.2.circlepath", .orange,
+                        "Retrying in \(Int((Double(wait) / 1000).rounded(.up))) s, continuing from \(Format.bytes(status.bytes))",
+                        lastIssue)
+            }
+            let idle = Double(status.sinceCommitMs ?? 0) / 1000
+            if idle >= max(5, stall / 2) {
+                return ("hourglass", .orange,
+                        "Nothing has landed for \(Int(idle)) s",
+                        "A request fails after \(Int(stall)) s with no data moving, then retries for up to \(duration(window)).")
+            }
+            guard let depth = status.pipelineDepth, let chunk = status.chunkBytes, depth > 0 else {
+                return ("ellipsis", .secondary, "Starting", nil)
+            }
+            let rate = status.linkRate.map { " at \(Rate.parts($0).0) \(Rate.parts($0).1)" } ?? ""
+            let small = status.adaptive != false && (chunk < 4 << 20 || depth < 8)
+            return (small ? "tortoise" : "bolt.horizontal", .secondary,
+                    "\(depth) × \(Self.binary(chunk)) in flight\(rate)",
+                    small && (status.linkRate ?? .infinity) < 2_000_000
+                        ? "Requests are kept small so each finishes in seconds on this link." : nil)
+        }
+    }
+
+    /// The transfer's own log, collapsed until asked for.
+    @ViewBuilder private var activity: some View {
+        if let events = item.status?.events, !events.isEmpty {
+            DisclosureGroup(isExpanded: $showActivity) {
+                ScrollViewReader { reader in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 3) {
+                            ForEach(Array(events.enumerated()), id: \.offset) { index, event in
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(String(format: "%.1fs", Double(event.atMs) / 1000))
+                                        .foregroundStyle(.tertiary)
+                                        .frame(width: 52, alignment: .trailing)
+                                    Circle()
+                                        .fill(event.level == "error" ? .red : event.level == "warning" ? .orange : .secondary)
+                                        .frame(width: 5, height: 5)
+                                    Text(event.message)
+                                        .foregroundStyle(event.level == "info" ? .secondary : .primary)
+                                        .textSelection(.enabled)
+                                }
+                                .id(index)
+                            }
+                        }
+                        .font(.system(size: 11, design: .monospaced))
+                        .padding(.vertical, 4)
+                    }
+                    .frame(height: 110)
+                    .onChange(of: events.count) { reader.scrollTo(events.count - 1, anchor: .bottom) }
+                    .onAppear { reader.scrollTo(events.count - 1, anchor: .bottom) }
+                }
+            } label: {
+                let issues = events.filter { $0.level != "info" }.count
+                HStack(spacing: 6) {
+                    Text("Activity").font(.callout)
+                    Text("\(events.count)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    if issues > 0 {
+                        Text("\(issues) \(issues == 1 ? "issue" : "issues")")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: Link
 
     private var linkSection: some View {
@@ -166,8 +282,11 @@ struct TransferDetail: View {
                 row("ALPN", proto.alpn)
                 row("version", "\(ProtocolSnapshot.version(proto.clientVersion)) ↔ \(ProtocolSnapshot.version(proto.serverVersion))")
                 row("compression", proto.compression ? "zstd ≥ 1 KiB" : "off")
-                if let chunk = item.status?.chunkBytes, let depth = item.status?.pipelineDepth {
-                    row("pipeline", "\(Self.binary(chunk)) × \(depth)")
+                if let chunk = item.status?.chunkBytes, let depth = item.status?.pipelineDepth, depth > 0 {
+                    row("pipeline", "\(depth) × \(Self.binary(chunk))\(item.status?.adaptive == false ? " fixed" : "")")
+                }
+                if let retries = item.status?.retries, retries > 0 {
+                    row("retries", "\(retries)", alert: true)
                 }
                 row("request streams", item.protocolDelta(\.streams).formatted())
                 row("frames out / in", "\(item.protocolDelta(\.framesSent).formatted()) / \(item.protocolDelta(\.framesReceived).formatted())")
@@ -200,6 +319,14 @@ struct TransferDetail: View {
             if item.isRunning {
                 Button("Cancel", systemImage: "xmark", role: .destructive) { item.cancel() }
                     .buttonStyle(.glass)
+            } else if item.canResume {
+                Button("Discard", systemImage: "trash", role: .destructive) { item.cancel() }
+                    .buttonStyle(.glass)
+                    .help("Delete the partial data and stop for good")
+                Button("Resume", systemImage: "arrow.clockwise") { item.resume() }
+                    .buttonStyle(.glassProminent)
+                    .disabled(item.owner == nil)
+                    .help(item.owner == nil ? "Reconnect to the server first" : "Continue from where it stopped")
             } else if let destination = item.destination, item.status?.state == .finished {
                 Button("Show in Finder", systemImage: "magnifyingglass") {
                     NSWorkspace.shared.activateFileViewerSelecting([destination])
@@ -213,7 +340,7 @@ struct TransferDetail: View {
 
     private var tint: Color {
         switch item.status?.state {
-        case .failed: .red
+        case .failed: item.canResume ? .orange : .red
         case .cancelled: .secondary
         case .finished: .green
         default: item.direction == .download ? .accentColor : .orange
@@ -223,9 +350,11 @@ struct TransferDetail: View {
     private var stateLabel: String {
         switch item.status?.state {
         case .finished: "DONE"
-        case .failed: "FAILED"
+        case .failed: item.canResume ? "STOPPED" : "FAILED"
         case .cancelled: "CANCELLED"
-        default: item.direction == .download ? "DOWNLOADING" : "UPLOADING"
+        default:
+            item.status?.retryInMs != nil ? "RETRYING"
+                : item.direction == .download ? "DOWNLOADING" : "UPLOADING"
         }
     }
 

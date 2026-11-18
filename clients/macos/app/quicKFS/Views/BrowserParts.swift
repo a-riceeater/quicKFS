@@ -79,7 +79,7 @@ struct TransferTray: View {
                 ForEach(browser.transfers) { item in
                     TransferRow(item: item)
                 }
-                if browser.transfers.contains(where: { !$0.isRunning }) {
+                if browser.transfers.contains(where: { !$0.isRunning && !$0.canResume }) {
                     Button("Clear", systemImage: "xmark") { browser.dismissFinishedTransfers() }
                         .labelStyle(.iconOnly)
                         .buttonStyle(.glass)
@@ -127,6 +127,12 @@ private struct TransferRow: View {
                     .labelStyle(.iconOnly)
                     .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
+            } else if item.canResume {
+                Button("Resume", systemImage: "arrow.clockwise.circle.fill") { item.resume() }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.orange)
+                    .help("Continue from \(Format.bytes(item.status?.bytes ?? 0))")
             } else if let destination = item.destination, item.status?.state == .finished {
                 Button("Show in Finder", systemImage: "magnifyingglass.circle.fill") {
                     NSWorkspace.shared.activateFileViewerSelecting([destination])
@@ -152,27 +158,34 @@ private struct TransferRow: View {
     private var symbol: String {
         switch item.status?.state {
         case .finished: "checkmark.circle.fill"
-        case .failed: "exclamationmark.circle.fill"
+        case .failed: item.canResume ? "pause.circle.fill" : "exclamationmark.circle.fill"
         case .cancelled: "minus.circle.fill"
-        default: item.direction == .download ? "arrow.down.circle" : "arrow.up.circle"
+        default:
+            item.status?.retryInMs != nil ? "arrow.triangle.2.circlepath.circle"
+                : item.direction == .download ? "arrow.down.circle" : "arrow.up.circle"
         }
     }
 
     private var tint: Color {
         switch item.status?.state {
         case .finished: .green
-        case .failed: .red
+        case .failed: item.canResume ? .orange : .red
         case .cancelled: .secondary
-        default: .accentColor
+        default: item.status?.retryInMs != nil ? .orange : .accentColor
         }
     }
 
     private var detail: String {
         guard let status = item.status else { return "" }
         switch status.state {
-        case .failed: return status.error?.message ?? ""
+        case .failed:
+            return item.canResume
+                ? "Stopped at \(Format.bytes(status.bytes)) of \(Format.bytes(status.total))"
+                : status.error?.message ?? ""
         case .cancelled: return ""
         case .finished: return Format.bytes(status.total)
+        case .running where status.retryInMs != nil:
+            return "Retrying in \(Int((Double(status.retryInMs ?? 0) / 1000).rounded(.up))) s"
         case .running:
             let files = status.filesTotal > 1 ? "\(status.files)/\(status.filesTotal)  " : ""
             let rate = item.rate > 0 ? "  \(Format.bytes(UInt64(item.rate)))/s" : ""

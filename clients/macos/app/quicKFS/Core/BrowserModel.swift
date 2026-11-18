@@ -29,6 +29,8 @@ final class TransferItem: Identifiable {
     private(set) var linkStart: LinkSnapshot?
     private(set) var link: LinkSnapshot?
     private var windowStart: (Date, UInt64)?
+    /// The browser that polls this transfer, which also resumes it.
+    weak var owner: BrowserModel?
 
     /// Every transfer this run, so a detail window can find its transfer
     /// immediately (and keep showing it after the tray is cleared).
@@ -100,7 +102,33 @@ final class TransferItem: Identifiable {
     }
 
     func cancel() {
-        Task { _ = try? await Core.call("transfer_cancel", ["transfer": .uint(id)], as: EmptyReply.self) }
+        Task {
+            _ = try? await Core.call("transfer_cancel", ["transfer": .uint(id)], as: EmptyReply.self)
+            // A stopped transfer is not polled, so pick up its new state here.
+            if !isRunning, let status: TransferStatus = try? await Core.call(
+                "transfer_status", ["transfer": .uint(id)]) {
+                update(status)
+            }
+        }
+    }
+
+    var canResume: Bool { status?.state == .failed && status?.resumable == true }
+
+    func resume() { owner?.resume(self) }
+
+    /// Clear the finished state so a resumed run reads as running again.
+    func markResumed() {
+        finishedAt = nil
+        windowStart = nil
+        if let status {
+            self.status = TransferStatus(
+                state: .running, bytes: status.bytes, total: status.total, files: status.files,
+                filesTotal: status.filesTotal, error: nil, current: status.current,
+                chunkBytes: status.chunkBytes, pipelineDepth: status.pipelineDepth,
+                adaptive: status.adaptive, linkRate: status.linkRate, retries: status.retries,
+                sinceCommitMs: 0, retryInMs: nil, stallTimeoutMs: status.stallTimeoutMs,
+                retryWindowMs: status.retryWindowMs, events: status.events, resumable: nil, hint: nil)
+        }
     }
 
     /// A plain-text report for pasting into an issue.
@@ -110,6 +138,16 @@ final class TransferItem: Identifiable {
             lines.append("state \(status.state.rawValue), \(Format.bytes(status.bytes)) of \(Format.bytes(status.total)), \(status.files)/\(status.filesTotal) files")
         }
         lines.append(String(format: "elapsed %.1f s, average %@/s, peak %@/s", elapsed, Format.bytes(UInt64(rate)), Format.bytes(UInt64(peakRate))))
+        if let status {
+            if let depth = status.pipelineDepth, let chunk = status.chunkBytes {
+                lines.append("pipeline \(depth) x \(Format.bytes(chunk))\(status.adaptive == false ? " fixed" : " adaptive"), retries \(status.retries ?? 0)")
+            }
+            if let error = status.error { lines.append("error \(error.code): \(error.message)") }
+            if let hint = status.hint { lines.append("hint \(hint)") }
+            for event in status.events ?? [] {
+                lines.append(String(format: "  %7.1f s  %@  %@", Double(event.atMs) / 1000, event.level, event.message))
+            }
+        }
         if let link {
             lines.append(String(format: "rtt %.2f ms, mtu %d, cwnd %@", Double(link.rttUs) / 1000, Int(link.mtu), Format.bytes(link.congestionWindow)))
             lines.append("packets \(delta(\.packetsSent)) sent, \(delta(\.packetsLost)) lost, \(delta(\.congestionEvents)) congestion events")
@@ -346,11 +384,14 @@ final class BrowserModel {
         ], title: node.displayName, direction: .write, destination: nil)
     }
 
+    /// Clear finished rows. Stopped transfers that can resume stay until
+    /// resumed or discarded, since forgetting one deletes its partial data.
     func dismissFinishedTransfers() {
-        for item in transfers where !item.isRunning {
+        let done = transfers.filter { !$0.isRunning && !$0.canResume }
+        for item in done {
             Task { _ = try? await Core.call("transfer_forget", ["transfer": .uint(item.id)], as: EmptyReply.self) }
         }
-        transfers.removeAll { !$0.isRunning }
+        transfers.removeAll { item in done.contains { $0 === item } }
     }
 
     private func start(
@@ -362,6 +403,7 @@ final class BrowserModel {
             do {
                 let reply: Reply = try await connection.request(op, fields)
                 let item = TransferItem(id: reply.transfer, title: title, direction: direction, destination: destination)
+                item.owner = self
                 transfers.append(item)
                 log.append(.app, .info, "\(op) started: \(title)")
                 await poll(item)
@@ -375,6 +417,19 @@ final class BrowserModel {
         struct Reply: Decodable, Sendable { let link: LinkSnapshot? }
         if let reply: Reply = try? await connection.request("link_stats"), let link = reply.link {
             item.updateLink(link)
+        }
+    }
+
+    func resume(_ item: TransferItem) {
+        Task {
+            do {
+                let _: EmptyReply = try await Core.call("transfer_resume", ["transfer": .uint(item.id)])
+                item.markResumed()
+                log.append(.app, .info, "resuming \(item.title)")
+                await poll(item)
+            } catch let failure as CoreError {
+                error = failure
+            } catch {}
         }
     }
 
@@ -398,7 +453,7 @@ final class BrowserModel {
                         item.direction == .download ? "download" : "upload", item.title,
                         Format.bytes(status.bytes), seconds, Format.bytes(UInt64(rate))))
                 case .failed:
-                    log.append(.app, .error, "\(item.title) failed: \(status.error?.message ?? "unknown error")")
+                    log.append(.app, .error, "\(item.title) failed: \(status.error?.message ?? "unknown error")\(status.resumable == true ? " (can resume)" : "")")
                 case .cancelled:
                     log.append(.app, .warning, "\(item.title) cancelled")
                 case .running: break
