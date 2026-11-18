@@ -2,7 +2,10 @@
 //! Authenticated browsing sessions and the filesystem operations the app
 //! performs on them.
 
-use crate::model::{BridgeError, BridgeResult, Endpoint, NodeInfo, TrustSpec, entry_name, node_id};
+use crate::{
+    model::{BridgeError, BridgeResult, Endpoint, NodeInfo, TrustSpec, entry_name, node_id},
+    pipeline::{Tuning, TuningRequest},
+};
 use quickfs_client_core::{
     AuthenticatedConnectionConfig, ReconnectPolicy, RemoteFilesystem, ResilientFilesystem,
     ResilientFilesystemOptions, ServerTrust, load_trusted_server_pin, resolve_path,
@@ -32,6 +35,8 @@ pub const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
 pub struct Session {
     pub filesystem: Arc<dyn RemoteFilesystem>,
     pub capabilities: FilesystemCapabilities,
+    /// How this session's downloads and uploads size and retry themselves.
+    pub tuning: Tuning,
 }
 
 static SESSIONS: Mutex<Option<HashMap<u64, Arc<Session>>>> = Mutex::new(None);
@@ -73,18 +78,21 @@ pub async fn connect(
     username: String,
     password: Zeroizing<String>,
     timeout: Option<Duration>,
+    transfer: Option<TuningRequest>,
 ) -> BridgeResult<Value> {
     if username.is_empty() {
         return Err(BridgeError::invalid("a username is required"));
     }
     let trust = server_trust(state_dir, endpoint, trust)?;
+    let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
+    let tuning = Tuning::from_request(transfer, timeout);
     let config = AuthenticatedConnectionConfig::new(
         endpoint.address,
         endpoint.server_name.clone(),
         trust,
         username,
         password.to_string(),
-        timeout.unwrap_or(DEFAULT_TIMEOUT),
+        timeout,
     );
     let resilient = ResilientFilesystem::connect_authenticated(
         config,
@@ -109,6 +117,7 @@ pub async fn connect(
             Arc::new(Session {
                 filesystem,
                 capabilities,
+                tuning,
             }),
         )
     });

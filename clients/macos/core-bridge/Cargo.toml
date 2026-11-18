@@ -25,7 +25,9 @@ quickfs-protocol = { path = "../../../crates/protocol" }
 quickfs-transport-quic = { path = "../../../crates/transport-quic" }
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 # The workspace forbids unsafe code outright. This crate is the one FFI
 # boundary, so it denies unsafe everywhere and allows it only inside `ffi.rs`

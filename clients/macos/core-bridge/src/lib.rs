@@ -26,7 +26,11 @@ use quickfs_client_core::{
 use quickfs_transport_quic::{PairingClient, certificate_sha256, load_certificates};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -67,8 +71,12 @@ enum Request {
         trust: TrustSpec,
         username: String,
         password: Zeroizing<String>,
+        /// Idle limit for each request phase; also what transfers size
+        /// their chunks against.
         #[serde(default)]
         timeout_ms: Option<u64>,
+        #[serde(default)]
+        transfer: Option<pipeline::TuningRequest>,
     },
     Disconnect {
         session: u64,
@@ -184,6 +192,10 @@ enum Request {
         transfer: u64,
     },
     TransferCancel {
+        transfer: u64,
+    },
+    /// Continue a failed transfer from where it stopped.
+    TransferResume {
         transfer: u64,
     },
     TransferForget {
@@ -306,6 +318,7 @@ async fn dispatch(
             username,
             password,
             timeout_ms,
+            transfer,
         } => {
             session::connect(
                 &state_dir,
@@ -314,6 +327,7 @@ async fn dispatch(
                 username,
                 password,
                 timeout_ms.map(Duration::from_millis),
+                transfer,
             )
             .await
         }
@@ -418,8 +432,15 @@ async fn dispatch(
             overwrite,
         } => {
             let session = session::session(id)?;
-            transfer::start(runtime, move |progress| {
-                transfer::download(session, node_id(node), destination, overwrite, progress)
+            let tuning = session.tuning;
+            transfer::start(runtime, tuning, move |progress| {
+                transfer::download(
+                    Arc::clone(&session),
+                    node_id(node),
+                    destination.clone(),
+                    overwrite,
+                    progress,
+                )
             })
         }
         Request::Upload {
@@ -441,8 +462,16 @@ async fn dispatch(
                 }
             };
             model::validate_name(name.as_bytes())?;
-            transfer::start(runtime, move |progress| {
-                transfer::upload(session, node_id(parent), source, name, replace, progress)
+            let tuning = session.tuning;
+            transfer::start(runtime, tuning, move |progress| {
+                transfer::upload(
+                    Arc::clone(&session),
+                    node_id(parent),
+                    source.clone(),
+                    name.clone(),
+                    replace,
+                    progress,
+                )
             })
         }
         Request::WriteAt {
@@ -453,13 +482,22 @@ async fn dispatch(
             sync,
         } => {
             let session = session::session(id)?;
-            transfer::start(runtime, move |progress| {
-                transfer::write_at(session, node_id(node), source, offset, sync, progress)
+            let tuning = session.tuning;
+            transfer::start(runtime, tuning, move |progress| {
+                transfer::write_at(
+                    Arc::clone(&session),
+                    node_id(node),
+                    source.clone(),
+                    offset,
+                    sync,
+                    progress,
+                )
             })
         }
         Request::TransferStatus { transfer: id } => transfer::status(id),
-        Request::TransferCancel { transfer: id } => transfer::cancel(id),
-        Request::TransferForget { transfer: id } => Ok(transfer::forget(id)),
+        Request::TransferCancel { transfer: id } => transfer::cancel(id).await,
+        Request::TransferResume { transfer: id } => transfer::resume(runtime, id),
+        Request::TransferForget { transfer: id } => Ok(transfer::forget(id).await),
         Request::LinkStats { session: id } => {
             let session = session::session(id)?;
             Ok(json!({ "link": session.filesystem.link_stats() }))

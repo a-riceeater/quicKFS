@@ -1240,6 +1240,7 @@ dependencies = [
 name = "quickfs-core-bridge"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "hex",
  "quickfs-client-core",
@@ -1391,6 +1392,7 @@ dependencies = [
  "bytes",
  "quickfs-protocol",
  "quinn",
+ "rcgen",
  "rustls",
  "rustls-platform-verifier",
  "serde",

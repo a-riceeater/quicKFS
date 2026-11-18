@@ -1,48 +1,128 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Background downloads and uploads with progress and cancellation.
+//! Background downloads and uploads with progress, retries, and resume.
 //!
 //! The app polls [`status`] rather than receiving callbacks, which keeps the
-//! C ABI to plain request/response strings. Reads and writes are pipelined a
-//! few chunks deep so a long-RTT link stays busy without buffering a whole
-//! file in memory: peak buffered data is `PIPELINE_DEPTH * CHUNK_BYTES`.
+//! C ABI to plain request/response strings. Reads and writes are pipelined,
+//! sized by [`Pipeline`] to the link the chunks are actually crossing, so
+//! peak buffered data is the pipeline's in-flight bytes (at most
+//! `max_depth x max_chunk`).
+//!
+//! A chunk that fails because the link stalled or dropped does not fail the
+//! transfer: everything before it is already committed, so the transfer backs
+//! off, lets the resilient layer reconnect, and carries on from the first
+//! uncommitted byte. Only when nothing commits for the session's retry window
+//! does it give up, and then it keeps its place (the hidden partial file for a
+//! download, the written prefix for an upload) so [`resume`] can continue it.
 
 use crate::{
     model::{BridgeError, BridgeResult, validate_name},
+    pipeline::{Pipeline, Shape, Tuning},
     session::{READ_WRITE, Session, lookup},
 };
-use futures::{StreamExt, stream::FuturesOrdered};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesOrdered};
 use quickfs_client_core::{
     ClientError, MAX_CLIENT_READ_SIZE, MAX_CLIENT_WRITE_SIZE, RemoteFilesystem,
 };
 use quickfs_protocol::{
     ErrorCode, FileAccess, FileHandle, FileOpenOptions, Name, NodeId, NodeKind,
 };
+use quickfs_transport_quic::TransportError;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    io::SeekFrom,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    // Tokio's clock, so tests can run retry backoff on paused time.
+    time::Instant,
+};
 use uuid::Uuid;
 
-const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
-const PIPELINE_DEPTH: usize = 8;
 const MAX_TRACKED_TRANSFERS: usize = 1_024;
+/// Recent events kept per transfer for the app's detail view.
+const MAX_EVENTS: usize = 64;
+/// First retry waits this long. It must exceed the resilient layer's 2 s
+/// reconnect backoff, or the retry just sees the cached reconnect failure.
+const FIRST_RETRY_DELAY: Duration = Duration::from_millis(2_500);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Closing a handle on a link that just failed must not hold up the retry.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Clone, Debug)]
 enum State {
     Running,
     Finished,
-    Failed(String, String),
+    /// Code, message, and whether [`resume`] can continue from where it stopped.
+    Failed(String, String, bool),
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Level {
+    Info,
+    Warning,
+    Error,
+}
+
+impl Level {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+struct Event {
+    at: Duration,
+    level: Level,
+    message: String,
+}
+
+/// Where a stopped transfer can pick up again.
 #[derive(Default)]
+struct Checkpoint {
+    /// Download steps, planned once so a resume does not walk the tree again.
+    plan: Option<Arc<Vec<Planned>>>,
+    /// Upload sources, sorted, with whether the source was a single file.
+    files: Option<Arc<Vec<PathBuf>>>,
+    /// Steps (download) or files (upload) fully done.
+    next: usize,
+    partial: Option<Partial>,
+}
+
+/// The file a transfer stopped inside of.
+#[derive(Clone, Debug)]
+enum Partial {
+    Download {
+        step: usize,
+        path: PathBuf,
+        revision: u64,
+        committed: u64,
+    },
+    Upload {
+        index: usize,
+        node: NodeId,
+        committed: u64,
+    },
+}
+
 pub struct Progress {
+    started: Instant,
     bytes: AtomicU64,
     total: AtomicU64,
     files: AtomicU64,
@@ -50,21 +130,43 @@ pub struct Progress {
     cancel: AtomicBool,
     /// The file being copied now, relative to the transfer's root.
     current: Mutex<String>,
+    shape: Mutex<Shape>,
+    /// The rate chunks are completing at, in bytes/s, when measured.
+    link_rate: Mutex<Option<f64>>,
+    retries: AtomicU64,
+    last_commit: Mutex<Instant>,
+    retry_at: Mutex<Option<Instant>>,
+    events: Mutex<VecDeque<Event>>,
+    /// In-flight bytes when the pipeline was last reported, so steady
+    /// small adjustments do not flood the event list.
+    logged_in_flight: AtomicU64,
+    checkpoint: Mutex<Checkpoint>,
 }
 
 impl Progress {
-    fn set_current(&self, name: impl Into<String>) {
-        *self
-            .current
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = name.into();
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            bytes: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            files: AtomicU64::new(0),
+            files_total: AtomicU64::new(0),
+            cancel: AtomicBool::new(false),
+            current: Mutex::new(String::new()),
+            shape: Mutex::new(Shape { depth: 0, chunk: 0 }),
+            link_rate: Mutex::new(None),
+            retries: AtomicU64::new(0),
+            last_commit: Mutex::new(now),
+            retry_at: Mutex::new(None),
+            events: Mutex::new(VecDeque::new()),
+            logged_in_flight: AtomicU64::new(0),
+            checkpoint: Mutex::new(Checkpoint::default()),
+        }
     }
 
-    fn current(&self) -> String {
-        self.current
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    fn set_current(&self, name: impl Into<String>) {
+        *lock(&self.current) = name.into();
     }
 
     fn check(&self) -> BridgeResult<()> {
@@ -75,23 +177,246 @@ impl Progress {
         }
     }
 
-    fn add_bytes(&self, amount: u64) {
+    fn event(&self, level: Level, message: impl Into<String>) {
+        let mut events = lock(&self.events);
+        if events.len() >= MAX_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(Event {
+            at: self.started.elapsed(),
+            level,
+            message: message.into(),
+        });
+    }
+
+    /// Bytes landed for good: count them and restart the retry window.
+    fn commit(&self, amount: u64) {
         self.bytes.fetch_add(amount, Ordering::Relaxed);
+        *lock(&self.last_commit) = Instant::now();
+    }
+
+    fn touch(&self) {
+        *lock(&self.last_commit) = Instant::now();
+    }
+
+    fn since_commit(&self) -> Duration {
+        lock(&self.last_commit).elapsed()
+    }
+
+    fn show_shape(&self, shape: Shape, rate: Option<f64>, why: &str) {
+        *lock(&self.shape) = shape;
+        if rate.is_some() {
+            *lock(&self.link_rate) = rate;
+        }
+        let logged = self.logged_in_flight.load(Ordering::Relaxed);
+        let now = shape.in_flight();
+        // Report the first shape, any cut, and growth past 2x.
+        if logged == 0 || now < logged || now >= logged * 2 {
+            self.logged_in_flight.store(now, Ordering::Relaxed);
+            let rate = rate.map_or(String::new(), |rate| {
+                format!(", link about {}/s", bytes(rate as u64))
+            });
+            self.event(
+                Level::Info,
+                format!(
+                    "{why}: {} x {} in flight{rate}",
+                    shape.depth,
+                    bytes(shape.chunk)
+                ),
+            );
+        }
+    }
+
+    fn save_partial(&self, partial: Partial) {
+        lock(&self.checkpoint).partial = Some(partial);
+    }
+
+    fn take_partial(&self) -> Option<Partial> {
+        lock(&self.checkpoint).partial.take()
+    }
+
+    fn step_done(&self, next: usize) {
+        let mut checkpoint = lock(&self.checkpoint);
+        checkpoint.next = next;
+        checkpoint.partial = None;
+        drop(checkpoint);
+        self.touch();
+    }
+
+    /// Wait out a transient failure. `Ok(false)` means the retry window is
+    /// spent and the caller should fail with the error.
+    async fn wait_to_retry(
+        &self,
+        tuning: &Tuning,
+        failures: &mut u32,
+        error: &BridgeError,
+        what: &str,
+    ) -> BridgeResult<bool> {
+        let idle = self.since_commit();
+        if idle >= tuning.retry_window {
+            self.event(
+                Level::Error,
+                format!(
+                    "{what}: {}. Nothing has moved for {}, giving up",
+                    explain(error, tuning),
+                    seconds(idle)
+                ),
+            );
+            return Ok(false);
+        }
+        *failures += 1;
+        let delay = FIRST_RETRY_DELAY
+            .saturating_mul(1 << (*failures - 1).min(4))
+            .min(MAX_RETRY_DELAY)
+            .min(tuning.retry_window - idle + Duration::from_millis(100));
+        self.retries.fetch_add(1, Ordering::Relaxed);
+        self.event(
+            Level::Warning,
+            format!(
+                "{what}: {}. Retrying in {} (attempt {})",
+                explain(error, tuning),
+                seconds(delay),
+                *failures
+            ),
+        );
+        let until = Instant::now() + delay;
+        *lock(&self.retry_at) = Some(until);
+        let waited = async {
+            while Instant::now() < until {
+                self.check()?;
+                tokio::time::sleep(Duration::from_millis(200).min(until - Instant::now())).await;
+            }
+            self.check()
+        }
+        .await;
+        *lock(&self.retry_at) = None;
+        waited.map(|()| true)
     }
 }
+
+/// Run an idempotent request, retrying it through transient failures.
+async fn retrying<T, F, Fut>(
+    progress: &Progress,
+    tuning: &Tuning,
+    what: &str,
+    mut operation: F,
+) -> BridgeResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ClientError>>,
+{
+    let mut failures = 0;
+    loop {
+        progress.check()?;
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if transient(&error) => {
+                let error = BridgeError::from(error);
+                if !progress
+                    .wait_to_retry(tuning, &mut failures, &error, what)
+                    .await?
+                {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Failures of the link or a busy server, which a later attempt can get past.
+/// `AmbiguousMutation` is left out: only callers that know their write is
+/// idempotent may retry it.
+fn transient(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport(_)
+            | ClientError::Offline
+            | ClientError::Server(ErrorCode::Timeout | ErrorCode::Busy | ErrorCode::Offline, _)
+    )
+}
+
+fn resumable(error: &BridgeError) -> bool {
+    match error {
+        BridgeError::Client(error) => {
+            transient(error) || matches!(error, ClientError::AmbiguousMutation)
+        }
+        BridgeError::Transport(_) => true,
+        _ => false,
+    }
+}
+
+/// What went wrong, in terms of the link rather than the code path.
+fn explain(error: &BridgeError, tuning: &Tuning) -> String {
+    let stall = seconds(tuning.stall_timeout);
+    match error {
+        BridgeError::Client(ClientError::Transport(TransportError::Timeout))
+        | BridgeError::Transport(TransportError::Timeout) => {
+            format!("no data moved for {stall}, the link stalled")
+        }
+        BridgeError::Client(ClientError::Transport(TransportError::Connection(error)))
+        | BridgeError::Transport(TransportError::Connection(error)) => {
+            format!("the connection dropped ({error})")
+        }
+        BridgeError::Client(ClientError::Transport(error)) | BridgeError::Transport(error) => {
+            format!("the link failed ({error})")
+        }
+        BridgeError::Client(ClientError::Offline) => "could not reconnect to the server".into(),
+        BridgeError::Client(ClientError::AmbiguousMutation) => {
+            "the connection dropped with writes in flight".into()
+        }
+        BridgeError::Client(ClientError::Server(ErrorCode::Timeout, _)) => {
+            "the request ran past its deadline".into()
+        }
+        BridgeError::Client(ClientError::Server(ErrorCode::Busy, _)) => "the server is busy".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Advice for a failed transfer, shown under the error.
+fn hint(error: &BridgeError, tuning: &Tuning) -> Option<String> {
+    let stall = seconds(tuning.stall_timeout);
+    let window = seconds(tuning.retry_window);
+    match error {
+        BridgeError::Client(
+            ClientError::Transport(_) | ClientError::Offline | ClientError::AmbiguousMutation,
+        )
+        | BridgeError::Transport(_) => Some(format!(
+            "The link to the server kept stalling (no data for {stall} at a time) and did not \
+             recover within {window}. A ping can look fine while the path is relayed or \
+             losing packets in one direction; on ZeroTier, check that `zerotier-cli peers` \
+             lists the server with a DIRECT path. Resume continues from where this stopped."
+        )),
+        BridgeError::Client(ClientError::Server(ErrorCode::Timeout | ErrorCode::Busy, _)) => {
+            Some(format!(
+                "The server stayed busy or slow for {window}. Resume continues from where \
+                 this stopped."
+            ))
+        }
+        BridgeError::Client(ClientError::StaleRevision) => Some(
+            "The file changed on the server during the transfer, so the copy would mix two \
+             versions. Start the transfer again."
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
+type Job = Arc<dyn Fn(Arc<Progress>) -> BoxFuture<'static, BridgeResult<()>> + Send + Sync>;
 
 struct Transfer {
     progress: Arc<Progress>,
     state: Mutex<State>,
+    tuning: Tuning,
+    job: Job,
+    hint: Mutex<Option<String>>,
 }
 
 static TRANSFERS: Mutex<Option<HashMap<u64, Arc<Transfer>>>> = Mutex::new(None);
 static NEXT_TRANSFER: AtomicU64 = AtomicU64::new(1);
 
 fn with_transfers<T>(body: impl FnOnce(&mut HashMap<u64, Arc<Transfer>>) -> T) -> T {
-    let mut guard = TRANSFERS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = lock(&TRANSFERS);
     body(guard.get_or_insert_with(HashMap::new))
 }
 
@@ -99,16 +424,24 @@ fn transfer(id: u64) -> BridgeResult<Arc<Transfer>> {
     with_transfers(|transfers| transfers.get(&id).cloned()).ok_or(BridgeError::UnknownTransfer)
 }
 
-/// Register a transfer and run `job` on the shared runtime.
-pub fn start<F, Fut>(runtime: &tokio::runtime::Runtime, job: F) -> BridgeResult<Value>
+/// Register a transfer and run `job` on the shared runtime. `job` is kept
+/// so [`resume`] can run it again; each run continues from the checkpoint the
+/// last one left in its [`Progress`].
+pub fn start<F, Fut>(
+    runtime: &tokio::runtime::Runtime,
+    tuning: Tuning,
+    job: F,
+) -> BridgeResult<Value>
 where
-    F: FnOnce(Arc<Progress>) -> Fut,
+    F: Fn(Arc<Progress>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = BridgeResult<()>> + Send + 'static,
 {
-    let progress = Arc::new(Progress::default());
     let record = Arc::new(Transfer {
-        progress: Arc::clone(&progress),
+        progress: Arc::new(Progress::new()),
         state: Mutex::new(State::Running),
+        tuning,
+        job: Arc::new(move |progress| Box::pin(job(progress))),
+        hint: Mutex::new(None),
     });
     let id = NEXT_TRANSFER.fetch_add(1, Ordering::Relaxed);
     with_transfers(|transfers| {
@@ -121,106 +454,223 @@ where
         transfers.insert(id, Arc::clone(&record));
         Ok(())
     })?;
-    let future = job(progress);
-    runtime.spawn(async move {
-        let outcome = future.await;
-        let mut state = record
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = match outcome {
-            Ok(()) => State::Finished,
-            Err(BridgeError::Cancelled) => State::Cancelled,
-            Err(error) => State::Failed(error.code(), error.to_string()),
-        };
-    });
+    run(runtime, record);
     Ok(json!({ "transfer": id }))
 }
 
+fn run(runtime: &tokio::runtime::Runtime, record: Arc<Transfer>) {
+    let future = (record.job)(Arc::clone(&record.progress));
+    runtime.spawn(async move {
+        let outcome = future.await;
+        let progress = &record.progress;
+        let state = match outcome {
+            Ok(()) => {
+                progress.event(Level::Info, "Finished");
+                State::Finished
+            }
+            Err(BridgeError::Cancelled) => {
+                discard_partial(progress).await;
+                progress.event(Level::Warning, "Cancelled");
+                State::Cancelled
+            }
+            Err(error) => {
+                let resumable = resumable(&error);
+                if !resumable {
+                    discard_partial(progress).await;
+                }
+                *lock(&record.hint) = hint(&error, &record.tuning);
+                progress.event(Level::Error, format!("Failed: {error}"));
+                State::Failed(error.code(), error.to_string(), resumable)
+            }
+        };
+        *lock(&record.state) = state;
+    });
+}
+
 fn lock_state(transfer: &Transfer) -> State {
-    transfer
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    lock(&transfer.state).clone()
 }
 
 pub fn status(id: u64) -> BridgeResult<Value> {
     let transfer = transfer(id)?;
     let progress = &transfer.progress;
+    let shape = *lock(&progress.shape);
+    let retry_in = lock(&progress.retry_at).map(|at| at.saturating_duration_since(Instant::now()));
+    let events: Vec<Value> = lock(&progress.events)
+        .iter()
+        .map(|event| {
+            json!({
+                "at_ms": event.at.as_millis() as u64,
+                "level": event.level.name(),
+                "message": event.message,
+            })
+        })
+        .collect();
+    let state = lock_state(&transfer);
     let mut reply = json!({
         "bytes": progress.bytes.load(Ordering::Relaxed),
         "total": progress.total.load(Ordering::Relaxed),
         "files": progress.files.load(Ordering::Relaxed),
         "files_total": progress.files_total.load(Ordering::Relaxed),
-        "current": progress.current(),
-        "chunk_bytes": CHUNK_BYTES,
-        "pipeline_depth": PIPELINE_DEPTH,
+        "current": lock(&progress.current).clone(),
+        "chunk_bytes": shape.chunk,
+        "pipeline_depth": shape.depth,
+        "adaptive": transfer.tuning.adaptive,
+        "link_rate": *lock(&progress.link_rate),
+        "retries": progress.retries.load(Ordering::Relaxed),
+        "since_commit_ms": progress.since_commit().as_millis() as u64,
+        "retry_in_ms": retry_in.map(|delay| delay.as_millis() as u64),
+        "stall_timeout_ms": transfer.tuning.stall_timeout.as_millis() as u64,
+        "retry_window_ms": transfer.tuning.retry_window.as_millis() as u64,
+        "events": events,
     });
-    let (state, error) = match lock_state(&transfer) {
+    let (name, error) = match state {
         State::Running => ("running", None),
         State::Finished => ("finished", None),
         State::Cancelled => ("cancelled", None),
-        State::Failed(code, message) => {
+        State::Failed(code, message, resumable) => {
+            reply["resumable"] = json!(resumable);
             ("failed", Some(json!({ "code": code, "message": message })))
         }
     };
-    reply["state"] = json!(state);
+    reply["state"] = json!(name);
     if let Some(error) = error {
         reply["error"] = error;
+    }
+    if let Some(hint) = lock(&transfer.hint).clone() {
+        reply["hint"] = json!(hint);
     }
     Ok(reply)
 }
 
-pub fn cancel(id: u64) -> BridgeResult<Value> {
-    transfer(id)?.progress.cancel.store(true, Ordering::Release);
+/// Continue a failed transfer from its checkpoint.
+pub fn resume(runtime: &tokio::runtime::Runtime, id: u64) -> BridgeResult<Value> {
+    let record = transfer(id)?;
+    {
+        let mut state = lock(&record.state);
+        if !matches!(*state, State::Failed(_, _, true)) {
+            return Err(BridgeError::invalid(
+                "only a stopped transfer can be resumed",
+            ));
+        }
+        *state = State::Running;
+    }
+    *lock(&record.hint) = None;
+    record.progress.event(Level::Info, "Resuming");
+    record.progress.touch();
+    run(runtime, Arc::clone(&record));
     Ok(json!({}))
 }
 
-pub fn forget(id: u64) -> Value {
-    let removed = with_transfers(|transfers| match transfers.get(&id) {
-        Some(transfer) if !matches!(lock_state(transfer), State::Running) => {
-            transfers.remove(&id).is_some()
+/// Cancel a running transfer, or discard a stopped one's partial data.
+pub async fn cancel(id: u64) -> BridgeResult<Value> {
+    let record = transfer(id)?;
+    record.progress.cancel.store(true, Ordering::Release);
+    let stopped = {
+        let mut state = lock(&record.state);
+        let stopped = matches!(*state, State::Failed(_, _, true));
+        if stopped {
+            *state = State::Cancelled;
         }
-        _ => false,
-    });
-    json!({ "forgotten": removed })
+        stopped
+    };
+    if stopped {
+        discard_partial(&record.progress).await;
+    }
+    Ok(json!({}))
 }
 
-fn chunk_size(limit: u64, client_limit: u64) -> u64 {
-    CHUNK_BYTES.min(limit.max(1)).min(client_limit)
+pub async fn forget(id: u64) -> Value {
+    let removed = with_transfers(|transfers| match transfers.get(&id) {
+        Some(transfer) if !matches!(lock_state(transfer), State::Running) => transfers.remove(&id),
+        _ => None,
+    });
+    if let Some(record) = &removed {
+        discard_partial(&record.progress).await;
+    }
+    json!({ "forgotten": removed.is_some() })
+}
+
+/// Delete a download's hidden partial file. An upload's written prefix is
+/// already the remote file, as it was before resume existed, so it stays.
+async fn discard_partial(progress: &Progress) {
+    if let Some(Partial::Download { path, .. }) = progress.take_partial() {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+fn bytes(amount: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if amount < 1_000 {
+        return format!("{amount} B");
+    }
+    let mut value = amount as f64 / 1_000.0;
+    let mut unit = 0;
+    while value >= 1_000.0 && unit + 1 < UNITS.len() {
+        value /= 1_000.0;
+        unit += 1;
+    }
+    let precision = if value < 10.0 { 1 } else { 0 };
+    format!("{value:.precision$} {}", UNITS[unit])
+}
+
+fn seconds(duration: Duration) -> String {
+    let total = duration.as_secs_f64();
+    if total < 10.0 {
+        format!("{total:.1} s")
+    } else if total < 120.0 {
+        format!("{} s", total.round() as u64)
+    } else {
+        format!("{} min", (total / 60.0).round() as u64)
+    }
+}
+
+fn limit(capability: u64, client: u64) -> u64 {
+    capability.max(1).min(client)
 }
 
 // ---------------------------------------------------------------------------
 // Download
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
 enum Planned {
     Directory(PathBuf),
     File { node: NodeId, path: PathBuf },
     Symlink { node: NodeId, path: PathBuf },
 }
 
-/// Copy a remote file or directory tree to `destination`, which must not
-/// exist unless `overwrite` is set (files only; directories merge).
-pub async fn download(
-    session: Arc<Session>,
+fn partial_path(destination: &Path) -> PathBuf {
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    destination.with_file_name(format!(".{name}.{}.qkfs-partial", Uuid::new_v4().simple()))
+}
+
+/// Walk the remote tree into a list of steps and size the transfer.
+async fn plan_download(
+    filesystem: &dyn RemoteFilesystem,
+    tuning: &Tuning,
     node: NodeId,
     destination: PathBuf,
-    overwrite: bool,
-    progress: Arc<Progress>,
-) -> BridgeResult<()> {
-    let filesystem = session.filesystem.as_ref();
-    let root = filesystem.get_metadata(node).await?;
-    let destination_root = destination.clone();
+    progress: &Progress,
+) -> BridgeResult<Vec<Planned>> {
+    let root = retrying(progress, tuning, "Reading the item", || {
+        filesystem.get_metadata(node)
+    })
+    .await?;
     let mut plan = Vec::new();
     match root.kind {
         NodeKind::Directory => {
             let mut pending = vec![(node, destination.clone())];
             plan.push(Planned::Directory(destination));
             while let Some((directory, local)) = pending.pop() {
-                progress.check()?;
-                for entry in filesystem.list_directory(directory).await? {
+                let entries = retrying(progress, tuning, "Listing a folder", || {
+                    filesystem.list_directory(directory)
+                })
+                .await?;
+                for entry in entries {
                     let name = local_name(&entry.name)?;
                     let path = local.join(name);
                     match entry.kind {
@@ -266,31 +716,66 @@ pub async fn download(
             ));
         }
     }
+    Ok(plan)
+}
 
-    let read_chunk = chunk_size(session.capabilities.max_read_size, MAX_CLIENT_READ_SIZE);
-    for step in plan {
+/// Copy a remote file or directory tree to `destination`, which must not
+/// exist unless `overwrite` is set (files only; directories merge).
+pub async fn download(
+    session: Arc<Session>,
+    node: NodeId,
+    destination: PathBuf,
+    overwrite: bool,
+    progress: Arc<Progress>,
+) -> BridgeResult<()> {
+    let filesystem = session.filesystem.as_ref();
+    let tuning = session.tuning;
+    let saved = lock(&progress.checkpoint).plan.clone();
+    let plan = match saved {
+        Some(plan) => plan,
+        None => {
+            let plan = Arc::new(
+                plan_download(filesystem, &tuning, node, destination.clone(), &progress).await?,
+            );
+            lock(&progress.checkpoint).plan = Some(Arc::clone(&plan));
+            plan
+        }
+    };
+    let first = lock(&progress.checkpoint).next;
+    let read_limit = limit(session.capabilities.max_read_size, MAX_CLIENT_READ_SIZE);
+    for (index, step) in plan.iter().enumerate().skip(first) {
         progress.check()?;
         match step {
-            Planned::Directory(path) => match tokio::fs::create_dir(&path).await {
+            Planned::Directory(path) => match tokio::fs::create_dir(path).await {
                 Ok(()) => {}
                 Err(error)
                     if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
                 Err(error) => return Err(error.into()),
             },
             Planned::Symlink { node, path } => {
-                let target = filesystem.read_link(node).await?;
-                create_local_symlink(&target, &path)?;
+                let target = retrying(&progress, &tuning, "Reading a link", || {
+                    filesystem.read_link(*node)
+                })
+                .await?;
+                create_local_symlink(&target, path)?;
             }
             Planned::File { node, path } => {
-                let shown = match path.strip_prefix(&destination_root) {
+                let shown = match path.strip_prefix(&destination) {
                     Ok(relative) if !relative.as_os_str().is_empty() => relative,
-                    _ => path.file_name().map(Path::new).unwrap_or(&path),
+                    _ => path.file_name().map(Path::new).unwrap_or(path),
                 };
                 progress.set_current(shown.display().to_string());
-                download_file(filesystem, node, &path, overwrite, read_chunk, &progress).await?;
+                let target = DownloadTarget {
+                    step: index,
+                    node: *node,
+                    destination: path,
+                    overwrite,
+                };
+                download_file(filesystem, &tuning, &target, read_limit, &progress).await?;
                 progress.files.fetch_add(1, Ordering::Relaxed);
             }
         }
+        progress.step_done(index + 1);
     }
     Ok(())
 }
@@ -307,94 +792,225 @@ fn create_local_symlink(target: &[u8], path: &Path) -> BridgeResult<()> {
     Ok(())
 }
 
+struct DownloadTarget<'a> {
+    step: usize,
+    node: NodeId,
+    destination: &'a Path,
+    overwrite: bool,
+}
+
 async fn download_file(
     filesystem: &dyn RemoteFilesystem,
-    node: NodeId,
-    destination: &Path,
-    overwrite: bool,
-    chunk: u64,
+    tuning: &Tuning,
+    target: &DownloadTarget<'_>,
+    read_limit: u64,
     progress: &Progress,
 ) -> BridgeResult<()> {
-    if !overwrite && tokio::fs::symlink_metadata(destination).await.is_ok() {
+    let destination = target.destination;
+    if !target.overwrite && tokio::fs::symlink_metadata(destination).await.is_ok() {
         return Err(BridgeError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("'{}' already exists", destination.display()),
         )));
     }
-    let partial = partial_path(destination);
-    let (handle, revision, size) = filesystem.open_file(node).await?;
+    let (handle, revision, size) = retrying(progress, tuning, "Opening the file", || {
+        filesystem.open_file(target.node)
+    })
+    .await?;
+
+    // Pick up a partial file a stopped attempt left, unless the remote file
+    // changed since, in which case its bytes would mix two versions.
+    let saved = match progress.take_partial() {
+        Some(Partial::Download {
+            step,
+            path,
+            revision: saved_revision,
+            committed,
+        }) if step == target.step => {
+            if saved_revision == revision || revision == 0 {
+                Some((path, committed))
+            } else {
+                progress.event(
+                    Level::Warning,
+                    "The file changed on the server since the last attempt, starting it over",
+                );
+                progress.bytes.fetch_sub(committed, Ordering::Relaxed);
+                let _ = tokio::fs::remove_file(path).await;
+                None
+            }
+        }
+        other => {
+            if let Some(other) = other {
+                progress.save_partial(other);
+            }
+            None
+        }
+    };
+    let (partial, mut committed, mut local) = match saved {
+        Some((path, committed)) => {
+            let mut local = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .await?;
+            local.set_len(committed).await?;
+            local.seek(SeekFrom::Start(committed)).await?;
+            progress.event(
+                Level::Info,
+                format!("Resuming at {} of {}", bytes(committed), bytes(size)),
+            );
+            (path, committed, local)
+        }
+        None => {
+            let path = partial_path(destination);
+            let local = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await?;
+            (path, 0, local)
+        }
+    };
+
+    let remote = RemoteRead {
+        handle,
+        revision,
+        size,
+    };
     let copied = copy_to_local(
-        filesystem, handle, revision, size, &partial, chunk, progress,
+        filesystem,
+        tuning,
+        &remote,
+        &mut local,
+        &mut committed,
+        read_limit,
+        progress,
     )
     .await;
-    let closed = filesystem.close_file(handle).await;
-    if let Err(error) = copied.and(closed.map_err(Into::into)) {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(error);
+    let copied = match copied {
+        Ok(()) => {
+            async {
+                local.flush().await?;
+                local.sync_all().await?;
+                Ok::<(), BridgeError>(())
+            }
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    // Every byte is already read and checked against the revision, so a
+    // close that fails on a dying link does not undo the copy.
+    let _ = tokio::time::timeout(CLOSE_GRACE, filesystem.close_file(handle)).await;
+    drop(local);
+    match copied {
+        Ok(()) => {
+            if let Err(error) = tokio::fs::rename(&partial, destination).await {
+                let _ = tokio::fs::remove_file(&partial).await;
+                return Err(error.into());
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if committed > 0 && resumable(&error) {
+                progress.save_partial(Partial::Download {
+                    step: target.step,
+                    path: partial,
+                    revision,
+                    committed,
+                });
+            } else {
+                let _ = tokio::fs::remove_file(&partial).await;
+            }
+            Err(error)
+        }
     }
-    if let Err(error) = tokio::fs::rename(&partial, destination).await {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(error.into());
-    }
-    Ok(())
 }
 
-fn partial_path(destination: &Path) -> PathBuf {
-    let name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    destination.with_file_name(format!(".{name}.{}.qkfs-partial", Uuid::new_v4().simple()))
-}
-
-async fn copy_to_local(
-    filesystem: &dyn RemoteFilesystem,
+struct RemoteRead {
     handle: FileHandle,
     revision: u64,
     size: u64,
-    partial: &Path,
-    chunk: u64,
+}
+
+/// Read `remote` from `committed` to its end into `local`, which is
+/// positioned at `committed`. Chunks are written strictly in order, so after
+/// any failure `committed` is exactly what is safely on disk.
+async fn copy_to_local(
+    filesystem: &dyn RemoteFilesystem,
+    tuning: &Tuning,
+    remote: &RemoteRead,
+    local: &mut tokio::fs::File,
+    committed: &mut u64,
+    read_limit: u64,
     progress: &Progress,
 ) -> BridgeResult<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(partial)
-        .await?;
-    let mut offsets = (0..size).step_by(usize::try_from(chunk).unwrap_or(usize::MAX));
-    let mut inflight = FuturesOrdered::new();
+    let mut pipeline = Pipeline::new(*tuning, read_limit);
+    progress.show_shape(pipeline.shape(), None, "Starting");
+    let handle = remote.handle;
+    let mut failures = 0;
     loop {
-        while inflight.len() < PIPELINE_DEPTH {
-            let Some(offset) = offsets.next() else { break };
-            let length = chunk.min(size - offset);
-            inflight.push_back(async move {
-                (
-                    length,
-                    filesystem
+        let mut next = *committed;
+        let mut inflight = FuturesOrdered::new();
+        let (offset, error) = loop {
+            let shape = pipeline.shape();
+            while inflight.len() < shape.depth && next < remote.size {
+                let offset = next;
+                let length = shape.chunk.min(remote.size - offset);
+                next += length;
+                inflight.push_back(async move {
+                    let started = Instant::now();
+                    let read = filesystem
                         .read_range_versioned(handle, offset, length)
-                        .await,
-                )
-            });
-        }
-        let Some((expected, read)) = inflight.next().await else {
-            break;
+                        .await;
+                    (offset, length, started, read)
+                });
+            }
+            let Some((offset, expected, started, read)) = inflight.next().await else {
+                return Ok(());
+            };
+            progress.check()?;
+            match read {
+                Ok(read) => {
+                    // A revision of zero means the implementation does not report one.
+                    if read.revision != 0
+                        && remote.revision != 0
+                        && read.revision != remote.revision
+                    {
+                        return Err(ClientError::StaleRevision.into());
+                    }
+                    local.write_all(&read.data).await?;
+                    let landed = read.data.len() as u64;
+                    *committed += landed;
+                    progress.commit(landed);
+                    failures = 0;
+                    if let Some(shape) =
+                        pipeline.complete(landed, started.elapsed(), Instant::now().into_std())
+                    {
+                        progress.show_shape(shape, pipeline.rate(), "Resized");
+                    }
+                    if landed < expected {
+                        // The file shrank after open; what was read is the whole file.
+                        return Ok(());
+                    }
+                }
+                Err(error) if transient(&error) => break (offset, error),
+                Err(error) => return Err(error.into()),
+            }
         };
-        progress.check()?;
-        let read = read?;
-        // A revision of zero means the implementation does not report one.
-        if read.revision != 0 && revision != 0 && read.revision != revision {
-            return Err(ClientError::StaleRevision.into());
+        // Abandon the rest of the wave: reads are idempotent, and every byte
+        // past `committed` is read again.
+        drop(inflight);
+        let error = BridgeError::from(error);
+        if let Some(shape) = pipeline.fail() {
+            progress.show_shape(shape, None, "Cut back after a failure");
         }
-        file.write_all(&read.data).await?;
-        progress.add_bytes(read.data.len() as u64);
-        if (read.data.len() as u64) < expected {
-            // The file shrank after open; what was read is the whole file.
-            break;
+        let what = format!("Chunk at {}", bytes(offset));
+        if !progress
+            .wait_to_retry(tuning, &mut failures, &error, &what)
+            .await?
+        {
+            return Err(error);
         }
     }
-    file.flush().await?;
-    file.sync_all().await?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -412,23 +1028,23 @@ pub async fn upload(
     progress: Arc<Progress>,
 ) -> BridgeResult<()> {
     let filesystem = session.filesystem.as_ref();
-    let write_chunk = chunk_size(session.capabilities.max_write_size, MAX_CLIENT_WRITE_SIZE);
+    let tuning = session.tuning;
+    let write_limit = limit(session.capabilities.max_write_size, MAX_CLIENT_WRITE_SIZE);
     let metadata = tokio::fs::symlink_metadata(&source).await?;
     if metadata.is_file() {
         progress.total.store(metadata.len(), Ordering::Relaxed);
         progress.files_total.store(1, Ordering::Relaxed);
         progress.set_current(String::from_utf8_lossy(name.as_bytes()).into_owned());
-        upload_file(
-            filesystem,
+        let target = UploadTarget {
+            index: 0,
             parent,
-            &name,
-            &source,
+            name: &name,
+            source: &source,
             replace,
-            write_chunk,
-            &progress,
-        )
-        .await?;
+        };
+        upload_file(filesystem, &tuning, &target, write_limit, &progress).await?;
         progress.files.store(1, Ordering::Relaxed);
+        progress.step_done(1);
         let _ = filesystem.sync_directory(parent).await;
         return Ok(());
     }
@@ -438,29 +1054,48 @@ pub async fn upload(
         ));
     }
 
-    // Size the whole tree first so progress is meaningful from the start.
-    let mut files = Vec::new();
-    let mut pending = vec![source.clone()];
-    while let Some(directory) = pending.pop() {
-        progress.check()?;
-        let mut reader = tokio::fs::read_dir(&directory).await?;
-        while let Some(entry) = reader.next_entry().await? {
-            let kind = entry.file_type().await?;
-            if kind.is_dir() {
-                pending.push(entry.path());
-            } else if kind.is_file() {
-                let size = entry.metadata().await?.len();
-                progress.total.fetch_add(size, Ordering::Relaxed);
-                progress.files_total.fetch_add(1, Ordering::Relaxed);
-                files.push(entry.path());
+    // Size the whole tree first so progress is meaningful from the start. A
+    // resumed upload keeps the first walk's list and totals.
+    let saved = lock(&progress.checkpoint).files.clone();
+    let files = match saved {
+        Some(files) => files,
+        None => {
+            let mut files = Vec::new();
+            let mut pending = vec![source.clone()];
+            while let Some(directory) = pending.pop() {
+                progress.check()?;
+                let mut reader = tokio::fs::read_dir(&directory).await?;
+                while let Some(entry) = reader.next_entry().await? {
+                    let kind = entry.file_type().await?;
+                    if kind.is_dir() {
+                        pending.push(entry.path());
+                    } else if kind.is_file() {
+                        let size = entry.metadata().await?.len();
+                        progress.total.fetch_add(size, Ordering::Relaxed);
+                        progress.files_total.fetch_add(1, Ordering::Relaxed);
+                        files.push(entry.path());
+                    }
+                }
             }
+            files.sort();
+            let files = Arc::new(files);
+            lock(&progress.checkpoint).files = Some(Arc::clone(&files));
+            files
         }
-    }
+    };
 
-    let root = ensure_directory(filesystem, parent, name, mode_of(&metadata)).await?;
+    let root = ensure_directory(
+        filesystem,
+        &tuning,
+        &progress,
+        parent,
+        name,
+        mode_of(&metadata),
+    )
+    .await?;
     let mut directories: HashMap<PathBuf, NodeId> = HashMap::from([(source.clone(), root)]);
-    files.sort();
-    for file in files {
+    let first = lock(&progress.checkpoint).next;
+    for (index, file) in files.iter().enumerate().skip(first) {
         progress.check()?;
         let relative = file
             .strip_prefix(&source)
@@ -477,6 +1112,8 @@ pub async fn upload(
                         let mode = mode_of(&tokio::fs::metadata(&local).await?);
                         let node = ensure_directory(
                             filesystem,
+                            &tuning,
+                            &progress,
                             remote,
                             os_name(component.as_os_str())?,
                             mode,
@@ -492,17 +1129,16 @@ pub async fn upload(
             file.file_name()
                 .ok_or_else(|| BridgeError::invalid("upload file has no name"))?,
         )?;
-        upload_file(
-            filesystem,
-            remote,
-            &file_name,
-            &file,
+        let target = UploadTarget {
+            index,
+            parent: remote,
+            name: &file_name,
+            source: file,
             replace,
-            write_chunk,
-            &progress,
-        )
-        .await?;
+        };
+        upload_file(filesystem, &tuning, &target, write_limit, &progress).await?;
         progress.files.fetch_add(1, Ordering::Relaxed);
+        progress.step_done(index + 1);
     }
     for node in directories.values() {
         let _ = filesystem.sync_directory(*node).await;
@@ -523,98 +1159,304 @@ fn mode_of(metadata: &std::fs::Metadata) -> u32 {
     metadata.permissions().mode() & 0o7777
 }
 
+/// Create a directory, or use the one already there. Safe to retry: a create
+/// that landed before the link failed shows up as an existing directory.
 async fn ensure_directory(
     filesystem: &dyn RemoteFilesystem,
+    tuning: &Tuning,
+    progress: &Progress,
     parent: NodeId,
     name: Name,
     mode: u32,
 ) -> BridgeResult<NodeId> {
-    match filesystem
-        .create_directory(parent, name.clone(), mode | 0o700)
-        .await
-    {
-        Ok(metadata) => Ok(metadata.node),
-        Err(ClientError::Server(ErrorCode::AlreadyExists, _)) => {
-            let node = lookup(filesystem, parent, &name).await?;
-            if filesystem.get_metadata(node).await?.kind != NodeKind::Directory {
-                return Err(ClientError::Server(
-                    ErrorCode::NotDirectory,
-                    String::from_utf8_lossy(name.as_bytes()).into_owned(),
-                )
-                .into());
+    let mut failures = 0;
+    loop {
+        progress.check()?;
+        match filesystem
+            .create_directory(parent, name.clone(), mode | 0o700)
+            .await
+        {
+            Ok(metadata) => return Ok(metadata.node),
+            Err(ClientError::Server(ErrorCode::AlreadyExists, _)) => {
+                let node = lookup(filesystem, parent, &name).await?;
+                if filesystem.get_metadata(node).await?.kind != NodeKind::Directory {
+                    return Err(ClientError::Server(
+                        ErrorCode::NotDirectory,
+                        String::from_utf8_lossy(name.as_bytes()).into_owned(),
+                    )
+                    .into());
+                }
+                return Ok(node);
             }
-            Ok(node)
+            Err(error) if transient(&error) || matches!(error, ClientError::AmbiguousMutation) => {
+                let error = BridgeError::from(error);
+                if !progress
+                    .wait_to_retry(tuning, &mut failures, &error, "Creating a folder")
+                    .await?
+                {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => Err(error.into()),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct UploadTarget<'a> {
+    index: usize,
+    parent: NodeId,
+    name: &'a Name,
+    source: &'a Path,
+    replace: bool,
+}
+
+const REWRITE: FileOpenOptions = FileOpenOptions {
+    access: FileAccess::ReadWrite,
+    truncate: true,
+    append: false,
+};
+
+/// Create (or, with `replace`, truncate) the remote file and return its node
+/// and an open handle. A create whose reply was lost is retried; if it had
+/// landed, the file it made is still empty, which is how it is recognised.
+async fn create_remote(
+    filesystem: &dyn RemoteFilesystem,
+    tuning: &Tuning,
+    progress: &Progress,
+    target: &UploadTarget<'_>,
+    mode: u32,
+) -> BridgeResult<(NodeId, FileHandle)> {
+    let mut failures = 0;
+    let mut ambiguous = false;
+    loop {
+        progress.check()?;
+        let error = match filesystem
+            .create_file(target.parent, target.name.clone(), mode, READ_WRITE)
+            .await
+        {
+            Ok(created) => return Ok((created.metadata.node, created.opened.handle)),
+            Err(ClientError::Server(ErrorCode::AlreadyExists, message)) => {
+                let node = lookup(filesystem, target.parent, target.name).await?;
+                let ours = ambiguous && filesystem.get_metadata(node).await?.size == 0;
+                if !target.replace && !ours {
+                    return Err(ClientError::Server(ErrorCode::AlreadyExists, message).into());
+                }
+                match filesystem.open_file_with_options(node, REWRITE).await {
+                    Ok(opened) => return Ok((node, opened.handle)),
+                    // Truncating to empty again is harmless, so retry it too.
+                    Err(error)
+                        if transient(&error) || matches!(error, ClientError::AmbiguousMutation) =>
+                    {
+                        error
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) if transient(&error) || matches!(error, ClientError::AmbiguousMutation) => {
+                ambiguous = true;
+                error
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let error = BridgeError::from(error);
+        if !progress
+            .wait_to_retry(tuning, &mut failures, &error, "Creating the file")
+            .await?
+        {
+            return Err(error);
+        }
+    }
+}
+
 async fn upload_file(
     filesystem: &dyn RemoteFilesystem,
-    parent: NodeId,
-    name: &Name,
-    source: &Path,
-    replace: bool,
-    chunk: u64,
+    tuning: &Tuning,
+    target: &UploadTarget<'_>,
+    write_limit: u64,
     progress: &Progress,
 ) -> BridgeResult<()> {
-    let local = tokio::fs::File::open(source).await?;
+    let mut local = tokio::fs::File::open(target.source).await?;
     let mode = mode_of(&local.metadata().await?) & 0o777;
-    let handle = match filesystem
-        .create_file(parent, name.clone(), mode, READ_WRITE)
-        .await
-    {
-        Ok(created) => created.opened.handle,
-        Err(ClientError::Server(ErrorCode::AlreadyExists, _)) if replace => {
-            let node = lookup(filesystem, parent, name).await?;
-            filesystem
-                .open_file_with_options(
-                    node,
-                    FileOpenOptions {
-                        access: FileAccess::ReadWrite,
-                        truncate: true,
-                        append: false,
-                    },
-                )
-                .await?
-                .handle
+    let (node, handle, committed) = match progress.take_partial() {
+        Some(Partial::Upload {
+            index,
+            node,
+            committed,
+        }) if index == target.index => {
+            progress.event(Level::Info, format!("Resuming at {}", bytes(committed)));
+            (node, None, committed)
         }
-        Err(error) => return Err(error.into()),
+        other => {
+            if let Some(other) = other {
+                progress.save_partial(other);
+            }
+            let (node, handle) = create_remote(filesystem, tuning, progress, target, mode).await?;
+            (node, Some(handle), 0)
+        }
     };
-    let written = write_from_local(filesystem, handle, local, 0, chunk, progress).await;
-    let synced = match &written {
-        Ok(_) => filesystem
-            .sync_file(handle, false)
-            .await
-            .map_err(BridgeError::from),
-        Err(_) => Ok(()),
+    let destination = WriteTarget {
+        index: target.index,
+        node,
+        base: 0,
+        sync: true,
     };
-    let closed = filesystem.close_file(handle).await;
-    written?;
-    synced?;
-    closed?;
+    let written = write_from_local(
+        filesystem,
+        tuning,
+        &destination,
+        handle,
+        &mut local,
+        committed,
+        write_limit,
+        progress,
+    )
+    .await?;
+    let _ = tokio::time::timeout(CLOSE_GRACE, filesystem.close_file(written)).await;
     Ok(())
 }
 
-/// Write a local file into an open remote handle starting at `offset`,
-/// pipelining up to `PIPELINE_DEPTH` positioned writes, then flush.
-pub async fn write_from_local(
+/// Where [`write_from_local`] writes: file bytes `n..` go to remote offset
+/// `base + n`, and `sync` asks for durability before it returns.
+struct WriteTarget {
+    index: usize,
+    node: NodeId,
+    base: u64,
+    sync: bool,
+}
+
+/// Write `local` from byte `committed` to its end into `target.node`,
+/// pipelining positioned writes, then flush (and sync). Returns the handle
+/// still open, for the caller to close.
+///
+/// Positioned writes are idempotent, so when the link fails mid-wave the
+/// writer reopens the file (never truncating) and rewrites from the last
+/// in-order acknowledged byte. That assumes no one else writes this range
+/// meanwhile, which holds for a file this transfer created or truncated.
+#[allow(clippy::too_many_arguments)]
+async fn write_from_local(
+    filesystem: &dyn RemoteFilesystem,
+    tuning: &Tuning,
+    target: &WriteTarget,
+    mut handle: Option<FileHandle>,
+    local: &mut tokio::fs::File,
+    mut committed: u64,
+    write_limit: u64,
+    progress: &Progress,
+) -> BridgeResult<FileHandle> {
+    let mut pipeline = Pipeline::new(*tuning, write_limit);
+    progress.show_shape(pipeline.shape(), None, "Starting");
+    let reopen = FileOpenOptions {
+        access: FileAccess::ReadWrite,
+        truncate: false,
+        append: false,
+    };
+    let mut failures = 0;
+    loop {
+        let current = match handle.take() {
+            Some(handle) => handle,
+            None => {
+                retrying(progress, tuning, "Reopening the file", || {
+                    filesystem.open_file_with_options(target.node, reopen)
+                })
+                .await?
+                .handle
+            }
+        };
+        let outcome = write_wave(
+            filesystem,
+            current,
+            target,
+            local,
+            &mut committed,
+            &mut pipeline,
+            progress,
+        )
+        .await;
+        let error = match outcome {
+            Ok(()) => {
+                failures = 0;
+                let finished = async {
+                    filesystem.flush_file(current, None).await?;
+                    if target.sync {
+                        filesystem.sync_file(current, false).await?;
+                    }
+                    Ok::<(), ClientError>(())
+                }
+                .await;
+                match finished {
+                    Ok(()) => return Ok(current),
+                    Err(error)
+                        if transient(&error) || matches!(error, ClientError::AmbiguousMutation) =>
+                    {
+                        error
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(WaveError::Retry(error)) => error,
+            Err(WaveError::Fatal(error)) => {
+                save_upload(progress, target, committed);
+                return Err(error);
+            }
+        };
+        let _ = tokio::time::timeout(CLOSE_GRACE, filesystem.close_file(current)).await;
+        let error = BridgeError::from(error);
+        if let Some(shape) = pipeline.fail() {
+            progress.show_shape(shape, None, "Cut back after a failure");
+        }
+        let what = format!("Write at {}", bytes(committed));
+        match progress
+            .wait_to_retry(tuning, &mut failures, &error, &what)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                save_upload(progress, target, committed);
+                return Err(error);
+            }
+            Err(cancelled) => return Err(cancelled),
+        }
+    }
+}
+
+fn save_upload(progress: &Progress, target: &WriteTarget, committed: u64) {
+    progress.save_partial(Partial::Upload {
+        index: target.index,
+        node: target.node,
+        committed,
+    });
+}
+
+enum WaveError {
+    Retry(ClientError),
+    Fatal(BridgeError),
+}
+
+impl<E: Into<BridgeError>> From<E> for WaveError {
+    fn from(error: E) -> Self {
+        Self::Fatal(error.into())
+    }
+}
+
+/// One pass of pipelined writes from `committed` to the end of `local`.
+async fn write_wave(
     filesystem: &dyn RemoteFilesystem,
     handle: FileHandle,
-    mut local: tokio::fs::File,
-    offset: u64,
-    chunk: u64,
+    target: &WriteTarget,
+    local: &mut tokio::fs::File,
+    committed: &mut u64,
+    pipeline: &mut Pipeline,
     progress: &Progress,
-) -> BridgeResult<u64> {
-    let capacity = usize::try_from(chunk).unwrap_or(usize::MAX);
-    let mut position = offset;
-    let mut written = 0_u64;
+) -> Result<(), WaveError> {
+    local.seek(SeekFrom::Start(*committed)).await?;
+    let mut position = *committed;
     let mut exhausted = false;
     let mut inflight = FuturesOrdered::new();
     loop {
-        while !exhausted && inflight.len() < PIPELINE_DEPTH {
+        let shape = pipeline.shape();
+        while !exhausted && inflight.len() < shape.depth {
             progress.check()?;
+            let capacity = usize::try_from(shape.chunk).unwrap_or(usize::MAX);
             let mut buffer = vec![0_u8; capacity];
             let mut filled = 0;
             while filled < capacity {
@@ -629,27 +1471,39 @@ pub async fn write_from_local(
                 break;
             }
             buffer.truncate(filled);
-            let at = position;
-            position = position
-                .checked_add(filled as u64)
+            let at = target
+                .base
+                .checked_add(position)
                 .ok_or_else(|| BridgeError::invalid("write offset overflows"))?;
+            position += filled as u64;
             inflight.push_back(async move {
+                let started = Instant::now();
                 let result = filesystem.write_range(handle, at, &buffer).await;
-                (buffer.len() as u64, result)
+                (buffer.len() as u64, started, result)
             });
         }
-        let Some((expected, result)) = inflight.next().await else {
-            break;
+        let Some((expected, started, result)) = inflight.next().await else {
+            return Ok(());
         };
-        let result = result?;
+        progress.check()?;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if transient(&error) || matches!(error, ClientError::AmbiguousMutation) => {
+                return Err(WaveError::Retry(error));
+            }
+            Err(error) => return Err(error.into()),
+        };
         if result.written != expected {
-            return Err(BridgeError::invalid("the server reported a partial write"));
+            return Err(BridgeError::invalid("the server reported a partial write").into());
         }
-        written += result.written;
-        progress.add_bytes(result.written);
+        *committed += result.written;
+        progress.commit(result.written);
+        if let Some(shape) =
+            pipeline.complete(result.written, started.elapsed(), Instant::now().into_std())
+        {
+            progress.show_shape(shape, pipeline.rate(), "Resized");
+        }
     }
-    filesystem.flush_file(handle, None).await?;
-    Ok(written)
 }
 
 /// The CLI `write` command: overwrite part of an existing remote file with a
@@ -663,29 +1517,546 @@ pub async fn write_at(
     progress: Arc<Progress>,
 ) -> BridgeResult<()> {
     let filesystem = session.filesystem.as_ref();
+    let tuning = session.tuning;
     if let Some(name) = source.file_name() {
         progress.set_current(name.to_string_lossy().into_owned());
     }
-    let local = tokio::fs::File::open(&source).await?;
+    let mut local = tokio::fs::File::open(&source).await?;
     progress
         .total
         .store(local.metadata().await?.len(), Ordering::Relaxed);
     progress.files_total.store(1, Ordering::Relaxed);
-    let opened = filesystem.open_file_with_options(node, READ_WRITE).await?;
-    let chunk = chunk_size(session.capabilities.max_write_size, MAX_CLIENT_WRITE_SIZE);
-    let written =
-        write_from_local(filesystem, opened.handle, local, offset, chunk, &progress).await;
-    let synced = match (&written, sync) {
-        (Ok(_), true) => filesystem
-            .sync_file(opened.handle, false)
-            .await
-            .map_err(BridgeError::from),
-        _ => Ok(()),
+    let committed = match progress.take_partial() {
+        Some(Partial::Upload { committed, .. }) => committed,
+        _ => 0,
     };
-    let closed = filesystem.close_file(opened.handle).await;
-    written?;
-    synced?;
-    closed?;
+    let target = WriteTarget {
+        index: 0,
+        node,
+        base: offset,
+        sync,
+    };
+    let write_limit = limit(session.capabilities.max_write_size, MAX_CLIENT_WRITE_SIZE);
+    let handle = write_from_local(
+        filesystem,
+        &tuning,
+        &target,
+        None,
+        &mut local,
+        committed,
+        write_limit,
+        &progress,
+    )
+    .await?;
+    let _ = tokio::time::timeout(CLOSE_GRACE, filesystem.close_file(handle)).await;
     progress.files.store(1, Ordering::Relaxed);
+    progress.step_done(1);
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use quickfs_client_core::{CreatedFile, OpenedFile, RangeRead, WriteResult};
+    use quickfs_protocol::{DirectoryEntry, FilesystemCapabilities, Metadata, ROOT_NODE};
+    use std::sync::atomic::AtomicUsize;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// An in-memory server whose reads and writes fail on request, the way a
+    /// stalled link makes them fail.
+    #[derive(Default)]
+    struct FlakyFs {
+        files: Mutex<HashMap<NodeId, Vec<u8>>>,
+        names: Mutex<HashMap<Vec<u8>, NodeId>>,
+        handles: Mutex<HashMap<FileHandle, NodeId>>,
+        /// Reads at or past this offset time out while `stall_reads` is set.
+        stall_from: AtomicU64,
+        stall_reads: AtomicBool,
+        /// Fail this many reads (past `stall_from`) and then recover.
+        failing_reads: AtomicUsize,
+        /// Apply this many writes past `stall_from` but report the reply lost.
+        lost_write_replies: AtomicUsize,
+        /// Land the next create but report the reply lost.
+        lost_create_reply: AtomicBool,
+        reads: Mutex<Vec<u64>>,
+        opens: AtomicUsize,
+    }
+
+    impl FlakyFs {
+        fn with_file(node: NodeId, data: Vec<u8>) -> Self {
+            let fs = Self::default();
+            lock(&fs.files).insert(node, data);
+            fs
+        }
+
+        fn meta(&self, node: NodeId) -> Metadata {
+            let size = lock(&self.files)
+                .get(&node)
+                .map_or(0, |data| data.len() as u64);
+            Metadata {
+                node,
+                kind: if node == ROOT_NODE {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::File
+                },
+                size,
+                mode: 0o644,
+                allocated_blocks: 0,
+                revision: 7,
+                accessed_unix_ms: 1,
+                modified_unix_ms: 1,
+                created_unix_ms: Some(1),
+                backup_unix_ms: None,
+                link_count: 1,
+                device_major: 0,
+                device_minor: 0,
+            }
+        }
+
+        fn stalled() -> ClientError {
+            ClientError::Transport(TransportError::Timeout)
+        }
+
+        fn reads_at(&self, offset: u64) -> usize {
+            lock(&self.reads).iter().filter(|at| **at == offset).count()
+        }
+    }
+
+    #[async_trait]
+    impl RemoteFilesystem for FlakyFs {
+        async fn ping(&self, nonce: u64) -> quickfs_client_core::Result<u64> {
+            Ok(nonce)
+        }
+        async fn get_metadata(&self, node: NodeId) -> quickfs_client_core::Result<Metadata> {
+            Ok(self.meta(node))
+        }
+        async fn list_directory(
+            &self,
+            _node: NodeId,
+        ) -> quickfs_client_core::Result<Vec<DirectoryEntry>> {
+            Ok(lock(&self.names)
+                .iter()
+                .map(|(name, node)| DirectoryEntry {
+                    node: *node,
+                    name: Name::new(name.clone()),
+                    kind: NodeKind::File,
+                    metadata: self.meta(*node),
+                })
+                .collect())
+        }
+        async fn open_file(
+            &self,
+            node: NodeId,
+        ) -> quickfs_client_core::Result<(FileHandle, u64, u64)> {
+            let opened = self
+                .open_file_with_options(node, FileOpenOptions::READ_ONLY)
+                .await?;
+            Ok((opened.handle, opened.revision, opened.size))
+        }
+        async fn open_file_with_options(
+            &self,
+            node: NodeId,
+            options: FileOpenOptions,
+        ) -> quickfs_client_core::Result<OpenedFile> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            if options.truncate {
+                lock(&self.files).insert(node, Vec::new());
+            }
+            let handle = FileHandle(Uuid::new_v4());
+            lock(&self.handles).insert(handle, node);
+            Ok(OpenedFile {
+                handle,
+                revision: 7,
+                size: self.meta(node).size,
+            })
+        }
+        async fn create_file(
+            &self,
+            _parent: NodeId,
+            name: Name,
+            _mode: u32,
+            options: FileOpenOptions,
+        ) -> quickfs_client_core::Result<CreatedFile> {
+            if lock(&self.names).contains_key(name.as_bytes()) {
+                return Err(ClientError::Server(
+                    ErrorCode::AlreadyExists,
+                    "exists".into(),
+                ));
+            }
+            let node = NodeId(Uuid::new_v4());
+            lock(&self.files).insert(node, Vec::new());
+            lock(&self.names).insert(name.as_bytes().to_vec(), node);
+            if self.lost_create_reply.swap(false, Ordering::SeqCst) {
+                return Err(ClientError::AmbiguousMutation);
+            }
+            let opened = self.open_file_with_options(node, options).await?;
+            Ok(CreatedFile {
+                metadata: self.meta(node),
+                opened,
+            })
+        }
+        async fn read_range(
+            &self,
+            handle: FileHandle,
+            offset: u64,
+            length: u64,
+        ) -> quickfs_client_core::Result<Vec<u8>> {
+            Ok(self
+                .read_range_versioned(handle, offset, length)
+                .await?
+                .data)
+        }
+        async fn read_range_versioned(
+            &self,
+            handle: FileHandle,
+            offset: u64,
+            length: u64,
+        ) -> quickfs_client_core::Result<RangeRead> {
+            lock(&self.reads).push(offset);
+            if offset >= self.stall_from.load(Ordering::SeqCst) {
+                if self.stall_reads.load(Ordering::SeqCst) {
+                    return Err(Self::stalled());
+                }
+                if self
+                    .failing_reads
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(Self::stalled());
+                }
+            }
+            let node = lock(&self.handles)[&handle];
+            let files = lock(&self.files);
+            let data = &files[&node];
+            let start = (offset as usize).min(data.len());
+            let end = (start + length as usize).min(data.len());
+            Ok(RangeRead {
+                revision: 7,
+                data: data[start..end].to_vec(),
+            })
+        }
+        async fn write_range(
+            &self,
+            handle: FileHandle,
+            offset: u64,
+            data: &[u8],
+        ) -> quickfs_client_core::Result<WriteResult> {
+            let node = lock(&self.handles)[&handle];
+            let size = {
+                let mut files = lock(&self.files);
+                let file = files.get_mut(&node).unwrap();
+                let end = offset as usize + data.len();
+                if file.len() < end {
+                    file.resize(end, 0);
+                }
+                file[offset as usize..end].copy_from_slice(data);
+                file.len() as u64
+            };
+            if offset >= self.stall_from.load(Ordering::SeqCst)
+                && self
+                    .lost_write_replies
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(ClientError::AmbiguousMutation);
+            }
+            Ok(WriteResult {
+                written: data.len() as u64,
+                revision: 7,
+                size,
+            })
+        }
+        async fn flush_file(
+            &self,
+            _handle: FileHandle,
+            _lock_owner: Option<u64>,
+        ) -> quickfs_client_core::Result<()> {
+            Ok(())
+        }
+        async fn sync_file(
+            &self,
+            _handle: FileHandle,
+            _data_only: bool,
+        ) -> quickfs_client_core::Result<()> {
+            Ok(())
+        }
+        async fn sync_directory(&self, _node: NodeId) -> quickfs_client_core::Result<()> {
+            Ok(())
+        }
+        async fn close_file(&self, handle: FileHandle) -> quickfs_client_core::Result<()> {
+            lock(&self.handles).remove(&handle);
+            Ok(())
+        }
+    }
+
+    fn session(fs: Arc<FlakyFs>, tuning: Tuning) -> Arc<Session> {
+        Arc::new(Session {
+            filesystem: fs,
+            capabilities: FilesystemCapabilities {
+                server_epoch: Uuid::nil(),
+                writable: true,
+                supports_locks: false,
+                supports_atomic_rename: true,
+                supports_directory_sync: true,
+                supports_preallocation: false,
+                supports_symlinks: false,
+                supports_xattrs: false,
+                supports_hard_links: false,
+                supports_special_nodes: false,
+                supports_copy_file_range: false,
+                supports_seek_data_hole: false,
+                supports_safe_ioctl: false,
+                supports_poll: false,
+                supports_bmap: false,
+                supports_exchange_data: false,
+                supports_volume_rename: false,
+                supports_backup_time: false,
+                supports_readdirplus: false,
+                persistent_node_ids: true,
+                restart_lock_replay: false,
+                volume_name: "test".into(),
+                max_read_size: 16 * MIB,
+                max_write_size: 8 * MIB,
+            },
+            tuning,
+        })
+    }
+
+    fn content(length: u64) -> Vec<u8> {
+        (0..length).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn events(progress: &Progress) -> Vec<String> {
+        lock(&progress.events)
+            .iter()
+            .map(|event| event.message.clone())
+            .collect()
+    }
+
+    const FILE: NodeId = NodeId(Uuid::from_u128(42));
+
+    #[tokio::test(start_paused = true)]
+    async fn download_rides_out_stalls_without_rereading_committed_chunks() {
+        let data = content(6 * MIB);
+        let fs = Arc::new(FlakyFs::with_file(FILE, data.clone()));
+        fs.stall_from.store(2 * MIB, Ordering::SeqCst);
+        fs.failing_reads.store(3, Ordering::SeqCst);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("copy.bin");
+        let progress = Arc::new(Progress::new());
+        download(
+            session(Arc::clone(&fs), Tuning::default()),
+            FILE,
+            destination.clone(),
+            false,
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), data);
+        assert_eq!(fs.reads_at(0), 1, "committed chunks are never read again");
+        assert_eq!(progress.retries.load(Ordering::Relaxed), 3);
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 6 * MIB);
+        let log = events(&progress);
+        assert!(
+            log.iter()
+                .any(|line| line.contains("no data moved for 30 s")),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with("Cut back after a failure")),
+            "{log:?}"
+        );
+        // No hidden partial file is left behind.
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_gives_up_after_the_window_then_resumes_from_its_partial() {
+        let data = content(5 * MIB);
+        let fs = Arc::new(FlakyFs::with_file(FILE, data.clone()));
+        fs.stall_from.store(3 * MIB, Ordering::SeqCst);
+        fs.stall_reads.store(true, Ordering::SeqCst);
+        let tuning = Tuning {
+            retry_window: Duration::from_secs(60),
+            ..Tuning::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("copy.bin");
+        let progress = Arc::new(Progress::new());
+        let session = session(Arc::clone(&fs), tuning);
+        let error = download(
+            Arc::clone(&session),
+            FILE,
+            destination.clone(),
+            false,
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap_err();
+        assert!(resumable(&error));
+        assert!(hint(&error, &tuning).unwrap().contains("DIRECT path"));
+        assert!(!destination.exists());
+        let Some(Partial::Download {
+            path, committed, ..
+        }) = lock(&progress.checkpoint).partial.clone()
+        else {
+            panic!("the partial file is kept");
+        };
+        // Everything before the stall point landed; the file is exactly it.
+        assert!((3 * MIB..5 * MIB).contains(&committed), "{committed}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), committed);
+
+        // The link comes back: resume reads only what is missing.
+        fs.stall_reads.store(false, Ordering::SeqCst);
+        let reads_before = lock(&fs.reads).len();
+        download(
+            session,
+            FILE,
+            destination.clone(),
+            false,
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), data);
+        assert!(
+            lock(&fs.reads)[reads_before..]
+                .iter()
+                .all(|offset| *offset >= committed)
+        );
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 5 * MIB);
+        assert!(!path.exists());
+        let resumed = format!("Resuming at {}", bytes(committed));
+        assert!(
+            events(&progress)
+                .iter()
+                .any(|line| line.starts_with(&resumed))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_stopped_download_deletes_its_partial() {
+        let fs = Arc::new(FlakyFs::with_file(FILE, content(4 * MIB)));
+        fs.stall_from.store(MIB, Ordering::SeqCst);
+        fs.stall_reads.store(true, Ordering::SeqCst);
+        let tuning = Tuning {
+            retry_window: Duration::from_secs(10),
+            ..Tuning::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::new());
+        download(
+            session(fs, tuning),
+            FILE,
+            directory.path().join("copy.bin"),
+            false,
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        discard_partial(&progress).await;
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_rewrites_from_the_last_acknowledged_byte_after_lost_replies() {
+        let data = content(5 * MIB + 123);
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        std::fs::write(&source, &data).unwrap();
+        let fs = Arc::new(FlakyFs::default());
+        fs.stall_from.store(2 * MIB, Ordering::SeqCst);
+        fs.lost_write_replies.store(2, Ordering::SeqCst);
+        let progress = Arc::new(Progress::new());
+        upload(
+            session(Arc::clone(&fs), Tuning::default()),
+            ROOT_NODE,
+            source,
+            Name::from("copy.bin"),
+            false,
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap();
+        let node = lock(&fs.names)[b"copy.bin".as_slice()];
+        assert_eq!(lock(&fs.files)[&node], data);
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), data.len() as u64);
+        assert_eq!(progress.retries.load(Ordering::Relaxed), 2);
+        // One handle from the create, one reopen per lost reply.
+        assert_eq!(fs.opens.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_create_whose_reply_was_lost_is_recognised_and_reused() {
+        let data = content(300_000);
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        std::fs::write(&source, &data).unwrap();
+        let fs = Arc::new(FlakyFs::default());
+        fs.lost_create_reply.store(true, Ordering::SeqCst);
+        upload(
+            session(Arc::clone(&fs), Tuning::default()),
+            ROOT_NODE,
+            source,
+            Name::from("copy.bin"),
+            false,
+            Arc::new(Progress::new()),
+        )
+        .await
+        .unwrap();
+        let node = lock(&fs.names)[b"copy.bin".as_slice()];
+        assert_eq!(lock(&fs.files)[&node], data);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_existing_file_is_still_refused_without_replace() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        std::fs::write(&source, b"new").unwrap();
+        let fs = Arc::new(FlakyFs::with_file(FILE, b"old".to_vec()));
+        lock(&fs.names).insert(b"copy.bin".to_vec(), FILE);
+        let error = upload(
+            session(Arc::clone(&fs), Tuning::default()),
+            ROOT_NODE,
+            source,
+            Name::from("copy.bin"),
+            false,
+            Arc::new(Progress::new()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "AlreadyExists");
+        assert_eq!(lock(&fs.files)[&FILE], b"old");
+    }
+
+    #[test]
+    fn explanations_name_the_link_not_the_code_path() {
+        let tuning = Tuning::default();
+        let stalled = BridgeError::Client(ClientError::Transport(TransportError::Timeout));
+        assert_eq!(
+            explain(&stalled, &tuning),
+            "no data moved for 30 s, the link stalled"
+        );
+        assert!(resumable(&stalled));
+        let changed = BridgeError::Client(ClientError::StaleRevision);
+        assert!(!resumable(&changed));
+        assert!(
+            hint(&changed, &tuning)
+                .unwrap()
+                .contains("changed on the server")
+        );
+        assert_eq!(bytes(3 * MIB), "3.1 MB");
+        assert_eq!(seconds(Duration::from_secs(300)), "5 min");
+    }
 }
