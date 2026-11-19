@@ -11,7 +11,7 @@ behaviour of a real network link. This plan covers that.
 
 | Item | Value |
 | --- | --- |
-| Client | Windows 10 1809 or newer, x64, WinFsp 2.0+ (Core) installed |
+| Client | Windows 10 1809 or newer, x64, WinFsp 2.0+ (Core) installed; Developer Mode for the link-creation cases |
 | Server | The Linux `quickfs-server-daemon` with a writable export |
 | Link | At least one run on a LAN and one over a link with 50 ms or more of added latency |
 | Mount | `quickfs mount <server> Q: --username <user>` unless a case says otherwise |
@@ -105,7 +105,7 @@ its own assertion passed.
 | 7.2 | Eight jobs reading the *same* file concurrently | All reads correct. |
 | 7.3 | One job appending while another reads the same file | No torn reads; no client crash. |
 | 7.4 | Create, rename and delete 5 000 small files in a loop for ten minutes | No leak in client memory or server handles; no errors. |
-| 7.5 | Run [`winfsp-tests`](https://github.com/winfsp/winfsp) against the mount, excluding the cases for features documented as unsupported (streams, reparse points, EAs, `SetSecurity`) | No failures outside the excluded set. |
+| 7.5 | Run [`winfsp-tests`](https://github.com/winfsp/winfsp) against the mount, excluding the cases for features documented as unsupported (hard-link creation, EAs, absolute-target links, `SetSecurity` on trustees other than the owner) | No failures outside the excluded set. |
 | 7.6 | `robocopy /MIR` a 10 000-file tree onto `Q:` and back off | Both directions complete; trees compare equal. |
 
 ## 8. Network failure and reconnect
@@ -129,8 +129,10 @@ its own assertion passed.
 | 9.3 | `quickfs unmount Q:` from another window | The mount exits cleanly; the letter disappears. |
 | 9.4 | Control+C in the mount window | Same. |
 | 9.5 | `quickfs unmount Q:` when nothing is mounted | Reports that no mount is active, exit status non-zero. |
-| 9.6 | Mount on `*` | Takes the highest free letter. |
-| 9.7 | Mount on an existing empty directory | The volume appears there. |
+| 9.6 | Mount on `*`, then `quickfs unmount` the letter it reported | Takes the highest free letter; the banner names it and unmount reaches it. |
+| 9.7 | Mount on a directory path that does not exist yet | WinFsp creates it, the volume appears there, and it is gone after unmount. An existing directory is refused. |
+| 9.9 | Mount with `--exit-with-parent` from a launcher, then kill the launcher | The volume unmounts within a second. |
+| 9.10 | Mount with `--password-stdin --stats-on-request` and send `stats` lines | One `quickfs-stats <json>` reply per line. |
 | 9.8 | Kill the mount process with `Stop-Process -Force` | The letter is released by WinFsp; a fresh mount on it succeeds. |
 
 ## 10. Explorer and shell
@@ -178,3 +180,49 @@ Differences are expected only where the operating systems differ, and each one
 should already be listed under "Windows-specific limitations" in
 [the Windows client guide](windows.md). A difference that is *not* listed there
 is a bug in either the client or the documentation.
+
+## 13. Links, streams and permissions
+
+| # | Steps | Expected |
+| --- | --- | --- |
+| 13.1 | On the server, create `ln -s target.txt file-link` and `ln -s dir dir-link`; on Windows, `Get-Item` each and read or list through it | `LinkType` is `SymbolicLink`; `dir-link` is a directory and lists `dir`'s entries. |
+| 13.2 | On the server, create a link with an absolute target or one that climbs above the export | On Windows it resolves inside the volume, never to a path on the local drive. |
+| 13.3 | `mklink R:\l target.txt` and `mklink /D R:\d dir` (Developer Mode) | The server holds links with relative targets. |
+| 13.4 | `Set-Content R:\f.txt -Stream Zone.Identifier -Value x`, then `dir /r` | The stream is listed, readable, and stored as the attribute `Zone.Identifier`. |
+| 13.5 | Copy a file with a stream from NTFS to the mount and back | The stream survives both copies. |
+| 13.6 | `icacls R:\f.txt /inheritance:r /grant:r "%USERNAME%:(R)"`, then try to write | The write is refused; the server mode's owner bits are `r--`; group and other bits are unchanged. |
+| 13.7 | Set the read-only attribute, then clear it again | Both succeed; the owner write bit follows. |
+| 13.8 | Set `LastWriteTimeUtc` right after writing a file | The time set is the one the server keeps. |
+| 13.9 | Rename `case.txt` to `CASE.TXT` | The server's spelling changes. |
+
+## Record of a live run
+
+Run on 2026-11-18 against the Linux daemon on a LAN (about 1 ms round trip),
+Windows 11 with WinFsp 2.1, every change confined to one test folder. Sections
+1–7, 9, 12 and 13 passed (29 scripted write cases, the read-only lifecycle
+cases, and 1 GiB of a 13 GB file hashed through the mount and independently
+through the app bridge). Measured: 256 MiB copies at about 75 MiB/s onto the
+mount and 55–60 MiB/s off it; 64 KiB reads at about 300 MiB/s once cached.
+
+The run found and fixed, each now covered by an automated case:
+
+* a crash on every named-stream create (`winfsp_wrs` read the null descriptor
+  WinFsp passes for a stream);
+* `ReadFile` or `WriteFile` above 16 MiB failing instead of being split;
+* small reads costing about 1 ms each from cache, because each copied its whole
+  1 MiB block (now a few microseconds; this was shared with macOS);
+* writes reaching the server only at WinFsp's deferred `Close`, seconds after
+  the application closed the file;
+* an explicitly set last-write time stamped over at cleanup;
+* case-only renames to upper case silently dropped, because WinFsp upper-cased
+  names it was given no normalized spelling for;
+* directory links unusable as directories, `icacls /grant:r` leaving the old
+  rights in place, read-only files that could not be made writable again, and
+  `*` and directory mountpoints that `quickfs unmount` could not reach;
+* parallel writers failing when the server's write capacity was momentarily
+  full (shared with macOS; reads and writes now retry `Busy` briefly).
+
+Not covered by that run: section 8 (blocking the link needs an administrator's
+firewall rule), 10 and 11 (interactive Explorer and applications), and link
+creation from Windows (the account had no Developer Mode; the callback is
+covered by the automated suite).

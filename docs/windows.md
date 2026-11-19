@@ -35,8 +35,13 @@ add **Developer** if the same machine also builds it.
 
 `quickfs.exe` delay-loads `winfsp-x64.dll`, so it starts and prints an actionable
 message on a machine where WinFsp is missing, instead of failing to launch with a
-loader error. `quickfs pair`, `quickfs forget` and `quickfs trust` work without
-WinFsp installed; only `quickfs mount` requires it.
+loader error. `quickfs pair`, `quickfs forget`, `quickfs trust` and
+`quickfs remote` work without WinFsp installed; only `quickfs mount` requires it.
+
+WinFsp 2.x registers its driver under a versioned service name,
+`WinFsp+<install id>`, so `sc query WinFsp` reports "does not exist" even on a
+working installation. `sc query type= driver state= all | findstr WinFsp` shows
+it; it is demand-start and reads STOPPED until the first mount.
 
 ## Licensing
 
@@ -123,8 +128,8 @@ The mountpoint may be:
 | Form | Meaning |
 | --- | --- |
 | `Q:`, `Q`, `Q:\` | That drive letter. |
-| `*` | The next free drive letter, counting down from `Z:`. |
-| `C:\mnt\quickfs` | An existing, empty directory on an NTFS volume. |
+| `*` | The highest free drive letter from `Z:` down. It is resolved before mounting, so the banner and `quickfs unmount` name the real letter. |
+| `C:\mnt\quickfs` | A directory that does **not** exist yet, inside one that does. WinFsp creates it for the life of the mount and removes it afterwards; an existing directory is refused, which also means a mount can never hide files kept there. |
 
 The command stays in the foreground for the life of the mount. The volume is
 visible only to the logon session that created it, which is why an elevated
@@ -134,13 +139,58 @@ Useful options (`quickfs mount --help` lists them all):
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--volume-name` | `quicKFS` | Volume label shown in Explorer, at most 32 characters. |
+| `--volume-name` | derived | Label shown in Explorer, at most 32 characters. Without it: the export's renamed label, else a directory mountpoint's folder name, else `quicKFS` — the macOS rules. |
+| `--read-only` | off | Mount read-only even when the account may write. |
 | `--cache-dir` | `--state-dir` | Where the persistent offline read cache lives. |
 | `--cache-max-bytes` | 20 GiB | Cached payload ceiling. |
 | `--read-ahead-max-bytes` | 64 MiB | In-flight speculative read-ahead; `0` disables it. |
 | `--transport-timeout-ms` | 60000 | Longest idle wait for one transport phase. |
 | `--callback-timeout-ms` | 120000 | End-to-end budget for one filesystem operation. |
 | `--reconnect-attempts` | 3 | Attempts before an operation fails. |
+
+### Launching a mount from an app
+
+The macOS app runs its mounts through a helper process, and `quickfs mount`
+offers that helper's interface unchanged — the code is shared — so a Windows app
+can drive it the same way:
+
+| Option | Purpose |
+| --- | --- |
+| `--password-stdin` | Read the password from the first line of standard input. |
+| `--stats-on-request` | Answer each `stats` line on standard input with one `quickfs-stats <json>` line on standard output: round-trip time, congestion window, MTU, byte, datagram and packet counters, losses, reconnects and the negotiated protocol. Other lines are ignored. |
+| `--stats-file <PATH>` | Rewrite a file with the same snapshot every second instead, atomically, with an owner-only DACL. |
+| `--exit-with-parent` | Unmount when the launching process exits, so a crash or forced quit cannot leave an orphaned mount. The parent is opened at startup, so a later reuse of its process ID is never mistaken for it. |
+
+Standard output never panics on a closed pipe, so a launcher that exits first
+does not abandon the unmount. A graceful unmount that has not finished eight
+seconds after it was requested — a callback stuck on a dead link — exits the
+process regardless, as on macOS; WinFsp releases the volume with the process.
+`QUICKFS_WINFSP_DEBUG=1` logs every request WinFsp dispatches, and each reply, to
+standard error, as `QUICKFS_FUSE_DEBUG` does on macOS.
+
+The rest of what the macOS app uses — pairing, trust, browsing, pipelined and
+resumable transfers striped across several connections, link statistics, and
+offline-cache measurement — lives in `core-bridge`, which builds on Windows as
+`quickfs_core_bridge.dll` with the same one-function JSON ABI
+(`quickfs_bridge_call`/`quickfs_bridge_free`). Its `environment` request reports
+`mount_runtime` (`WinFsp`, whether it is installed, and where to get it).
+Downloaded names are checked against the Win32 rules before anything is created,
+and a link that cannot be created locally — Windows needs Developer Mode or an
+administrator for that, and an absolute server path has no local meaning — is
+skipped with a warning in the transfer's activity log instead of failing the
+whole folder.
+
+### Commands without a mount
+
+`quickfs remote <SERVER> <COMMAND>` runs one of the file commands
+`quickfs-client-cli` has on macOS — `ping`, `capabilities`, `filesystem-stats`,
+`list`, `stat`, `read`, `write`, `create`, `truncate`, `mkdir`, `remove`,
+`rename`, `symlink`, `readlink` — with the same trust options, and the same
+server-identity check before the password is sent:
+
+```powershell
+quickfs remote 192.0.2.10:4433 --server-name files.example.net --username alice list /
+```
 
 ## Unmounting
 
@@ -172,18 +222,34 @@ pretend otherwise. What it does is defined and narrow:
 | directory | `FILE_ATTRIBUTE_DIRECTORY` | n/a |
 | owner write bit clear | `FILE_ATTRIBUTE_READONLY` | yes, through the mode |
 | leading `.` in the name | `FILE_ATTRIBUTE_HIDDEN` | no |
-| owner read/write/execute bits | the mount owner's ACE in the security descriptor | no |
-| group and other mode bits | not shown | no |
+| owner read/write/execute bits | the mount owner's ACE in the security descriptor | yes, from a DACL Windows sets (`icacls`, Properties → Security) |
+| group and other mode bits | not shown | no; never changed |
 | uid and gid | not shown | no |
 | modification and access times | `LastWriteTime`, `LastAccessTime` | yes |
 | creation time | `CreationTime` | no |
+| persistent node identity | file ID (`IndexNumber`), stable across remounts | n/a |
+| link count | `NumberOfLinks` | n/a |
+| symbolic link | symbolic-link reparse point | yes, created from Windows |
+| extended attributes | named streams (`file:name`) | yes |
+| stored spelling of a name | reported back on open | yes, including case-only renames |
 
 Every node is presented as owned by the account that started the mount, with an
 ACE granting only that account, and rights derived from the file's *owner* mode
 bits. No ACE is created for `Everyone`, and the POSIX group and other bits are
 not approximated onto any Windows trustee — doing so would widen access on a
 shared machine beyond what the user asked for. This mirrors the macOS client,
-where every node reports the mounting user's uid.
+where every node reports the mounting user's uid. Whatever the mode, the owner
+can always read and change attributes, as the owner of a Unix file can always
+`stat`, `chmod` and set times — otherwise a file made read-only could never be
+made writable again.
+
+When Windows sets a DACL, Windows itself decides what it grants the mounting
+account — `AccessCheck` against the mount process's token, so rights through
+`Users`, `Authenticated Users` or any other group count exactly as they would on
+NTFS — and the owner's read, write and execute bits follow `FILE_READ_DATA`,
+`FILE_WRITE_DATA` and `FILE_EXECUTE`. Other trustees have nowhere to go and are
+dropped. Owner and group changes are accepted and have no effect, so ACL-copying
+tools (`robocopy /COPYALL`, `icacls /restore`) keep working.
 
 Real authorisation still happens on the server, for the authenticated quicKFS
 account. The Windows-side descriptor is a second, more restrictive gate and can
@@ -194,17 +260,49 @@ clears all three. Attributes quicKFS cannot store — hidden, system, archive,
 temporary — are accepted and discarded rather than refused, because Windows sets
 them constantly and failing would break ordinary file copies.
 
+### Symbolic links
+
+A link on the server is a Windows symbolic link, and a link to a directory is a
+directory link, so `dir`, `cd` and Explorer follow it. Its target is always
+presented relative to the link and **always resolves inside the volume**:
+
+* A relative target is resolved against the link's directory, clamped at the
+  export root as the server clamps it, and written as the shortest relative
+  path — no number of `..` climbs out of the mount.
+* An absolute target names a path on the server, which means nothing on the
+  Windows machine; following it literally would open a path on the user's own
+  drive. It is presented as relative to the export root instead.
+* A target containing `:` or `\` would read as a drive, a device or a UNC path,
+  and is not presented as a link.
+
+Links can be created from Windows (`mklink`, `mklink /D`) where Windows allows
+the account to create links at all — Developer Mode or an elevated prompt — and
+must have relative targets.
+
+### Extended attributes as named streams
+
+An extended attribute is the stream of the same name: the macOS resource fork
+of `photo.jpg` is `photo.jpg:com.apple.ResourceFork`, and a Samba-written
+`user.DOSATTRIB` appears as a stream too. Streams can be listed
+(`dir /r`, `Get-Item -Stream *`), read, written, created and deleted, and the
+Windows tools that carry streams across copies — Explorer, `robocopy`, the
+`Zone.Identifier` mark a browser adds to a download — carry quicKFS attributes
+with them. A stream is held in memory while open and written back whole on flush
+and on the last close; values are bounded at 64 MiB.
+
+A file whose stored name contains `:` — created from Linux — keeps opening as
+that file; only when no such file exists is `a:b` read as the stream `b` of `a`.
+
 ## Windows-specific limitations
 
 These are deliberate and tested, not accidental:
 
 * **Names that Win32 cannot round-trip are refused at creation** with
-  `STATUS_OBJECT_NAME_INVALID`: names containing `< > : " | ? *` or a control
+  `STATUS_OBJECT_NAME_INVALID`: names containing `< > " | ? *` or a control
   character, names ending in a dot or a space, and the DOS device names (`CON`,
-  `NUL`, `COM1`…, with or without an extension). Files already carrying such
-  names — created from Linux — stay visible, readable, renamable and deletable
-  from Windows. Only creating a new one is refused, so the client never makes a
-  file the user cannot afterwards reach through Explorer.
+  `NUL`, `COM1`…, with or without an extension). A name with `:` names a stream,
+  as on NTFS. Files already carrying such names — created from Linux — stay
+  visible, readable, renamable and deletable from Windows.
 * **Names that are not valid UTF-8 are omitted from directory listings.** The
   Windows namespace is UTF-16 and has no spelling for them. They remain
   accessible from a POSIX client.
@@ -212,17 +310,24 @@ These are deliberate and tested, not accidental:
   holding two entries that differ only by case is ambiguous in the Windows
   namespace, and a lookup that could match either is refused rather than
   resolved arbitrarily.
-* **Symbolic links appear as ordinary files.** Reparse points are not
-  implemented, so a link's contents cannot be read through the mount. Its entry
-  is still listed, renamable and deletable.
-* **Extended attributes, alternate data streams, hard links and object IDs are
-  not exposed.** macOS resource forks stored as xattrs are not visible here.
-* **Security descriptors cannot be set.** `SetSecurity` is not implemented,
-  because a descriptor Windows supplied could not be mapped onto a POSIX mode
-  without inventing meaning. Tools that copy ACLs (`robocopy /copyall`,
-  `icacls`) report that the volume does not support the operation.
-* **Byte-range locks are advisory on the server and are not plumbed through the
-  WinFsp bridge.** Windows mandatory locking is not emulated.
+* **Hard links can be counted but not created.** WinFsp has no hard-link
+  creation callback; `NumberOfLinks` and stable file IDs are reported.
+* **Byte-range locks are local.** Windows enforces them inside the WinFsp
+  driver without telling the file system, so they protect processes on this
+  machine but not against another client. macOS's advisory server locks have no
+  Windows counterpart to carry them.
+* **Overwriting a file keeps its extended attributes.** NTFS drops a file's
+  alternate streams on `CREATE_ALWAYS`; doing the same here would silently erase
+  Finder tags and resource forks whenever a Windows application saved over a
+  file.
+* **Renaming the volume needs an elevated prompt.** The label is the export's
+  name on the server, as a Finder rename is, but Windows only lets an
+  administrator set a volume label at all.
+* **No server-side copy, sparse-range queries or exchange-data.** WinFsp passes
+  none of these to the file system; copies run through ordinary reads and
+  writes.
+* **Special nodes (FIFOs, devices) appear as ordinary files** and cannot be
+  created from Windows.
 * **One mount per mountpoint per session.** A second `quickfs mount Q:` is
   refused immediately, before any network work or password prompt.
 
@@ -235,13 +340,17 @@ and the architecture's DLL, so it also catches a failed or partial uninstall.
 
 **`WinFsp refused the mount with NTSTATUS 0xC0000035`**
 The mountpoint is already in use — by another quicKFS mount, another WinFsp
-filesystem, or a real drive. Pick another letter or use `*`.
+filesystem, or a real drive. Pick another letter or use `*`. A directory
+mountpoint must not exist yet; WinFsp creates it.
 
 **`WinFsp refused the mount with NTSTATUS 0xC0000034`**
 WinFsp's user-mode library is present but its kernel driver is not registered.
 This happens after an SDK-only extraction, or when the driver service was
-removed. Reinstall WinFsp with the Core feature; `sc query WinFsp` should report
-a registered service.
+removed. Reinstall WinFsp with the Core feature. WinFsp 2.x names its service
+`WinFsp+<install id>`; `sc query type= driver state= all | findstr WinFsp`
+should list it. If a reinstall only "reconfigures" an existing product without
+registering the driver, repair it with
+`msiexec /i winfsp-<version>.msi REINSTALL=ALL REINSTALLMODE=amus`.
 
 **`no quicKFS mount is active on Q: in this session`**
 The mount belongs to a different logon session — commonly, it was started from
@@ -267,6 +376,11 @@ The link dropped and reconnect attempts were exhausted. Reads that the offline
 cache can satisfy keep working; writes do not. The mount recovers on its own
 when the server is reachable again.
 
+**`mklink` reports that you do not have sufficient privilege**
+Windows itself refuses to create symbolic links for an account without
+Developer Mode or elevation, before the file system is asked. Links created on
+the server still appear and work.
+
 **A mount is slow to browse**
 Check `--cache-block-kib` and `--read-ahead-max-bytes` against the link's
 bandwidth-delay product. Directory listings and metadata are cached for one
@@ -283,4 +397,5 @@ administrator rights.
 
 Behaviour that only exists once a volume is mounted — the FSD's own caching,
 Explorer's call sequences, third-party applications — is covered by the manual
-plan in [Windows integration tests](windows-integration-tests.md).
+plan in [Windows integration tests](windows-integration-tests.md). The record of
+the run against a real Linux server is at the end of that plan.
