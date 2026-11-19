@@ -62,7 +62,7 @@ mod macos {
     use quickfs_client_core::{
         AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, MAX_CLIENT_READ_SIZE,
         ReconnectPolicy, RemoteFilesystem, ResilientFilesystem, ResilientFilesystemOptions,
-        ServerTrust, load_trusted_server_pin,
+        ServerTrust, load_trusted_server_pin, mount_helper,
     };
     use quickfs_filesystem_macfuse::{Adapter, MacFuseBackend, MountConfig, mount};
     use quickfs_transport_quic::load_certificates;
@@ -243,7 +243,7 @@ mod macos {
         identity_check.close();
 
         let password = if cli.password_stdin {
-            read_password_line(std::io::stdin().lock())?
+            mount_helper::read_password_line(std::io::stdin().lock())?
         } else {
             Zeroizing::new(rpassword::prompt_password("Password: ")?)
         };
@@ -272,10 +272,12 @@ mod macos {
             .context("username/password authentication failed")?;
         let resilient: Arc<dyn RemoteFilesystem> = Arc::new(resilient);
         if let Some(path) = cli.stats_file.clone() {
-            spawn_stats_writer(&runtime, Arc::clone(&resilient), path);
+            mount_helper::spawn_stats_writer(runtime.handle(), Arc::clone(&resilient), path);
         }
-        if cli.stats_on_request {
-            spawn_stats_responder(Arc::clone(&resilient));
+        if cli.stats_on_request
+            && let Err(error) = mount_helper::spawn_stats_responder(Arc::clone(&resilient))
+        {
+            note!("link statistics are unavailable: {error}");
         }
         if cli.exit_with_parent {
             spawn_parent_watch(&runtime);
@@ -386,165 +388,6 @@ mod macos {
         });
     }
 
-    /// Publish link statistics for the app once a second. Each snapshot is
-    /// written to a private temporary file and renamed into place, so a
-    /// reader never sees a partial document. Failures are ignored: telemetry
-    /// must never disturb the mount.
-    fn spawn_stats_writer(
-        runtime: &tokio::runtime::Runtime,
-        filesystem: Arc<dyn RemoteFilesystem>,
-        path: PathBuf,
-    ) {
-        let started = unix_millis();
-        runtime.spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
-                let snapshot = stats_snapshot(started, filesystem.link_stats());
-                let _ = write_private_atomically(&path, snapshot.to_string().as_bytes());
-            }
-        });
-    }
-
-    fn unix_millis() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis())
-            .unwrap_or(0)
-    }
-
-    fn stats_snapshot(
-        started_ms: u128,
-        link: Option<quickfs_client_core::LinkStats>,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "pid": std::process::id(),
-            "started_ms": started_ms,
-            "sampled_ms": unix_millis(),
-            "link": link,
-        })
-    }
-
-    /// Prefix of a `--stats-on-request` reply line, so the launcher can tell
-    /// replies apart from the banner and log lines sharing standard output.
-    const STATS_REPLY_PREFIX: &str = "quickfs-stats ";
-
-    /// Longest request line read whole; longer lines are discarded, so a
-    /// misbehaving parent cannot make the helper buffer unbounded input.
-    const MAX_REQUEST_LINE_BYTES: u64 = 256;
-
-    /// Serve `--stats-on-request` on a plain thread: standard input blocks,
-    /// and `link_stats` never waits, so neither touches the FUSE runtime.
-    fn spawn_stats_responder(filesystem: Arc<dyn RemoteFilesystem>) {
-        let started = unix_millis();
-        let spawned = std::thread::Builder::new()
-            .name("quickfs-stats".into())
-            .spawn(move || {
-                serve_stats_requests(std::io::stdin().lock(), std::io::stdout(), || {
-                    stats_snapshot(started, filesystem.link_stats())
-                });
-            });
-        if let Err(error) = spawned {
-            note!("link statistics are unavailable: {error}");
-        }
-    }
-
-    /// Reply to each `stats` request line until input ends or output fails.
-    /// Each reply is one `write_all` of a whole line, so it never interleaves
-    /// with the other writers of standard output.
-    fn serve_stats_requests(
-        mut input: impl std::io::BufRead,
-        mut output: impl std::io::Write,
-        snapshot: impl Fn() -> serde_json::Value,
-    ) {
-        use std::io::{BufRead as _, Read as _};
-
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            let read = (&mut input)
-                .take(MAX_REQUEST_LINE_BYTES)
-                .read_until(b'\n', &mut line);
-            match read {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-            if line.last() != Some(&b'\n') {
-                // Over-long line: drop the rest of it unread into memory.
-                if skip_line(&mut input).is_err() {
-                    return;
-                }
-                continue;
-            }
-            if line.trim_ascii() != b"stats" {
-                continue;
-            }
-            let reply = format!("{STATS_REPLY_PREFIX}{}\n", snapshot());
-            if output
-                .write_all(reply.as_bytes())
-                .and_then(|()| output.flush())
-                .is_err()
-            {
-                return;
-            }
-        }
-    }
-
-    fn skip_line(input: &mut impl std::io::BufRead) -> std::io::Result<()> {
-        loop {
-            let buffer = input.fill_buf()?;
-            if buffer.is_empty() {
-                return Ok(());
-            }
-            if let Some(end) = buffer.iter().position(|&byte| byte == b'\n') {
-                input.consume(end + 1);
-                return Ok(());
-            }
-            let length = buffer.len();
-            input.consume(length);
-        }
-    }
-
-    fn write_private_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        use std::{io::Write, os::unix::fs::OpenOptionsExt};
-        let temporary = path.with_extension("tmp");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        drop(file);
-        std::fs::rename(&temporary, path)
-    }
-
-    /// Longest accepted stdin password line, so a misbehaving parent cannot
-    /// make the mount buffer unbounded input before authenticating.
-    const MAX_STDIN_PASSWORD_BYTES: u64 = 4_096;
-
-    fn read_password_line(input: impl std::io::BufRead) -> Result<Zeroizing<String>> {
-        use std::io::BufRead;
-
-        let mut line = Zeroizing::new(Vec::new());
-        input
-            .take(MAX_STDIN_PASSWORD_BYTES + 1)
-            .read_until(b'\n', &mut line)
-            .context("failed to read the password from standard input")?;
-        if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_STDIN_PASSWORD_BYTES {
-            bail!("the standard-input password exceeds {MAX_STDIN_PASSWORD_BYTES} bytes");
-        }
-        while matches!(line.last(), Some(b'\n' | b'\r')) {
-            line.pop();
-        }
-        if line.is_empty() {
-            bail!("no password was supplied on standard input");
-        }
-        let text =
-            std::str::from_utf8(&line).context("the standard-input password is not valid UTF-8")?;
-        Ok(Zeroizing::new(text.to_owned()))
-    }
-
     fn validate_mountpoint(path: &Path) -> Result<PathBuf> {
         let canonical = path
             .canonicalize()
@@ -560,43 +403,6 @@ mod macos {
             Err("mount name must contain 1-255 characters and no commas".into())
         } else {
             Ok(value.to_owned())
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::unwrap_used)]
-    mod tests {
-        use super::{read_password_line, serve_stats_requests};
-
-        #[test]
-        fn stdin_password_strips_line_endings_and_rejects_empty_or_huge_input() {
-            assert_eq!(
-                read_password_line(&b"secret\r\nignored"[..])
-                    .unwrap()
-                    .as_str(),
-                "secret"
-            );
-            assert!(read_password_line(&b"\n"[..]).is_err());
-            assert!(read_password_line(&vec![b'a'; 5_000][..]).is_err());
-        }
-
-        #[test]
-        fn stats_requests_get_one_tagged_line_each_and_other_input_is_ignored() {
-            let mut input = b"stats\nhello\n".to_vec();
-            input.extend(vec![b'x'; 1_000]);
-            input.extend(b"stats\n \tstats\r\nstats");
-            let mut output = Vec::new();
-            let calls = std::cell::Cell::new(0);
-            serve_stats_requests(&input[..], &mut output, || {
-                calls.set(calls.get() + 1);
-                serde_json::json!({ "n": calls.get() })
-            });
-            // The over-long line swallows the "stats" glued to its end; the
-            // final unterminated request is incomplete and not answered.
-            assert_eq!(
-                String::from_utf8(output).unwrap(),
-                "quickfs-stats {\"n\":1}\nquickfs-stats {\"n\":2}\n"
-            );
         }
     }
 }

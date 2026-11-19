@@ -9,6 +9,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 mod cached;
+pub mod mount_helper;
 mod resilient;
 mod trust;
 pub use cached::{CachePolicy, CachedFilesystem, FilesystemCache};
