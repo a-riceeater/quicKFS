@@ -69,6 +69,10 @@ pub enum RemoteCommand {
         #[arg(long, default_value_t = false)]
         directory: bool,
     },
+    /// Create a symbolic link at `path` holding `target` verbatim.
+    Symlink { path: String, target: String },
+    /// Print a symbolic link's target.
+    Readlink { path: String },
     /// Rename or move a remote entry.
     Rename {
         source: String,
@@ -204,6 +208,21 @@ pub async fn run(
             filesystem
                 .remove_node(parent, name.into(), *directory)
                 .await?;
+        }
+        RemoteCommand::Symlink { path, target } => {
+            let (parent, name) = resolve_parent(filesystem, path).await?;
+            let metadata = filesystem
+                .create_symlink(parent, name.into(), target.as_bytes().to_vec())
+                .await?;
+            filesystem.sync_directory(parent).await?;
+            writeln!(output, "created link {:?}", metadata.node)?;
+        }
+        RemoteCommand::Readlink { path } => {
+            // Path resolution walks directory listings and never follows a
+            // link, so this names the link itself.
+            let node = resolve_path(filesystem, path).await?;
+            let target = filesystem.read_link(node).await?;
+            writeln!(output, "{}", String::from_utf8_lossy(&target))?;
         }
         RemoteCommand::Rename {
             source,
