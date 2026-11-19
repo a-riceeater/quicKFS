@@ -8,7 +8,9 @@
 //! the bridge creates a file under it; a name that is neither is refused rather
 //! than mangled into something the user did not choose.
 
-use crate::model::{BridgeError, BridgeResult, validate_name};
+#[cfg(not(unix))]
+use crate::model::BridgeError;
+use crate::model::{BridgeResult, validate_name};
 use quickfs_protocol::Name;
 use std::{ffi::OsStr, path::Path};
 
