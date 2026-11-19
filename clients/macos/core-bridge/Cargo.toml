@@ -4,11 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "C ABI over client-core for the native macOS app"
+description = "C ABI over client-core for the native quicKFS apps"
 
 [lib]
 name = "quickfs_core_bridge"
-crate-type = ["staticlib", "rlib"]
+# A static library for the macOS app; a DLL for a Windows app.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 futures.workspace = true
@@ -23,6 +24,10 @@ quickfs-client-core = { path = "../../../crates/client-core" }
 quickfs-macos-support = { path = "../../../crates/macos-support" }
 quickfs-protocol = { path = "../../../crates/protocol" }
 quickfs-transport-quic = { path = "../../../crates/transport-quic" }
+
+[target.'cfg(windows)'.dependencies]
+quickfs-common = { path = "../../../crates/common" }
+quickfs-windows-support = { path = "../../../crates/windows-support" }
 
 [dev-dependencies]
 async-trait.workspace = true

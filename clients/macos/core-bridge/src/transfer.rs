@@ -15,8 +15,9 @@
 //! download, the written prefix for an upload) so [`resume`] can continue it.
 
 use crate::{
-    model::{BridgeError, BridgeResult, validate_name},
+    model::{BridgeError, BridgeResult},
     pipeline::{Pipeline, Shape, Tuning},
+    platform::{SKIP_UNCREATABLE_SYMLINKS, create_local_symlink, local_name, mode_of, remote_name},
     session::{READ_WRITE, Session, lookup},
 };
 use futures::{StreamExt, future::BoxFuture, stream::FuturesOrdered};
@@ -900,7 +901,14 @@ pub async fn download(
                     filesystem.read_link(*node)
                 })
                 .await?;
-                create_local_symlink(&target, path)?;
+                match create_local_symlink(&target, path) {
+                    Ok(()) => {}
+                    Err(error) if SKIP_UNCREATABLE_SYMLINKS => progress.event(
+                        Level::Warning,
+                        format!("Skipped the link {}: {error}", path.display()),
+                    ),
+                    Err(error) => return Err(error),
+                }
             }
             Planned::File { node, path } => {
                 let shown = match path.strip_prefix(&destination) {
@@ -928,18 +936,6 @@ pub async fn download(
         }
         progress.step_done(index + 1);
     }
-    Ok(())
-}
-
-fn local_name(name: &Name) -> BridgeResult<&std::ffi::OsStr> {
-    use std::os::unix::ffi::OsStrExt;
-    validate_name(name.as_bytes())?;
-    Ok(std::ffi::OsStr::from_bytes(name.as_bytes()))
-}
-
-fn create_local_symlink(target: &[u8], path: &Path) -> BridgeResult<()> {
-    use std::os::unix::ffi::OsStrExt;
-    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), path)?;
     Ok(())
 }
 
@@ -1434,7 +1430,7 @@ pub async fn upload(
                             &tuning,
                             &progress,
                             remote,
-                            os_name(component.as_os_str())?,
+                            remote_name(component.as_os_str())?,
                             mode,
                         )
                         .await?;
@@ -1444,7 +1440,7 @@ pub async fn upload(
                 };
             }
         }
-        let file_name = os_name(
+        let file_name = remote_name(
             file.file_name()
                 .ok_or_else(|| BridgeError::invalid("upload file has no name"))?,
         )?;
@@ -1464,18 +1460,6 @@ pub async fn upload(
     }
     let _ = filesystem.sync_directory(parent).await;
     Ok(())
-}
-
-fn os_name(name: &std::ffi::OsStr) -> BridgeResult<Name> {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = name.as_bytes().to_vec();
-    validate_name(&bytes)?;
-    Ok(Name::new(bytes))
-}
-
-fn mode_of(metadata: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o7777
 }
 
 /// Create a directory, or use the one already there. Safe to retry: a create

@@ -13,6 +13,7 @@ mod cache;
 mod ffi;
 mod model;
 mod pipeline;
+mod platform;
 mod session;
 mod transfer;
 
@@ -253,13 +254,7 @@ async fn dispatch(
     request: Request,
 ) -> BridgeResult<Value> {
     match request {
-        Request::Environment => Ok(json!({
-            "macfuse_installed": quickfs_macos_support::macfuse_is_installed(),
-            "macfuse_install_url": quickfs_macos_support::MACFUSE_INSTALL_URL,
-            "max_client_read_size": MAX_CLIENT_READ_SIZE,
-            "max_client_write_size": MAX_CLIENT_WRITE_SIZE,
-            "core_version": env!("CARGO_PKG_VERSION"),
-        })),
+        Request::Environment => Ok(environment()),
         Request::Resolve { host } => resolve(&host).await,
         Request::TrustList { state_dir } => {
             let pins: Vec<Value> = TrustStore::open(&state_dir)?
@@ -453,13 +448,11 @@ async fn dispatch(
             let session = session::session(id)?;
             let name = match name {
                 Some(name) => session::parse_name(&name, None)?,
-                None => {
-                    use std::os::unix::ffi::OsStrExt;
-                    let file_name = source
+                None => platform::remote_name(
+                    source
                         .file_name()
-                        .ok_or_else(|| BridgeError::invalid("the upload source has no name"))?;
-                    quickfs_protocol::Name::new(file_name.as_bytes().to_vec())
-                }
+                        .ok_or_else(|| BridgeError::invalid("the upload source has no name"))?,
+                )?,
             };
             model::validate_name(name.as_bytes())?;
             let tuning = session.tuning;
@@ -505,6 +498,37 @@ async fn dispatch(
         Request::CacheUsage { cache_dir } => cache::usage(&cache_dir),
         Request::CacheClear { cache_dir } => cache::clear(&cache_dir),
     }
+}
+
+/// What the app needs to know about this machine before it offers to mount:
+/// which mount runtime the platform uses, whether it is installed, and where
+/// to get it. `mount_runtime` is the same shape on every platform; the
+/// `macfuse_*` keys are kept for the macOS app, which reads them by name.
+fn environment() -> Value {
+    #[cfg(windows)]
+    let (runtime, installed, url) = (
+        "WinFsp",
+        quickfs_windows_support::winfsp_available(),
+        quickfs_windows_support::WINFSP_INSTALL_URL,
+    );
+    #[cfg(not(windows))]
+    let (runtime, installed, url) = (
+        "macFUSE",
+        quickfs_macos_support::macfuse_is_installed(),
+        quickfs_macos_support::MACFUSE_INSTALL_URL,
+    );
+    let mut value = json!({
+        "platform": std::env::consts::OS,
+        "mount_runtime": { "name": runtime, "installed": installed, "install_url": url },
+        "max_client_read_size": MAX_CLIENT_READ_SIZE,
+        "max_client_write_size": MAX_CLIENT_WRITE_SIZE,
+        "core_version": env!("CARGO_PKG_VERSION"),
+    });
+    if !cfg!(windows) {
+        value["macfuse_installed"] = json!(installed);
+        value["macfuse_install_url"] = json!(url);
+    }
+    value
 }
 
 async fn pair(
