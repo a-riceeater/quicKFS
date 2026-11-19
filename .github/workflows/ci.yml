@@ -121,6 +121,8 @@ jobs:
           -p quickfs-windows-cli
           -p quickfs-filesystem-macfuse
           -p quickfs-client-cli
+          -p quickfs-client-commands
+          -p quickfs-core-bridge
           -- -D warnings
 
       # Same scope, and for the same reason: most server tests report
@@ -138,9 +140,11 @@ jobs:
           -p quickfs-windows-support
           -p quickfs-filesystem-winfsp
           -p quickfs-windows-cli
+          -p quickfs-client-commands
+          -p quickfs-core-bridge
 
-      - name: Build the Windows client
-        run: cargo build --release -p quickfs-windows-cli
+      - name: Build the Windows client and the app bridge DLL
+        run: cargo build --release -p quickfs-windows-cli -p quickfs-core-bridge
 
   macos:
     name: macOS CI

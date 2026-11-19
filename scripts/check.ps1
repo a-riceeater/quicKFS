@@ -30,6 +30,8 @@ cargo clippy --all-targets `
   -p quickfs-windows-cli `
   -p quickfs-filesystem-macfuse `
   -p quickfs-client-cli `
+  -p quickfs-client-commands `
+  -p quickfs-core-bridge `
   -- -D warnings
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -43,7 +45,9 @@ cargo test `
   -p quickfs-transport-quic `
   -p quickfs-windows-support `
   -p quickfs-filesystem-winfsp `
-  -p quickfs-windows-cli
+  -p quickfs-windows-cli `
+  -p quickfs-client-commands `
+  -p quickfs-core-bridge
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 cargo doc --workspace --no-deps
