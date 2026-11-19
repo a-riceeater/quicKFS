@@ -80,6 +80,12 @@ impl SecurityDescriptor {
     }
 
     pub(crate) fn from_ptr(ptr: PSECURITY_DESCRIPTOR) -> Self {
+        // quicKFS change: WinFsp passes a null descriptor to `Create` for a
+        // named stream, which streams inherit from their file. Upstream read
+        // its length anyway, crashing the file system on every stream create.
+        if ptr.is_null() {
+            return Self(Vec::new());
+        }
         let len = unsafe { GetSecurityDescriptorLength(ptr) as usize };
 
         Self::from_ptr_and_len(ptr, len)
