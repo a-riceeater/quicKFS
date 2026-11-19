@@ -7,8 +7,8 @@
 //!   mirroring `quickfs-macos-support`'s macFUSE check.
 //! * [`current_user_sid`] — the mounting account's SID, used to build the
 //!   security descriptors the WinFsp bridge presents for every node — and
-//!   [`granted_access`], which reads back what a descriptor Windows supplies
-//!   grants that account.
+//!   [`effective_access`], which asks Windows what a descriptor an application
+//!   supplies would grant that account.
 //! * [`UnmountSignal`] and [`signal_unmount`], the named event that lets
 //!   `quickfs unmount Q:` reach the process holding the mount.
 //! * [`ParentProcess`], which lets a mount started by an app unmount itself
@@ -29,7 +29,7 @@ mod windows;
 
 #[cfg(windows)]
 pub use windows::{
-    ParentProcess, UnmountSignal, create_private_directory, current_user_sid, granted_access,
+    ParentProcess, UnmountSignal, create_private_directory, current_user_sid, effective_access,
     harden_private_path, lock_file, signal_unmount, validate_private_owner,
     winfsp_install_directory, winfsp_is_installed,
 };

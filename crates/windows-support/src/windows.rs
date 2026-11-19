@@ -19,14 +19,15 @@ use windows_sys::Win32::{
         INVALID_HANDLE_VALUE, LocalFree, MAX_PATH, WAIT_OBJECT_0,
     },
     Security::{
-        ACL,
+        ACL, AccessCheck,
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
         },
-        DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorLength, IsValidSecurityDescriptor, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        DACL_SECURITY_INFORMATION, DuplicateToken, GENERIC_MAPPING, GetAce,
+        GetSecurityDescriptorControl, GetSecurityDescriptorLength, IsValidSecurityDescriptor,
+        OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SecurityImpersonation, TOKEN_DUPLICATE,
         TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
@@ -457,47 +458,28 @@ pub fn validate_private_owner(path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// The well-known `Everyone` SID, whose ACEs apply to every account.
-const EVERYONE_SID: &str = "S-1-1-0";
+/// The file rights the four generic rights stand for, as `AccessCheck` needs
+/// them spelled out.
+const FILE_GENERIC_MAPPING: GENERIC_MAPPING = GENERIC_MAPPING {
+    GenericRead: 0x0012_0089,
+    GenericWrite: 0x0012_0116,
+    GenericExecute: 0x0012_00A0,
+    GenericAll: 0x001F_01FF,
+};
 
-/// `ACCESS_DENIED_ACE_TYPE`.
-const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+/// `MAXIMUM_ALLOWED`: ask `AccessCheck` for everything the descriptor grants.
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 
-/// `INHERIT_ONLY_ACE`: an ACE that applies only to children, not this object.
-const INHERIT_ONLY_ACE: u8 = 0x08;
-
-/// Map the four generic rights onto the file rights they stand for.
-fn map_generic_file_rights(mask: u32) -> u32 {
-    const GENERIC_READ: u32 = 0x8000_0000;
-    const GENERIC_WRITE: u32 = 0x4000_0000;
-    const GENERIC_EXECUTE: u32 = 0x2000_0000;
-    const GENERIC_ALL: u32 = 0x1000_0000;
-    let mut mapped = mask & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
-    if mask & GENERIC_READ != 0 {
-        mapped |= 0x0012_0089;
-    }
-    if mask & GENERIC_WRITE != 0 {
-        mapped |= 0x0012_0116;
-    }
-    if mask & GENERIC_EXECUTE != 0 {
-        mapped |= 0x0012_00A0;
-    }
-    if mask & GENERIC_ALL != 0 {
-        mapped |= 0x001F_01FF;
-    }
-    mapped
-}
-
-/// The access a self-relative security descriptor's DACL grants `account`.
+/// The file rights a self-relative security descriptor grants the account
+/// running this process, evaluated by Windows itself.
 ///
-/// ACEs naming the account itself and `Everyone` are evaluated in order, as
-/// Windows evaluates them: an allow grants whatever an earlier deny has not
-/// already refused, and a deny refuses whatever an earlier allow has not
-/// already granted. ACEs for other trustees are ignored — the WinFsp bridge
-/// presents every node as owned by the mounting account and has nowhere to put
-/// rights for anybody else. Returns `None` for a descriptor with no DACL or a
-/// null DACL, which Windows treats as granting everything.
-pub fn granted_access(descriptor: &[u8], account: &str) -> Result<Option<u32>, WindowsError> {
+/// `AccessCheck` against this process's token accounts for everything the
+/// account is a member of — `Users`, `Authenticated Users`, `Everyone`, its own
+/// groups — and for allow and deny ordering, exactly as opening a file would.
+/// That matters because a descriptor copied from NTFS (`robocopy /COPYALL`)
+/// usually grants the user nothing by name and everything through a group;
+/// reading only ACEs that name the account would see no rights at all.
+pub fn effective_access(descriptor: &[u8]) -> Result<u32, WindowsError> {
     let invalid = WindowsError {
         operation: "IsValidSecurityDescriptor",
         code: windows_sys::Win32::Foundation::ERROR_INVALID_SECURITY_DESCR,
@@ -514,53 +496,51 @@ pub fn granted_access(descriptor: &[u8], account: &str) -> Result<Option<u32>, W
     {
         return Err(invalid);
     }
-    let mut present = 0;
-    let mut defaulted = 0;
-    let mut dacl: *mut ACL = ptr::null_mut();
-    // SAFETY: `pointer` is a valid descriptor and the out-parameters are
-    // valid; `dacl` points into `descriptor`.
-    if unsafe { GetSecurityDescriptorDacl(pointer, &mut present, &mut dacl, &mut defaulted) } == 0 {
-        return Err(last_error("GetSecurityDescriptorDacl"));
+
+    let mut process_token: HANDLE = ptr::null_mut();
+    // SAFETY: the pseudo-handle needs no closing; the out-parameter is valid.
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut process_token,
+        )
+    } == 0
+    {
+        return Err(last_error("OpenProcessToken"));
     }
-    if present == 0 || dacl.is_null() {
-        return Ok(None);
+    let process_token = OwnedHandle(process_token);
+    // `AccessCheck` needs an impersonation token, not a primary one.
+    let mut token: HANDLE = ptr::null_mut();
+    // SAFETY: `process_token` was opened with `TOKEN_DUPLICATE` above.
+    if unsafe { DuplicateToken(process_token.0, SecurityImpersonation, &mut token) } == 0 {
+        return Err(last_error("DuplicateToken"));
     }
+    let token = OwnedHandle(token);
+
+    // SAFETY: `PRIVILEGE_SET` is plain data; all-zero is a valid empty set.
+    let mut privileges: PRIVILEGE_SET = unsafe { std::mem::zeroed() };
+    let mut privileges_length = std::mem::size_of::<PRIVILEGE_SET>() as u32;
     let mut granted = 0u32;
-    let mut denied = 0u32;
-    // SAFETY: `dacl` points into the live descriptor.
-    let count = unsafe { (*dacl).AceCount } as u32;
-    for index in 0..count {
-        let mut ace: *mut c_void = ptr::null_mut();
-        // SAFETY: `index` is below the ACE count reported by the same ACL.
-        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
-            return Err(last_error("GetAce"));
-        }
-        // SAFETY: `ace` points at an `ACE_HEADER` inside the live ACL.
-        let header = unsafe { *ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
-        if header.AceFlags & INHERIT_ONLY_ACE != 0
-            || (header.AceType != ACCESS_ALLOWED_ACE_TYPE
-                && header.AceType != ACCESS_DENIED_ACE_TYPE)
-        {
-            continue;
-        }
-        // SAFETY: allow and deny ACEs share the `ACCESS_ALLOWED_ACE` layout:
-        // header, mask, then the trustee SID starting at `SidStart`.
-        let (mask, trustee) = unsafe {
-            let typed = ace.cast::<windows_sys::Win32::Security::ACCESS_ALLOWED_ACE>();
-            ((*typed).Mask, ptr::addr_of!((*typed).SidStart) as PSID)
-        };
-        let trustee = sid_to_string(trustee)?;
-        if trustee != account && trustee != EVERYONE_SID {
-            continue;
-        }
-        let mask = map_generic_file_rights(mask);
-        if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
-            granted |= mask & !denied;
-        } else {
-            denied |= mask & !granted;
-        }
+    let mut allowed = 0;
+    // SAFETY: every pointer names a live local of the right type for the
+    // duration of the call; `pointer` was validated above.
+    let checked = unsafe {
+        AccessCheck(
+            pointer,
+            token.0,
+            MAXIMUM_ALLOWED,
+            &FILE_GENERIC_MAPPING,
+            &mut privileges,
+            &mut privileges_length,
+            &mut granted,
+            &mut allowed,
+        )
+    };
+    if checked == 0 {
+        return Err(last_error("AccessCheck"));
     }
-    Ok(Some(granted))
+    Ok(if allowed == 0 { 0 } else { granted })
 }
 
 /// Take an exclusive, non-blocking lock on the whole of `file`.
@@ -805,29 +785,41 @@ mod tests {
     }
 
     #[test]
-    fn granted_access_follows_allow_and_deny_aces_in_order() {
-        let me = "S-1-5-21-1-2-3-1001";
+    fn effective_access_is_what_windows_would_grant_this_account() {
+        let me = current_user_sid().unwrap();
         let other = "S-1-5-21-1-2-3-1002";
-        // Read and execute for the account; everything for someone else.
-        let bytes = descriptor_bytes(&format!("O:{me}D:P(A;;0x1200a9;;;{me})(A;;FA;;;{other})"));
-        assert_eq!(granted_access(&bytes, me).unwrap(), Some(0x0012_00A9));
+        const READ_DATA: u32 = 0x1;
+        const WRITE_DATA: u32 = 0x2;
+        const EXECUTE: u32 = 0x20;
 
-        // A deny before an allow wins; generic rights are mapped.
-        let bytes = descriptor_bytes(&format!("O:{me}D:P(D;;FW;;;{me})(A;;GA;;;{me})"));
-        let granted = granted_access(&bytes, me).unwrap().unwrap();
-        assert_eq!(granted & 0x2, 0, "write data stays denied");
-        assert_ne!(granted & 0x1, 0, "read data is granted");
+        // Read and execute by name; everything for someone else.
+        let bytes = descriptor_bytes(&format!(
+            "O:{me}G:{me}D:P(A;;0x1200a9;;;{me})(A;;FA;;;{other})"
+        ));
+        let granted = effective_access(&bytes).unwrap();
+        assert_ne!(granted & READ_DATA, 0);
+        assert_ne!(granted & EXECUTE, 0);
+        assert_eq!(granted & WRITE_DATA, 0);
 
-        // Everyone applies to the account too; inherit-only ACEs do not.
-        let bytes = descriptor_bytes(&format!("O:{me}D:P(A;;FR;;;WD)(A;IO;FA;;;{me})"));
-        assert_eq!(granted_access(&bytes, me).unwrap(), Some(0x0012_0089));
+        // Rights through a group the account belongs to count — this is what
+        // a DACL copied from NTFS looks like.
+        let bytes = descriptor_bytes(&format!("O:{me}G:{me}D:P(A;;FA;;;AU)"));
+        assert_ne!(effective_access(&bytes).unwrap() & WRITE_DATA, 0);
 
-        // No DACL at all means unrestricted.
+        // A deny before an allow wins.
+        let bytes = descriptor_bytes(&format!("O:{me}G:{me}D:P(D;;FW;;;{me})(A;;FA;;;{me})"));
+        let granted = effective_access(&bytes).unwrap();
+        assert_eq!(granted & WRITE_DATA, 0);
+        assert_ne!(granted & READ_DATA, 0);
+
+        // Nothing granted to this account at all.
+        let bytes = descriptor_bytes(&format!("O:{me}G:{me}D:P(A;;FA;;;{other})"));
         assert_eq!(
-            granted_access(&descriptor_bytes(&format!("O:{me}")), me).unwrap(),
-            None
+            effective_access(&bytes).unwrap() & (READ_DATA | WRITE_DATA | EXECUTE),
+            0
         );
-        assert!(granted_access(&[0; 8], me).is_err());
+
+        assert!(effective_access(&[0; 8]).is_err());
     }
 
     #[test]
