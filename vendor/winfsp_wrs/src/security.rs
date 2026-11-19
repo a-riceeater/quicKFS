@@ -43,6 +43,13 @@ impl PSecurityDescriptor {
         self.ptr
     }
 
+    /// quicKFS change: an owned copy of the descriptor, or `None` when WinFsp
+    /// passed none. Uses only `GetSecurityDescriptorLength`, so a file system
+    /// can inspect a `SetSecurity` request without calling into the WinFsp DLL.
+    pub fn to_descriptor(&self) -> Option<SecurityDescriptor> {
+        (!self.ptr.is_null()).then(|| SecurityDescriptor::from_ptr(self.ptr))
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }

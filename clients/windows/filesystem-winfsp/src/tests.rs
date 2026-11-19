@@ -1538,3 +1538,89 @@ fn a_stored_name_containing_a_colon_still_opens_as_that_file() {
     assert_eq!(&buffer[..read], b"linux");
     harness.close(handle);
 }
+
+#[test]
+fn renaming_the_volume_renames_the_export_and_the_label() {
+    let harness = Harness::empty();
+    let info = harness
+        .filesystem
+        .set_volume_label(&wide("Photos"))
+        .unwrap();
+    assert_eq!(info.volume_label().to_string().unwrap(), "Photos");
+    assert_eq!(harness.server.volume_name().as_deref(), Some("Photos"));
+    assert_eq!(
+        harness
+            .filesystem
+            .get_volume_info()
+            .unwrap()
+            .volume_label()
+            .to_string()
+            .unwrap(),
+        "Photos"
+    );
+    // A label Windows cannot store is refused, not truncated.
+    assert_eq!(
+        harness
+            .filesystem
+            .set_volume_label(&wide(&"x".repeat(33)))
+            .err(),
+        Some(status::STATUS_INVALID_VOLUME_LABEL)
+    );
+}
+
+/// A harness mounted as the account running the tests, which is the account
+/// `AccessCheck` evaluates a supplied descriptor for.
+fn as_this_account() -> Harness {
+    let server = MockFilesystem::tree();
+    let adapter = adapter_for(Arc::clone(&server));
+    let capabilities = adapter.probe_capabilities().unwrap();
+    let filesystem = WindowsFilesystem::new(
+        adapter,
+        capabilities,
+        "quickfs-test",
+        quickfs_windows_support::current_user_sid().unwrap(),
+    )
+    .unwrap();
+    Harness { filesystem, server }
+}
+
+fn mode_of(harness: &Harness, components: &[&str]) -> u32 {
+    harness
+        .server
+        .mode(node(&harness.server, components))
+        .unwrap()
+}
+
+#[test]
+fn setting_a_dacl_changes_only_the_owners_mode_bits() {
+    let harness = as_this_account();
+    let me = quickfs_windows_support::current_user_sid().unwrap();
+    assert_eq!(mode_of(&harness, &["readme.md"]) & 0o777, 0o644);
+
+    let handle = harness.open("\\readme.md", Harness::read_write());
+    let read_only =
+        SecurityDescriptor::from_wstr(&wide(&format!("O:{me}G:{me}D:P(A;;FR;;;{me})"))).unwrap();
+    harness
+        .filesystem
+        .set_security(handle.clone(), 0x4, read_only.as_ptr())
+        .unwrap();
+    assert_eq!(mode_of(&harness, &["readme.md"]) & 0o777, 0o444);
+
+    // Rights through a group count: a DACL copied from NTFS often names the
+    // user nowhere and grants everything to Authenticated Users.
+    let through_group =
+        SecurityDescriptor::from_wstr(&wide(&format!("O:{me}G:{me}D:P(A;;FA;;;AU)"))).unwrap();
+    harness
+        .filesystem
+        .set_security(handle.clone(), 0x4, through_group.as_ptr())
+        .unwrap();
+    assert_eq!(mode_of(&harness, &["readme.md"]) & 0o777, 0o744);
+
+    // An owner-only change has nothing to change and is accepted.
+    harness
+        .filesystem
+        .set_security(handle.clone(), 0x1, read_only.as_ptr())
+        .unwrap();
+    assert_eq!(mode_of(&harness, &["readme.md"]) & 0o777, 0o744);
+    harness.close(handle);
+}

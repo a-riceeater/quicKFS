@@ -124,6 +124,27 @@ pub fn apply_readonly(mode: u32, readonly: bool) -> Option<u32> {
     (updated != mode).then_some(updated)
 }
 
+/// The mode a node should have once Windows has set a DACL granting the mount
+/// owner `granted`: the owner's read, write and execute bits follow
+/// `FILE_READ_DATA`, `FILE_WRITE_DATA` and `FILE_EXECUTE`, and every other bit
+/// — group, other, set-id, sticky — is left exactly as it was.
+pub fn apply_owner_access(mode: u32, granted: u32) -> u32 {
+    const READ_DATA: u32 = 0x1;
+    const WRITE_DATA: u32 = 0x2;
+    const EXECUTE: u32 = 0x20;
+    let mut owner = 0;
+    if granted & READ_DATA != 0 {
+        owner |= 0o400;
+    }
+    if granted & WRITE_DATA != 0 {
+        owner |= OWNER_WRITE;
+    }
+    if granted & EXECUTE != 0 {
+        owner |= 0o100;
+    }
+    (mode & !0o700) | owner
+}
+
 /// The `GENERIC`-equivalent access mask an account should be granted for a node
 /// with this mode, in the numeric form SDDL accepts.
 ///
@@ -172,6 +193,16 @@ pub fn allocation_size(size: u64, unit: u64) -> u64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dacl_sets_only_the_owner_bits() {
+        // Read only: write and execute go, group and other stay.
+        assert_eq!(apply_owner_access(0o4755, 0x0012_0089), 0o4455);
+        // Full control.
+        assert_eq!(apply_owner_access(0o044, 0x001F_01FF), 0o744);
+        // Nothing at all.
+        assert_eq!(apply_owner_access(0o640, 0), 0o040);
+    }
 
     #[test]
     fn the_unix_epoch_is_the_windows_epoch_offset() {

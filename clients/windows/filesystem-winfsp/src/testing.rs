@@ -141,6 +141,7 @@ pub struct Traffic {
 /// A small, real, in-memory filesystem.
 pub struct MockFilesystem {
     state: Mutex<State>,
+    volume_name: Mutex<Option<String>>,
     capabilities: FilesystemCapabilities,
     directory_listings: AtomicUsize,
     metadata_fetches: AtomicUsize,
@@ -160,6 +161,7 @@ impl MockFilesystem {
                 handles: HashMap::new(),
             }),
             capabilities: writable_capabilities(),
+            volume_name: Mutex::new(None),
             directory_listings: AtomicUsize::new(0),
             metadata_fetches: AtomicUsize::new(0),
             opens: AtomicUsize::new(0),
@@ -236,6 +238,22 @@ impl MockFilesystem {
             .xattrs
             .get(&Name::from(name.to_owned()))
             .cloned()
+    }
+
+    /// The mode stored for a node.
+    pub fn mode(&self, node: NodeId) -> Option<u32> {
+        #[allow(clippy::expect_used)]
+        let state = self.state.lock().expect("test state must not be poisoned");
+        state.nodes.get(&node).map(|node| node.mode)
+    }
+
+    /// The export name a client last set, if any.
+    pub fn volume_name(&self) -> Option<String> {
+        #[allow(clippy::expect_used)]
+        self.volume_name
+            .lock()
+            .expect("test state must not be poisoned")
+            .clone()
     }
 
     /// The kind stored for a node.
@@ -334,7 +352,7 @@ fn writable_capabilities() -> FilesystemCapabilities {
         supports_poll: false,
         supports_bmap: false,
         supports_exchange_data: false,
-        supports_volume_rename: false,
+        supports_volume_rename: true,
         supports_backup_time: false,
         supports_readdirplus: true,
         persistent_node_ids: true,
@@ -660,6 +678,16 @@ impl RemoteFilesystem for MockFilesystem {
             .remove(&name)
             .map(|_| ())
             .ok_or_else(|| server(ErrorCode::NoAttribute, "no such attribute"))
+    }
+
+    async fn set_volume_name(&self, name: Name) -> ClientResult<()> {
+        let text = String::from_utf8(name.as_bytes().to_vec())
+            .map_err(|_| server(ErrorCode::InvalidRequest, "name is not UTF-8"))?;
+        *self
+            .volume_name
+            .lock()
+            .map_err(|_| server(ErrorCode::Internal, "test state poisoned"))? = Some(text);
+        Ok(())
     }
 
     async fn read_link(&self, node: NodeId) -> ClientResult<Vec<u8>> {

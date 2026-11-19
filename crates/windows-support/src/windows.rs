@@ -22,13 +22,15 @@ use windows_sys::Win32::{
         ACL, AccessCheck,
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-            GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+            ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
         },
         DACL_SECURITY_INFORMATION, DuplicateToken, GENERIC_MAPPING, GetAce,
-        GetSecurityDescriptorControl, GetSecurityDescriptorLength, IsValidSecurityDescriptor,
-        OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SecurityImpersonation, TOKEN_DUPLICATE,
-        TOKEN_QUERY, TOKEN_USER, TokenUser,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorLength,
+        InitializeSecurityDescriptor, IsValidSecurityDescriptor, OWNER_SECURITY_INFORMATION,
+        PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SecurityImpersonation, SetSecurityDescriptorDacl,
+        SetSecurityDescriptorGroup, SetSecurityDescriptorOwner, TOKEN_DUPLICATE, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
         CreateDirectoryW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
@@ -467,19 +469,28 @@ const FILE_GENERIC_MAPPING: GENERIC_MAPPING = GENERIC_MAPPING {
     GenericAll: 0x001F_01FF,
 };
 
+/// `SECURITY_DESCRIPTOR_REVISION`, the only revision Windows defines.
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
 /// `MAXIMUM_ALLOWED`: ask `AccessCheck` for everything the descriptor grants.
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 
-/// The file rights a self-relative security descriptor grants the account
-/// running this process, evaluated by Windows itself.
+/// The file rights the DACL of a self-relative security descriptor grants the
+/// account running this process, with `owner` as the object's owner and group,
+/// evaluated by Windows itself.
+///
+/// Only the descriptor's DACL is used; owner and group come from `owner`,
+/// because that is who every node on a quicKFS mount is presented as owned by,
+/// and because a `SetSecurity` request often carries a DACL alone.
 ///
 /// `AccessCheck` against this process's token accounts for everything the
 /// account is a member of — `Users`, `Authenticated Users`, `Everyone`, its own
 /// groups — and for allow and deny ordering, exactly as opening a file would.
 /// That matters because a descriptor copied from NTFS (`robocopy /COPYALL`)
 /// usually grants the user nothing by name and everything through a group;
-/// reading only ACEs that name the account would see no rights at all.
-pub fn effective_access(descriptor: &[u8]) -> Result<u32, WindowsError> {
+/// reading only ACEs that name the account would see no rights at all. A
+/// missing or null DACL grants everything.
+pub fn effective_access(descriptor: &[u8], owner: &str) -> Result<u32, WindowsError> {
     let invalid = WindowsError {
         operation: "IsValidSecurityDescriptor",
         code: windows_sys::Win32::Foundation::ERROR_INVALID_SECURITY_DESCR,
@@ -487,14 +498,48 @@ pub fn effective_access(descriptor: &[u8]) -> Result<u32, WindowsError> {
     if descriptor.len() < 20 {
         return Err(invalid);
     }
-    let pointer = descriptor.as_ptr().cast_mut().cast::<c_void>() as PSECURITY_DESCRIPTOR;
+    let supplied = descriptor.as_ptr().cast_mut().cast::<c_void>() as PSECURITY_DESCRIPTOR;
     // SAFETY: `descriptor` is at least a minimal descriptor header long and
     // stays borrowed for this whole function. Validity and the length the
     // descriptor claims are both checked before anything walks it.
-    if unsafe { IsValidSecurityDescriptor(pointer) } == 0
-        || unsafe { GetSecurityDescriptorLength(pointer) } as usize > descriptor.len()
+    if unsafe { IsValidSecurityDescriptor(supplied) } == 0
+        || unsafe { GetSecurityDescriptorLength(supplied) } as usize > descriptor.len()
     {
         return Err(invalid);
+    }
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl: *mut ACL = ptr::null_mut();
+    // SAFETY: `supplied` is valid; `dacl` will point into `descriptor`.
+    if unsafe { GetSecurityDescriptorDacl(supplied, &mut present, &mut dacl, &mut defaulted) } == 0
+    {
+        return Err(last_error("GetSecurityDescriptorDacl"));
+    }
+
+    let owner_text = wide(owner);
+    let mut owner_sid: PSID = ptr::null_mut();
+    // SAFETY: `owner_text` is NUL-terminated; the SID is released below.
+    if unsafe { ConvertStringSidToSidW(owner_text.as_ptr(), &mut owner_sid) } == 0 {
+        return Err(last_error("ConvertStringSidToSidW"));
+    }
+    let owner_sid = LocalSid(owner_sid);
+
+    // An absolute descriptor pointing at the owner SID and the supplied DACL,
+    // both of which outlive it.
+    // SAFETY: `SECURITY_DESCRIPTOR` is plain data; it is initialised next.
+    let mut absolute: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let target =
+        (&mut absolute as *mut SECURITY_DESCRIPTOR).cast::<c_void>() as PSECURITY_DESCRIPTOR;
+    // SAFETY: `target` is a live, writable `SECURITY_DESCRIPTOR`; every SID and
+    // ACL attached to it stays alive until after `AccessCheck` returns.
+    unsafe {
+        if InitializeSecurityDescriptor(target, SECURITY_DESCRIPTOR_REVISION) == 0
+            || SetSecurityDescriptorOwner(target, owner_sid.0, 0) == 0
+            || SetSecurityDescriptorGroup(target, owner_sid.0, 0) == 0
+            || SetSecurityDescriptorDacl(target, present, dacl, 0) == 0
+        {
+            return Err(last_error("InitializeSecurityDescriptor"));
+        }
     }
 
     let mut process_token: HANDLE = ptr::null_mut();
@@ -524,10 +569,10 @@ pub fn effective_access(descriptor: &[u8]) -> Result<u32, WindowsError> {
     let mut granted = 0u32;
     let mut allowed = 0;
     // SAFETY: every pointer names a live local of the right type for the
-    // duration of the call; `pointer` was validated above.
+    // duration of the call; `target` was initialised above.
     let checked = unsafe {
         AccessCheck(
-            pointer,
+            target,
             token.0,
             MAXIMUM_ALLOWED,
             &FILE_GENERIC_MAPPING,
@@ -541,6 +586,19 @@ pub fn effective_access(descriptor: &[u8]) -> Result<u32, WindowsError> {
         return Err(last_error("AccessCheck"));
     }
     Ok(if allowed == 0 { 0 } else { granted })
+}
+
+/// A SID allocated by `ConvertStringSidToSidW`, released with `LocalFree`.
+struct LocalSid(PSID);
+
+impl Drop for LocalSid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the SID came from `ConvertStringSidToSidW` and is freed
+            // exactly once.
+            unsafe { LocalFree(self.0 as HLOCAL) };
+        }
+    }
 }
 
 /// Take an exclusive, non-blocking lock on the whole of `file`.
@@ -796,7 +854,7 @@ mod tests {
         let bytes = descriptor_bytes(&format!(
             "O:{me}G:{me}D:P(A;;0x1200a9;;;{me})(A;;FA;;;{other})"
         ));
-        let granted = effective_access(&bytes).unwrap();
+        let granted = effective_access(&bytes, &me).unwrap();
         assert_ne!(granted & READ_DATA, 0);
         assert_ne!(granted & EXECUTE, 0);
         assert_eq!(granted & WRITE_DATA, 0);
@@ -804,22 +862,28 @@ mod tests {
         // Rights through a group the account belongs to count — this is what
         // a DACL copied from NTFS looks like.
         let bytes = descriptor_bytes(&format!("O:{me}G:{me}D:P(A;;FA;;;AU)"));
-        assert_ne!(effective_access(&bytes).unwrap() & WRITE_DATA, 0);
+        assert_ne!(effective_access(&bytes, &me).unwrap() & WRITE_DATA, 0);
 
         // A deny before an allow wins.
         let bytes = descriptor_bytes(&format!("O:{me}G:{me}D:P(D;;FW;;;{me})(A;;FA;;;{me})"));
-        let granted = effective_access(&bytes).unwrap();
+        let granted = effective_access(&bytes, &me).unwrap();
         assert_eq!(granted & WRITE_DATA, 0);
         assert_ne!(granted & READ_DATA, 0);
 
         // Nothing granted to this account at all.
         let bytes = descriptor_bytes(&format!("O:{me}G:{me}D:P(A;;FA;;;{other})"));
         assert_eq!(
-            effective_access(&bytes).unwrap() & (READ_DATA | WRITE_DATA | EXECUTE),
+            effective_access(&bytes, &me).unwrap() & (READ_DATA | WRITE_DATA | EXECUTE),
             0
         );
 
-        assert!(effective_access(&[0; 8]).is_err());
+        // A DACL on its own, as a `SetSecurity` request often carries it.
+        let bytes = descriptor_bytes(&format!("D:P(A;;FR;;;{me})"));
+        let granted = effective_access(&bytes, &me).unwrap();
+        assert_ne!(granted & READ_DATA, 0);
+        assert_eq!(granted & WRITE_DATA, 0);
+
+        assert!(effective_access(&[0; 8], &me).is_err());
     }
 
     #[test]

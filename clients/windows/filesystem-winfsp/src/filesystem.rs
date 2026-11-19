@@ -55,6 +55,9 @@ use winfsp_wrs::{
 mod stream_ops;
 use stream_ops::OpenStream;
 
+/// `DACL_SECURITY_INFORMATION`.
+const DACL_SECURITY_INFORMATION: u32 = 0x4;
+
 /// Bytes per allocation unit reported to Windows. One sector, which is what a
 /// modern NTFS volume reports and what Explorer divides by to show "size on
 /// disk".
@@ -208,6 +211,23 @@ struct SecurityDescriptors {
 }
 
 impl SecurityDescriptors {
+    /// A fresh, owned copy of the descriptor for this mode and kind.
+    fn owned(&self, mode: u32, kind: NodeKind) -> Result<SecurityDescriptor, NtStatus> {
+        let mask = attributes::access_mask(mode, kind);
+        let sid = &self.sid;
+        // `D:P` protects the DACL so nothing is inherited from the volume, and
+        // the single ACE names only the mounting account: no `Everyone`, no
+        // approximation of the POSIX group and other bits onto trustees the
+        // user did not choose.
+        let sddl = if mask == 0 {
+            format!("O:{sid}G:{sid}D:P")
+        } else {
+            format!("O:{sid}G:{sid}D:P(A;OICI;0x{mask:x};;;{sid})")
+        };
+        let text = U16CString::from_str(&sddl).map_err(|_| status::STATUS_INVALID_PARAMETER)?;
+        SecurityDescriptor::from_wstr(&text).map_err(|_| status::STATUS_IO_DEVICE_ERROR)
+    }
+
     fn new(sid: String) -> Self {
         Self {
             sid,
@@ -224,19 +244,7 @@ impl SecurityDescriptors {
         if let Some(descriptor) = cache.get(&mask) {
             return Ok(descriptor.as_ptr());
         }
-        let sid = &self.sid;
-        // `D:P` protects the DACL so nothing is inherited from the volume, and
-        // the single ACE names only the mounting account: no `Everyone`, no
-        // approximation of the POSIX group and other bits onto trustees the
-        // user did not choose.
-        let sddl = if mask == 0 {
-            format!("O:{sid}G:{sid}D:P")
-        } else {
-            format!("O:{sid}G:{sid}D:P(A;OICI;0x{mask:x};;;{sid})")
-        };
-        let text = U16CString::from_str(&sddl).map_err(|_| status::STATUS_INVALID_PARAMETER)?;
-        let descriptor =
-            SecurityDescriptor::from_wstr(&text).map_err(|_| status::STATUS_IO_DEVICE_ERROR)?;
+        let descriptor = self.owned(mode, kind)?;
         let descriptor: &'static SecurityDescriptor = Box::leak(Box::new(descriptor));
         cache.insert(mask, descriptor);
         Ok(descriptor.as_ptr())
@@ -251,7 +259,7 @@ pub struct WindowsFilesystem {
     /// Windows needs to know to present it as a directory link.
     link_kinds: Mutex<HashMap<(NodeId, u64), bool>>,
     capabilities: FilesystemCapabilities,
-    volume_label: U16CString,
+    volume_label: Mutex<U16CString>,
 }
 
 impl WindowsFilesystem {
@@ -268,7 +276,7 @@ impl WindowsFilesystem {
             security: SecurityDescriptors::new(owner_sid),
             link_kinds: Mutex::new(HashMap::new()),
             capabilities,
-            volume_label,
+            volume_label: Mutex::new(volume_label),
         })
     }
 
@@ -588,6 +596,8 @@ impl FileSystemInterface for WindowsFilesystem {
     const DELETE_REPARSE_POINT_DEFINED: bool = true;
     const RESOLVE_REPARSE_POINTS_DEFINED: bool = true;
     const GET_STREAM_INFO_DEFINED: bool = true;
+    const SET_VOLUME_LABEL_DEFINED: bool = true;
+    const SET_SECURITY_DEFINED: bool = true;
 
     fn get_volume_info(&self) -> Result<VolumeInfo, NtStatus> {
         let statistics = self
@@ -596,12 +606,13 @@ impl FileSystemInterface for WindowsFilesystem {
         let block = u64::from(statistics.block_size.max(1));
         let total = statistics.blocks.saturating_mul(block);
         let free = statistics.blocks_available.saturating_mul(block);
-        VolumeInfo::new(
-            total,
-            free,
-            U16Str::from_slice(self.volume_label.as_slice()),
-        )
-        .map_err(|_| status::STATUS_INVALID_PARAMETER)
+        let label = self
+            .volume_label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        VolumeInfo::new(total, free, U16Str::from_slice(label.as_slice()))
+            .map_err(|_| status::STATUS_INVALID_PARAMETER)
     }
 
     fn get_security_by_name(
@@ -1281,6 +1292,77 @@ impl FileSystemInterface for WindowsFilesystem {
         );
         self.resolver.release(result.inode);
         Ok(info)
+    }
+
+    fn set_volume_label(&self, volume_label: &U16CStr) -> Result<VolumeInfo, NtStatus> {
+        if !self.capabilities.writable {
+            return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        let label = volume_label
+            .to_string()
+            .map_err(|_| status::STATUS_INVALID_VOLUME_LABEL)?;
+        if !crate::mount::is_usable_volume_name(&label) {
+            return Err(status::STATUS_INVALID_VOLUME_LABEL);
+        }
+        // The label is the export's name on the server, as a Finder rename is
+        // on macOS, so the next mount — from either client — shows it too.
+        self.block_on(
+            self.adapter()
+                .set_volume_name_async(Name::from(label.clone())),
+        )
+        .map_err(adapter_status)?;
+        let stored =
+            U16CString::from_str(&label).map_err(|_| status::STATUS_INVALID_VOLUME_LABEL)?;
+        *self
+            .volume_label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stored;
+        self.get_volume_info()
+    }
+
+    fn set_security(
+        &self,
+        context: Self::FileContext,
+        security_information: u32,
+        modification_descriptor: PSecurityDescriptor,
+    ) -> Result<(), NtStatus> {
+        let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
+        if !self.capabilities.writable {
+            return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        // Only the DACL means anything here. Every node is presented as owned
+        // by the mounting account, so an owner or group change has nothing to
+        // change; it is accepted rather than refused so ACL-copying tools
+        // (`robocopy /COPYALL`, `icacls /restore`) keep working.
+        if security_information & DACL_SECURITY_INFORMATION == 0 {
+            return Ok(());
+        }
+        let metadata = self
+            .block_on(self.adapter().getattr_async(context.inode()))
+            .map_err(adapter_status)?;
+        // The supplied DACL replaces the node's, so it alone decides the new
+        // owner bits. Reading it needs no call into WinFsp, which keeps this
+        // testable on a machine without WinFsp installed.
+        let modification = modification_descriptor
+            .to_descriptor()
+            .ok_or(status::STATUS_INVALID_SECURITY_DESCR)?;
+        let granted =
+            quickfs_windows_support::effective_access(modification.as_bytes(), &self.security.sid)
+                .map_err(|_| status::STATUS_INVALID_SECURITY_DESCR)?;
+        let mode = attributes::apply_owner_access(metadata.mode, granted);
+        if mode == metadata.mode {
+            return Ok(());
+        }
+        let changes = AttributeChanges {
+            size: None,
+            mode: Some(mode),
+            accessed_unix_ms: None,
+            modified_unix_ms: None,
+            backup_unix_ms: None,
+        };
+        self.block_on(self.adapter().setattr_async(context.inode(), None, changes))
+            .map_err(adapter_status)?;
+        Ok(())
     }
 
     fn get_stream_info(
