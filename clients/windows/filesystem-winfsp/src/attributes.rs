@@ -163,8 +163,15 @@ pub fn access_mask(mode: u32, kind: NodeKind) -> u32 {
     const WRITE: u32 = 0x0012_0116;
     const EXECUTE: u32 = 0x0012_00A0;
     const DELETE: u32 = 0x0001_0000;
+    // What the owner of a Unix file may always do whatever its mode says:
+    // stat it, chmod it, and set its times. On Windows that is reading and
+    // writing attributes, reading the descriptor, and waiting on the handle.
+    // Without `FILE_WRITE_ATTRIBUTES` a file made read-only could never be
+    // made writable again — NTFS likewise lets attributes change on a
+    // read-only file.
+    const OWNER_ALWAYS: u32 = 0x0012_0180;
 
-    let mut mask = 0;
+    let mut mask = OWNER_ALWAYS;
     if mode & 0o400 != 0 {
         mask |= READ;
     }
@@ -306,7 +313,15 @@ mod tests {
 
         assert_ne!(full & 0x0002, 0, "writable nodes carry FILE_WRITE_DATA");
         assert_eq!(read_only & 0x0002, 0, "read-only nodes do not");
-        assert_eq!(none, 0, "a mode with no owner bits grants nothing");
+        // A mode with no owner bits grants no data access — but the owner can
+        // still read and change attributes, or nothing could restore access.
+        assert_eq!(none & (0x0001 | 0x0002 | 0x0004 | 0x0020 | 0x0001_0000), 0);
+        assert_ne!(none & 0x0100, 0, "FILE_WRITE_ATTRIBUTES is always granted");
+        assert_ne!(
+            read_only & 0x0100,
+            0,
+            "a read-only file's attributes can change"
+        );
         // Every bit a narrower mode grants is also granted by a wider one.
         assert_eq!(read_only & full, read_only);
         // A directory is always traversable even with no execute bit, because

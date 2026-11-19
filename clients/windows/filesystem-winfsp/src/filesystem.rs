@@ -247,11 +247,8 @@ impl SecurityDescriptors {
         } else {
             ""
         };
-        let sddl = if mask == 0 {
-            format!("O:{sid}G:{sid}D:P")
-        } else {
-            format!("O:{sid}G:{sid}D:P(A;{inherit};0x{mask:x};;;{sid})")
-        };
+        // Never empty: the owner can always read and change attributes.
+        let sddl = format!("O:{sid}G:{sid}D:P(A;{inherit};0x{mask:x};;;{sid})");
         let text = U16CString::from_str(&sddl).map_err(|_| status::STATUS_INVALID_PARAMETER)?;
         SecurityDescriptor::from_wstr(&text).map_err(|_| status::STATUS_IO_DEVICE_ERROR)
     }
