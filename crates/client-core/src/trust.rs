@@ -18,7 +18,7 @@
 //! platform is how the two would drift apart on which of those rules still
 //! holds.
 
-use quickfs_transport_quic::{QuicClient, TransportError};
+use quickfs_transport_quic::{CongestionControl, QuicClient, TransportError};
 use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -66,15 +66,48 @@ impl ServerTrust {
         server_name: &str,
         timeout: Duration,
     ) -> Result<QuicClient, TransportError> {
+        self.connect_using(server, server_name, timeout, CongestionControl::default())
+            .await
+    }
+
+    /// [`Self::connect`] with the congestion controller the client sends
+    /// with, which paces uploads.
+    pub async fn connect_using(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        timeout: Duration,
+        congestion: CongestionControl,
+    ) -> Result<QuicClient, TransportError> {
         match self {
             Self::Pinned(fingerprint) => {
-                QuicClient::connect_pinned(server, server_name, *fingerprint, timeout).await
+                QuicClient::connect_pinned_using(
+                    server,
+                    server_name,
+                    *fingerprint,
+                    timeout,
+                    congestion,
+                )
+                .await
             }
             Self::EnterpriseCa(authorities) => {
-                QuicClient::connect_with_ca(server, server_name, authorities.clone(), timeout).await
+                QuicClient::connect_with_ca_using(
+                    server,
+                    server_name,
+                    authorities.clone(),
+                    timeout,
+                    congestion,
+                )
+                .await
             }
             Self::SystemRoots => {
-                QuicClient::connect_with_system_roots(server, server_name, timeout).await
+                QuicClient::connect_with_system_roots_using(
+                    server,
+                    server_name,
+                    timeout,
+                    congestion,
+                )
+                .await
             }
         }
     }

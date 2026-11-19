@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use quickfs_auth::parse_pairing_code;
 use quickfs_protocol::*;
-pub use quickfs_transport_quic::ProtocolStats;
+pub use quickfs_transport_quic::{CongestionControl, ProtocolStats};
 use quickfs_transport_quic::{PairingClient, QuicClient, TransportError};
 use std::sync::Arc;
 use uuid::Uuid;

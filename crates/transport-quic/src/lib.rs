@@ -37,10 +37,11 @@ const SERVER_CONCURRENT_BIDI_STREAMS: u32 = 256;
 
 /// Congestion-control algorithm for an endpoint's *sending* direction.
 ///
-/// For file reads the server is the sender, so this is chiefly a server
-/// setting. `Cubic` (quinn's default) is loss-based: it treats every lost
-/// packet as congestion, so on a lossy or relayed long-RTT link it settles far
-/// below the link rate, and it fills bottleneck queues until they overflow
+/// Each endpoint runs its own controller for the data it sends: the server's
+/// governs reads (downloads), the client's governs writes (uploads). `Cubic`
+/// (quinn's default) is loss-based: it treats every lost packet as
+/// congestion, so on a lossy or relayed long-RTT link it settles far below
+/// the link rate, and it fills bottleneck queues until they overflow
 /// (bufferbloat), which delays every other request behind bulk data. `Bbr`
 /// models bottleneck bandwidth and RTT instead; it is marked experimental in
 /// quinn, so it is opt-in.
@@ -184,6 +185,25 @@ impl QuicClient {
         authorities: Vec<CertificateDer<'static>>,
         timeout: Duration,
     ) -> Result<Self, TransportError> {
+        Self::connect_with_ca_using(
+            server,
+            server_name,
+            authorities,
+            timeout,
+            CongestionControl::default(),
+        )
+        .await
+    }
+
+    /// [`Self::connect_with_ca`] with the congestion controller this client
+    /// sends with. It governs uploads, since there the client is the sender.
+    pub async fn connect_with_ca_using(
+        server: SocketAddr,
+        server_name: &str,
+        authorities: Vec<CertificateDer<'static>>,
+        timeout: Duration,
+        congestion: CongestionControl,
+    ) -> Result<Self, TransportError> {
         install_crypto_provider();
         if authorities.is_empty() {
             return Err(TransportError::Tls(
@@ -204,7 +224,7 @@ impl QuicClient {
         let crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        Self::connect_with_crypto(server, server_name, crypto, timeout).await
+        Self::connect_with_crypto(server, server_name, crypto, timeout, congestion).await
     }
 
     /// Connect using the operating system's native trust policy. This is the
@@ -215,12 +235,28 @@ impl QuicClient {
         server_name: &str,
         timeout: Duration,
     ) -> Result<Self, TransportError> {
+        Self::connect_with_system_roots_using(
+            server,
+            server_name,
+            timeout,
+            CongestionControl::default(),
+        )
+        .await
+    }
+
+    /// [`Self::connect_with_system_roots`] with a chosen congestion controller.
+    pub async fn connect_with_system_roots_using(
+        server: SocketAddr,
+        server_name: &str,
+        timeout: Duration,
+        congestion: CongestionControl,
+    ) -> Result<Self, TransportError> {
         install_crypto_provider();
         let crypto = rustls::ClientConfig::builder()
             .with_platform_verifier()
             .map_err(|error| TransportError::Tls(error.to_string()))?
             .with_no_client_auth();
-        Self::connect_with_crypto(server, server_name, crypto, timeout).await
+        Self::connect_with_crypto(server, server_name, crypto, timeout, congestion).await
     }
 
     pub async fn connect_pinned(
@@ -229,7 +265,26 @@ impl QuicClient {
         fingerprint: [u8; 32],
         timeout: Duration,
     ) -> Result<Self, TransportError> {
-        Self::connect_with_verifier(server, server_name, Some(fingerprint), timeout).await
+        Self::connect_pinned_using(
+            server,
+            server_name,
+            fingerprint,
+            timeout,
+            CongestionControl::default(),
+        )
+        .await
+    }
+
+    /// [`Self::connect_pinned`] with a chosen congestion controller.
+    pub async fn connect_pinned_using(
+        server: SocketAddr,
+        server_name: &str,
+        fingerprint: [u8; 32],
+        timeout: Duration,
+        congestion: CongestionControl,
+    ) -> Result<Self, TransportError> {
+        Self::connect_with_verifier(server, server_name, Some(fingerprint), timeout, congestion)
+            .await
     }
 
     async fn connect_with_verifier(
@@ -237,6 +292,7 @@ impl QuicClient {
         server_name: &str,
         fingerprint: Option<[u8; 32]>,
         timeout: Duration,
+        congestion: CongestionControl,
     ) -> Result<Self, TransportError> {
         install_crypto_provider();
         let verifier = FingerprintVerifier::new(fingerprint);
@@ -244,7 +300,7 @@ impl QuicClient {
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
-        Self::connect_with_crypto(server, server_name, crypto, timeout).await
+        Self::connect_with_crypto(server, server_name, crypto, timeout, congestion).await
     }
 
     async fn connect_with_crypto(
@@ -252,17 +308,14 @@ impl QuicClient {
         server_name: &str,
         mut crypto: rustls::ClientConfig,
         timeout: Duration,
+        congestion: CongestionControl,
     ) -> Result<Self, TransportError> {
         crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
         let mut config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|error| TransportError::Tls(error.to_string()))?,
         ));
-        config.transport_config(filesystem_transport_config(
-            true,
-            false,
-            CongestionControl::default(),
-        ));
+        config.transport_config(filesystem_transport_config(true, false, congestion));
         let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))?;
         endpoint.set_default_client_config(config);
         let connecting = endpoint
@@ -475,7 +528,14 @@ impl PairingClient {
         timeout: Duration,
     ) -> Result<Self, TransportError> {
         Ok(Self {
-            inner: QuicClient::connect_with_verifier(server, server_name, None, timeout).await?,
+            inner: QuicClient::connect_with_verifier(
+                server,
+                server_name,
+                None,
+                timeout,
+                CongestionControl::default(),
+            )
+            .await?,
         })
     }
 

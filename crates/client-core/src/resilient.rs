@@ -2,8 +2,8 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    ClientError, CreatedFile, DirectorySnapshot, NetworkFilesystem, OpenedFile, RangeRead,
-    RemoteFilesystem, Result, ServerTrust, WriteResult, XattrRead,
+    ClientError, CongestionControl, CreatedFile, DirectorySnapshot, NetworkFilesystem, OpenedFile,
+    RangeRead, RemoteFilesystem, Result, ServerTrust, WriteResult, XattrRead,
 };
 use async_trait::async_trait;
 use quickfs_protocol::{
@@ -38,6 +38,8 @@ pub struct AuthenticatedConnectionConfig {
     pub username: String,
     password: Zeroizing<String>,
     pub timeout: Duration,
+    /// How this client paces what it sends (writes). Cubic unless chosen.
+    pub congestion: CongestionControl,
 }
 
 impl AuthenticatedConnectionConfig {
@@ -56,7 +58,15 @@ impl AuthenticatedConnectionConfig {
             username,
             password: Zeroizing::new(password),
             timeout,
+            congestion: CongestionControl::default(),
         }
+    }
+
+    /// Send with `congestion` on this and every replacement connection.
+    #[must_use]
+    pub fn with_congestion(mut self, congestion: CongestionControl) -> Self {
+        self.congestion = congestion;
+        self
     }
 }
 
@@ -110,10 +120,11 @@ impl RemoteFilesystemConnector for AuthenticatedConnector {
         let transport = self
             .config
             .trust
-            .connect(
+            .connect_using(
                 self.config.server,
                 &self.config.server_name,
                 self.config.timeout,
+                self.config.congestion,
             )
             .await?;
         let filesystem = NetworkFilesystem::authenticate(
