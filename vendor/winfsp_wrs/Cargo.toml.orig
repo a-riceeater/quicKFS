@@ -1,0 +1,45 @@
+[package]
+name = "winfsp_wrs"
+version = "0.4.1"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+doctest = false
+
+[features]
+default = []
+debug = []
+# Enable `set_icon` for FileSystem to add a custom icon for the mountpoint folder
+icon = [
+    "windows-sys/Win32_System_IO",
+    "windows-sys/Win32_UI_Shell",
+]
+
+[dependencies]
+winfsp_wrs_sys = { path = "../winfsp_wrs_sys", version = "0.4.1" }
+chrono = "0.4.33"
+widestring = "1.1.0"
+
+[dependencies.windows-sys]
+version = "0.52.0"
+features = [
+    "Wdk",
+    "Wdk_Storage",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_WindowsProgramming",
+]

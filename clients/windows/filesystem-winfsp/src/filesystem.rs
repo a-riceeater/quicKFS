@@ -1309,12 +1309,8 @@ impl FileSystemInterface for WindowsFilesystem {
         } else {
             match buffer {
                 Some(buffer) => self.link_reparse_data(resolved.inode, &components, buffer),
-                // WinFsp only asks whether this component is a reparse point,
-                // and passes no size slot to fill. `winfsp_wrs` writes the size
-                // slot on every `Ok`, so success is reported through the status
-                // path, which writes nothing: `STATUS_SUCCESS` is what WinFsp
-                // tests for.
-                None => Err(status::STATUS_SUCCESS),
+                // WinFsp only asks whether this component is a reparse point.
+                None => Ok(0),
             }
         };
         self.resolver.release_resolved(&resolved);

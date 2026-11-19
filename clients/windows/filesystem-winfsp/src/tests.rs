@@ -1211,7 +1211,7 @@ fn a_links_reparse_data_is_its_target_kept_inside_the_volume() {
         harness
             .filesystem
             .get_reparse_point_by_name(&wide("\\to-docs"), true, None),
-        Err(status::STATUS_SUCCESS)
+        Ok(0)
     );
     assert_eq!(
         harness

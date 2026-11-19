@@ -2680,8 +2680,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winfsp_wrs"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3094fd0a4875434d3d7a2ddb273d382eece18243e14a139c12787fb3e9fb1062"
 dependencies = [
  "chrono",
  "widestring",

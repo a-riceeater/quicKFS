@@ -66,6 +66,12 @@ expect_used = "deny"
 # WINFSP_INSTALL_DIR / WINFSP_LIB_DIR so CI runners and unprivileged developer
 # machines can build against an unpacked SDK.
 winfsp_wrs_sys = { path = "vendor/winfsp_wrs_sys" }
+# The published winfsp_wrs writes a reparse-point size through a pointer WinFsp
+# passes as null when it only probes for a reparse point, and gives no access
+# to a security descriptor's bytes. The vendored copy fixes the first and adds
+# `SecurityDescriptor::as_bytes` for the second; both are marked "quicKFS
+# change" in the source.
+winfsp_wrs = { path = "vendor/winfsp_wrs" }
 # fuser 0.17 calls libfuse's obsolete API-25 mount entry point on macOS.
 # macFUSE 5.3 requires the current channel-based mount API instead.
 fuser = { path = "vendor/fuser" }
