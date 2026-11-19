@@ -218,7 +218,7 @@ impl FileContext {
 /// is the simplest thing that is definitely still valid at that moment.
 struct SecurityDescriptors {
     sid: String,
-    by_mask: Mutex<HashMap<u32, &'static SecurityDescriptor>>,
+    by_mask: Mutex<HashMap<(u32, bool), &'static SecurityDescriptor>>,
 }
 
 impl SecurityDescriptors {
@@ -230,10 +230,20 @@ impl SecurityDescriptors {
         // the single ACE names only the mounting account: no `Everyone`, no
         // approximation of the POSIX group and other bits onto trustees the
         // user did not choose.
+        //
+        // Inheritance flags only mean something on a directory. On a file they
+        // make the ACE look different from the plain one `icacls /grant:r`
+        // writes, so the tool would add its ACE beside this one instead of
+        // replacing it — and the old rights would survive the change.
+        let inherit = if kind == NodeKind::Directory {
+            "OICI"
+        } else {
+            ""
+        };
         let sddl = if mask == 0 {
             format!("O:{sid}G:{sid}D:P")
         } else {
-            format!("O:{sid}G:{sid}D:P(A;OICI;0x{mask:x};;;{sid})")
+            format!("O:{sid}G:{sid}D:P(A;{inherit};0x{mask:x};;;{sid})")
         };
         let text = U16CString::from_str(&sddl).map_err(|_| status::STATUS_INVALID_PARAMETER)?;
         SecurityDescriptor::from_wstr(&text).map_err(|_| status::STATUS_IO_DEVICE_ERROR)
@@ -247,17 +257,20 @@ impl SecurityDescriptors {
     }
 
     fn for_node(&self, mode: u32, kind: NodeKind) -> Result<PSecurityDescriptor, NtStatus> {
-        let mask = attributes::access_mask(mode, kind);
+        let key = (
+            attributes::access_mask(mode, kind),
+            kind == NodeKind::Directory,
+        );
         let mut cache = self
             .by_mask
             .lock()
             .map_err(|_| status::STATUS_IO_DEVICE_ERROR)?;
-        if let Some(descriptor) = cache.get(&mask) {
+        if let Some(descriptor) = cache.get(&key) {
             return Ok(descriptor.as_ptr());
         }
         let descriptor = self.owned(mode, kind)?;
         let descriptor: &'static SecurityDescriptor = Box::leak(Box::new(descriptor));
-        cache.insert(mask, descriptor);
+        cache.insert(key, descriptor);
         Ok(descriptor.as_ptr())
     }
 }
