@@ -298,6 +298,7 @@ On macOS, every client subcommand first verifies that the standard macFUSE files
 | `--state-dir <PATH>` | `QUICKFS_CLIENT_STATE_DIR` | `.quickfs-client` | Client trust database directory. |
 | `--username <NAME>` | `QUICKFS_USERNAME` | — | Account for authenticated commands. |
 | `--timeout-ms <MS>` | — | `30000` | Connection, stream-open, frame, and response-data timeout. |
+| `--password-stdin` | — | Off | Read the password from the first line of standard input instead of the hidden prompt, for scripts. |
 | `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Validate with the operating-system public/managed trust policy and `--server-name`. |
 | `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Validate with a deployed private-CA bundle and `--server-name`. |
 
@@ -398,6 +399,17 @@ quickfs-client-cli \
 
 `--length` is required. Offset defaults to zero. Reads beyond EOF return available bytes, zero-length reads succeed, and output is raw file content.
 
+### Other file commands
+
+`write <PATH> <LOCAL_FILE> [--offset N] [--sync]`, `create <PATH> [--mode M]`,
+`truncate <PATH> <SIZE>`, `mkdir <PATH> [--mode M]`, `remove <PATH>
+[--directory]`, `rename <FROM> <TO> [--no-replace]`, `symlink <PATH> <TARGET>`,
+`readlink <PATH>`, `capabilities`, and `filesystem-stats` complete the set.
+`symlink` stores `TARGET` verbatim; the server refuses targets that are absolute
+or climb out of the export. `readlink` prints a link's target without following
+it. The same commands, implemented once in `crates/client-commands`, are
+available on Windows as `quickfs remote <SERVER> <COMMAND>`.
+
 ## macOS `quickfs-mount`
 
 The native mount is built separately because it links against the macFUSE 4 SDK:
@@ -455,8 +467,11 @@ target\release\quickfs.exe mount 127.0.0.1:4433 Q: --username alice
 ```
 
 Both the server address and the mountpoint are positional. The mountpoint may
-be a drive letter (`Q:`, `Q`, `Q:\`), an existing empty directory, or `*` for
-the next free letter counting down from `Z:`. The mount runs in the foreground
+be a drive letter (`Q:`, `Q`, `Q:\`), `*` for the highest free letter from `Z:`
+down (resolved before mounting, so the banner and `quickfs unmount` name the real
+letter), or a directory path that does **not** exist yet inside one that does —
+WinFsp creates that directory for the life of the mount and removes it
+afterwards, and refuses an existing one. The mount runs in the foreground
 and verifies the selected trust policy before the password prompt, reconnects
 under that same policy, and retains one shared Tokio runtime around an
 authenticated reconnecting `RemoteFilesystem` — exactly as the macOS mount does,
@@ -489,7 +504,18 @@ volume.
 | `--reconnect-attempts <COUNT>` | — | `3` | Bounded authenticated reconnect attempts. |
 | `--trust-system-roots` | `QUICKFS_TRUST_SYSTEM_ROOTS` | Off | Use the operating-system public/managed roots. |
 | `--ca-cert <PEM>` | `QUICKFS_CA_CERT` | — | Use an explicit enterprise-CA bundle. |
-| `--volume-name <NAME>` | — | `quicKFS` | Volume label shown in Explorer, at most 32 characters. |
+| `--volume-name <NAME>` | — | Derived | Volume label shown in Explorer, at most 32 characters. Without it, the export's renamed label is used if it has one, otherwise a directory mountpoint's folder name, falling back to `quicKFS` — the macOS rules. |
+| `--read-only` | — | Off | Mount read-only even when the account may write; every modification is refused locally before it reaches the server. |
+| `--password-stdin` | — | Off | Read the password from the first line of standard input instead of the console. For an app or script launching the mount. |
+| `--stats-file <PATH>` | — | — | Rewrite this file every second with a JSON snapshot of the mount's QUIC link, written atomically with an owner-only DACL. |
+| `--stats-on-request` | — | Off | Answer each `stats` line on standard input with one `quickfs-stats <json>` line on standard output — the same protocol and code as the macOS helper. |
+| `--exit-with-parent` | — | Off | Unmount when the launching process exits, so a crashed or killed app cannot leave an orphaned mount. The parent is held open from startup, so a reused process ID is never mistaken for it. |
+
+Set `QUICKFS_WINFSP_DEBUG=1` to have WinFsp log every request it dispatches, and
+each reply, to standard error — the counterpart of `QUICKFS_FUSE_DEBUG`. An
+unmount that has not finished eight seconds after it was requested exits the
+process regardless, as the macOS helper's watchdog does; WinFsp releases the
+volume with the process.
 
 The trust subcommands take the server address positionally and share the trust
 database with the macOS client:
@@ -510,9 +536,16 @@ Timeout behaviour is identical to the macOS mount: a read-only operation that
 exhausts its budget returns a timeout status, and a mutation whose result may
 already have taken effect returns an I/O error and is never replayed.
 
-The Windows client does not provide the diagnostic file subcommands
-(`list`, `stat`, `read`, `write`, and the rest) that `quickfs-client-cli` has on
-macOS; use the mounted drive, or run the diagnostic CLI on another host. See the
+The diagnostic file commands are available without mounting, with the same
+trust options and the same server-identity-before-password order:
+
+```powershell
+quickfs remote 127.0.0.1:4433 --username alice ping
+quickfs remote 127.0.0.1:4433 --username alice list /
+quickfs remote 127.0.0.1:4433 --username alice --password-stdin read /hello.txt --length 64 < pw.txt
+```
+
+`remote` takes every command listed for `quickfs-client-cli` above. See the
 [Windows client guide](windows.md) for the POSIX-to-Windows metadata mapping and
 the platform limitations.
 
