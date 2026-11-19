@@ -6,7 +6,9 @@
 //! * [`require_winfsp`] — the actionable startup check for the WinFsp runtime,
 //!   mirroring `quickfs-macos-support`'s macFUSE check.
 //! * [`current_user_sid`] — the mounting account's SID, used to build the
-//!   security descriptors the WinFsp bridge presents for every node.
+//!   security descriptors the WinFsp bridge presents for every node — and
+//!   [`granted_access`], which reads back what a descriptor Windows supplies
+//!   grants that account.
 //! * [`UnmountSignal`] and [`signal_unmount`], the named event that lets
 //!   `quickfs unmount Q:` reach the process holding the mount.
 //! * [`ParentProcess`], which lets a mount started by an app unmount itself
@@ -27,9 +29,9 @@ mod windows;
 
 #[cfg(windows)]
 pub use windows::{
-    ParentProcess, UnmountSignal, create_private_directory, current_user_sid, harden_private_path,
-    lock_file, signal_unmount, validate_private_owner, winfsp_install_directory,
-    winfsp_is_installed,
+    ParentProcess, UnmountSignal, create_private_directory, current_user_sid, granted_access,
+    harden_private_path, lock_file, signal_unmount, validate_private_owner,
+    winfsp_install_directory, winfsp_is_installed,
 };
 
 /// The official WinFsp download and installation website.
