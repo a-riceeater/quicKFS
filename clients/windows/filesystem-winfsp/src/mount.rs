@@ -131,6 +131,9 @@ pub struct MountConfig {
     /// Shown as the file system type, as `NTFS` or `FAT32` would be. WinFsp
     /// caps this at 16 UTF-16 units.
     pub filesystem_name: String,
+    /// Have WinFsp log every request it dispatches, and each reply, to
+    /// standard error — the counterpart of `QUICKFS_FUSE_DEBUG` on macOS.
+    pub debug_log: bool,
 }
 
 impl Default for MountConfig {
@@ -139,6 +142,7 @@ impl Default for MountConfig {
             mountpoint: MountPoint::NextAvailable,
             volume_name: None,
             filesystem_name: "quickfs".into(),
+            debug_log: false,
         }
     }
 }
@@ -352,6 +356,7 @@ pub fn mount(
         // coarse volume lock would serialise every operation on a mount that is
         // frequently waiting on the network.
         guard_strategy: OperationGuardStrategy::Fine,
+        debug_log: config.debug_log,
     };
     let mountpoint = config.mountpoint.to_winfsp()?;
     let running =

@@ -304,6 +304,10 @@ impl VolumeParams {
 pub struct Params {
     pub volume_params: VolumeParams,
     pub guard_strategy: OperationGuardStrategy,
+    /// quicKFS change: log every request and response to standard error, as
+    /// the `debug` feature does, but chosen at run time so a release build can
+    /// be diagnosed in the field.
+    pub debug_log: bool,
 }
 
 pub struct FileSystem {
@@ -384,8 +388,7 @@ impl FileSystem {
             std::mem::drop(interface);
         });
 
-        #[cfg(feature = "debug")]
-        {
+        if cfg!(feature = "debug") || params.debug_log {
             use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
 
             // SAFETY: calling WinFSP C++ API
@@ -486,8 +489,7 @@ impl FileSystem {
         // SAFETY: dereferencing pointer that have been initialized by `FspFileSystemCreate` call
         unsafe { *p_inner }.UserContext = p_user_context;
 
-        #[cfg(feature = "debug")]
-        {
+        if cfg!(feature = "debug") || self.params.debug_log {
             use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
 
             // SAFETY: calling WinFSP C++ API

@@ -645,6 +645,10 @@ mod windows {
             mountpoint: mountpoint.clone(),
             volume_name: volume_name.clone(),
             filesystem_name: "quickfs".into(),
+            // `QUICKFS_WINFSP_DEBUG=1` streams every request WinFsp dispatches
+            // to standard error. It is the only view of what Windows is asking
+            // a mount, so it stays available in release builds.
+            debug_log: std::env::var_os("QUICKFS_WINFSP_DEBUG").is_some(),
         };
         let access = if capabilities.writable {
             "read/write"
