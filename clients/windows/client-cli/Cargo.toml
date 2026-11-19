@@ -13,6 +13,7 @@ tokio.workspace=true
 uuid.workspace=true
 zeroize.workspace=true
 quickfs-cache={path="../../../crates/cache"}
+quickfs-client-commands={path="../../../crates/client-commands"}
 quickfs-client-core={path="../../../crates/client-core"}
 quickfs-protocol={path="../../../crates/protocol"}
 quickfs-transport-quic={path="../../../crates/transport-quic"}

@@ -1,0 +1,18 @@
+[package]
+name = "quickfs-client-commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The remote file commands shared by the macOS and Windows command lines"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+zeroize.workspace = true
+quickfs-client-core = { path = "../client-core" }
+quickfs-protocol = { path = "../protocol" }
+
+[lints]
+workspace = true

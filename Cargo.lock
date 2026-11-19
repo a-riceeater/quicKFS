@@ -1189,6 +1189,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "quickfs-client-commands",
  "quickfs-client-core",
  "quickfs-macos-support",
  "quickfs-protocol",
@@ -1200,6 +1201,18 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "quickfs-client-commands"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "quickfs-client-core",
+ "quickfs-protocol",
+ "rpassword",
  "zeroize",
 ]
 
@@ -1414,6 +1427,7 @@ dependencies = [
  "clap",
  "hex",
  "quickfs-cache",
+ "quickfs-client-commands",
  "quickfs-client-core",
  "quickfs-filesystem-winfsp",
  "quickfs-protocol",

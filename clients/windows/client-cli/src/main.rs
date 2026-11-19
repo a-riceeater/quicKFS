@@ -9,6 +9,7 @@
 //! quickfs pair --pairing-id <uuid>        # authenticate and pin a server
 //! quickfs mount 192.0.2.10:4433 Q:        # mount it, staying in the foreground
 //! quickfs unmount Q:                      # from another window
+//! quickfs remote 192.0.2.10:4433 list /   # one command, without mounting
 //! ```
 //!
 //! The flags mirror `quickfs-mount` and `quickfs-client-cli` on macOS, and the
@@ -51,10 +52,12 @@ mod windows {
     use anyhow::{Context, Result, bail};
     use clap::{Parser, Subcommand};
     use quickfs_cache::{CacheNamespace, NonBlockingPersistentCache};
+    use quickfs_client_commands::{RemoteCommand, read_password, run as run_command};
     use quickfs_client_core::{
         AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, MAX_CLIENT_READ_SIZE,
-        ReconnectPolicy, RemoteFilesystem, ResilientFilesystem, ResilientFilesystemOptions,
-        ServerTrust, TrustStore, load_trusted_server_pin, mount_helper, parse_sha256_fingerprint,
+        NetworkFilesystem, ReconnectPolicy, RemoteFilesystem, ResilientFilesystem,
+        ResilientFilesystemOptions, ServerTrust, TrustStore, load_trusted_server_pin, mount_helper,
+        parse_sha256_fingerprint,
     };
     use quickfs_filesystem_winfsp::{MountConfig, MountPoint, mount};
     use quickfs_transport_quic::{certificate_sha256, load_certificates};
@@ -181,6 +184,20 @@ mod windows {
             #[arg(long)]
             read_only: bool,
         },
+        /// Run one file command against an export without mounting it.
+        Remote {
+            /// Server address, as `host:port`.
+            #[arg(env = "QUICKFS_SERVER")]
+            server: SocketAddr,
+            #[arg(long, env = "QUICKFS_USERNAME")]
+            username: Option<String>,
+            /// Read the password from the first line of standard input
+            /// instead of prompting on the console.
+            #[arg(long)]
+            password_stdin: bool,
+            #[command(subcommand)]
+            command: RemoteCommand,
+        },
         /// Ask the process holding a mountpoint to unmount it.
         Unmount {
             /// Drive letter (`Q:`) or directory the volume is mounted on.
@@ -259,6 +276,12 @@ mod windows {
                 require_winfsp()?;
                 run_mount(&cli)
             }
+            Command::Remote {
+                server,
+                username,
+                password_stdin,
+                command,
+            } => run_remote(&cli, *server, username.as_deref(), *password_stdin, command),
             Command::Unmount { mountpoint } => run_unmount(mountpoint),
             Command::Pair {
                 server,
@@ -386,6 +409,50 @@ mod windows {
                 Ok(())
             }
         }
+    }
+
+    /// Authenticate exactly as a mount does — server identity first, then the
+    /// password on a fresh connection — and run one remote command.
+    fn run_remote(
+        cli: &Cli,
+        server: SocketAddr,
+        username: Option<&str>,
+        password_stdin: bool,
+        command: &RemoteCommand,
+    ) -> Result<()> {
+        let username = username
+            .ok_or_else(|| anyhow::anyhow!("--username or QUICKFS_USERNAME is required"))?
+            .to_owned();
+        let trust = server_trust(cli, server)?;
+        let timeout = Duration::from_millis(cli.timeout_ms);
+        let runtime = Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("failed to create the client runtime")?;
+        runtime.block_on(async {
+            let identity_check = trust
+                .connect(server, &cli.server_name, timeout)
+                .await
+                .with_context(|| {
+                    format!("failed to authenticate server via {}", trust.description())
+                })?;
+            identity_check.close();
+            let password = read_password(password_stdin)?;
+            let transport = trust
+                .connect(server, &cli.server_name, timeout)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to re-authenticate server via {}; password was not sent",
+                        trust.description()
+                    )
+                })?;
+            let filesystem =
+                NetworkFilesystem::authenticate(transport, username, password.to_string())
+                    .await
+                    .context("username/password authentication failed")?;
+            run_command(&filesystem, command, &mut std::io::stdout().lock()).await
+        })
     }
 
     fn run_unmount(mountpoint: &str) -> Result<()> {
@@ -714,6 +781,33 @@ mod windows {
             assert_eq!(server.to_string(), "192.0.2.10:4433");
             assert_eq!(mountpoint, "Q:");
             assert_eq!(username.as_deref(), Some("alice"));
+        }
+
+        #[test]
+        fn a_remote_command_takes_the_server_then_the_shared_subcommand() {
+            let cli = Cli::try_parse_from([
+                "quickfs",
+                "remote",
+                "192.0.2.10:4433",
+                "--username",
+                "alice",
+                "--password-stdin",
+                "read",
+                "/a/b",
+                "--length",
+                "16",
+            ])
+            .unwrap();
+            let Command::Remote {
+                password_stdin,
+                command,
+                ..
+            } = &cli.command
+            else {
+                panic!("expected a remote command");
+            };
+            assert!(*password_stdin);
+            assert!(matches!(command, RemoteCommand::Read { length: 16, .. }));
         }
 
         #[test]
