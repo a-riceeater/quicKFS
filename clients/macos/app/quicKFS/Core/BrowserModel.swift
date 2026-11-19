@@ -28,7 +28,8 @@ final class TransferItem: Identifiable {
     /// Link counters when the transfer began and most recently.
     private(set) var linkStart: LinkSnapshot?
     private(set) var link: LinkSnapshot?
-    private var windowStart: (Date, UInt64)?
+    private var meter = RateMeter()
+    private var lastSample: Date?
     /// The browser that polls this transfer, which also resumes it.
     weak var owner: BrowserModel?
 
@@ -54,7 +55,7 @@ final class TransferItem: Identifiable {
         return elapsed > 0.5 ? Double(status.bytes) / elapsed : 0
     }
 
-    /// The most recent one-second rate, or the average before there is one.
+    /// The most recent sampled rate, or the average before there is one.
     var currentRate: Double { isRunning ? (rates.last?.rate ?? rate) : 0 }
 
     var remaining: TimeInterval? {
@@ -67,16 +68,17 @@ final class TransferItem: Identifiable {
     func update(_ status: TransferStatus) {
         self.status = status
         let now = Date.now
-        if let (since, bytes) = windowStart {
-            let span = now.timeIntervalSince(since)
-            if span >= 1 {
-                let rate = Double(status.bytes &- bytes) / span
-                rates.append(TransferRateSample(id: rates.count, elapsed: now.timeIntervalSince(startedAt), rate: rate))
-                peakRate = max(peakRate, rate)
-                windowStart = (now, status.bytes)
-            }
-        } else {
-            windowStart = (now, status.bytes)
+        let clock = now.timeIntervalSince(startedAt)
+        meter.observe(bytes: status.bytes, at: clock,
+                      sinceCommit: status.sinceCommitMs.map { Double($0) / 1000 })
+        if let lastSample, now.timeIntervalSince(lastSample) >= 1 {
+            // Waiting out a failure moves nothing, whatever came before.
+            let rate = status.retryInMs != nil ? 0 : (meter.rate(at: clock) ?? self.rate)
+            rates.append(TransferRateSample(id: rates.count, elapsed: clock, rate: rate))
+            peakRate = max(peakRate, rate)
+            self.lastSample = now
+        } else if lastSample == nil {
+            lastSample = now
         }
         if status.state != .running, finishedAt == nil { finishedAt = now }
     }
@@ -119,7 +121,8 @@ final class TransferItem: Identifiable {
     /// Clear the finished state so a resumed run reads as running again.
     func markResumed() {
         finishedAt = nil
-        windowStart = nil
+        meter.reset()
+        lastSample = nil
         if let status {
             self.status = TransferStatus(
                 state: .running, bytes: status.bytes, total: status.total, files: status.files,
