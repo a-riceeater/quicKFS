@@ -1692,3 +1692,24 @@ fn written_bytes_reach_the_server_at_cleanup_not_only_at_close() {
     );
     harness.filesystem.close(handle);
 }
+
+#[test]
+fn a_directory_link_is_a_directory_to_the_access_check_too() {
+    // WinFsp's access check takes its attributes from `GetSecurityByName`.
+    // Reported without the directory bit, a link to a directory cannot be
+    // opened as one — `dir link\` fails as NTFS fails for a link made
+    // without `mklink /D`.
+    let harness = linked_tree();
+    let (attributes, _, reparse) = harness
+        .filesystem
+        .get_security_by_name(&wide(r"\to-docs"), || None)
+        .unwrap();
+    assert!(!reparse);
+    assert!(attributes.is(FileAttributes::REPARSE_POINT));
+    assert!(attributes.is(FileAttributes::DIRECTORY));
+    let (attributes, _, _) = harness
+        .filesystem
+        .get_security_by_name(&wide(r"\to-notes"), || None)
+        .unwrap();
+    assert!(!attributes.is(FileAttributes::DIRECTORY));
+}

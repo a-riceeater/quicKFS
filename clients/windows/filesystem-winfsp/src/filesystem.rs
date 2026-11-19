@@ -645,10 +645,11 @@ impl FileSystemInterface for WindowsFilesystem {
         find_reparse_point: impl Fn() -> Option<FileAttributes>,
     ) -> Result<(FileAttributes, PSecurityDescriptor, bool), NtStatus> {
         let target = self.stream_target(file_name)?;
+        // Held until the attributes are computed: describing a link means
+        // reading it, which needs the adapter to still know its inode.
         let resolved = match self
             .block_on(self.resolver.resolve(&target.components))
             .map_err(adapter_status)
-            .inspect(|resolved| self.resolver.release_resolved(resolved))
         {
             Ok(resolved) => resolved,
             // The walk stops at a link that is not the last component; WinFsp
@@ -670,11 +671,19 @@ impl FileSystemInterface for WindowsFilesystem {
             .last()
             .map(|name| Name::from(name.clone()))
             .unwrap_or_default();
-        let attributes = FileAttributes(attributes::file_attributes(
-            resolved.metadata.kind,
-            resolved.metadata.mode,
-            path::is_hidden_name(name.as_bytes()),
-        ));
+        // The same attributes every other callback reports, including the
+        // directory bit on a link to a directory: WinFsp refuses to open, as a
+        // directory, a link this says is a file link, exactly as NTFS refuses
+        // to traverse a link made without `mklink /D`.
+        let directory = target
+            .components
+            .split_last()
+            .map(|(_, parent)| parent)
+            .unwrap_or(&[]);
+        let attributes = self
+            .entry_info(resolved.inode, &resolved.metadata, &name, directory)
+            .file_attributes();
+        self.resolver.release_resolved(&resolved);
         let descriptor = self
             .security
             .for_node(resolved.metadata.mode, resolved.metadata.kind)?;
