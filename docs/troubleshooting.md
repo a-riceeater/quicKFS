@@ -353,9 +353,12 @@ partial uninstall.
 
 `WinFsp refused the mount with NTSTATUS 0xC0000035` means the mountpoint is
 already taken — by another quicKFS mount, another WinFsp filesystem, or a real
-drive. `0xC0000034` means WinFsp's user-mode library is present but its kernel
-driver is not registered, which happens after an SDK-only extraction;
-`sc query WinFsp` should report a registered service.
+drive; a directory mountpoint must not exist yet, because WinFsp creates it.
+`0xC0000034` means WinFsp's user-mode library is present but its kernel driver
+is not registered, which happens after an SDK-only extraction. WinFsp 2.x names
+the service `WinFsp+<install id>`, so look for it with
+`sc query type= driver state= all | findstr WinFsp` rather than
+`sc query WinFsp`.
 
 `no quicKFS mount is active on Q: in this session` means the mount belongs to a
 different logon session — commonly it was started from an elevated prompt and

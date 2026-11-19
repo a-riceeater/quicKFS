@@ -8,6 +8,6 @@ Remaining priorities:
 2. Fault-injection and Linux/macOS CI for daemon restart, macFUSE 4/5 backends, backing-filesystem variants, special nodes, and large resource forks.
 3. Server-pushed cross-client cache invalidation plus better observability/profiling for multi-client media workloads. Local post-mutation projections are already invalidated coherently; synchronous fuser notifications from inside macOS callbacks are unsafe with the one receive loop.
 4. Signed/overlapping exact-pin rotation, platform keychain integration, and administrator recovery tooling. Linux deployment packaging is implemented: a TOML configuration, a checksum-verified release archive, a secure installer/uninstaller, and a hardened systemd unit. Detached cryptographic release signing, and packaging for the macOS client, remain outstanding.
-5. WinFsp support.
+5. WinFsp support has reached parity with the macOS client outside the app UI: links, xattrs as streams, permissions, the mount helper interface, the remote commands, and the app bridge. Remaining: a Windows app, link creation without Developer Mode, and the Windows-only gaps WinFsp cannot carry (hard-link creation, server-visible byte-range locks).
 
 Cold-start offline mounting and offline writes are intentionally deferred unless a future design includes authenticated durable journals, version preconditions, lock/permission revalidation, explicit conflict policy, and user-visible reconciliation.

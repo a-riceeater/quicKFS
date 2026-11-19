@@ -84,9 +84,10 @@ The main components are:
 - `crates/macos-support` and `crates/windows-support`: the per-platform runtime checks and private-state primitives;
 - `clients/macos/filesystem-macfuse`: native macFUSE callbacks and the `quickfs-mount` executable;
 - `clients/macos/client-cli`: trust, authentication, administration, and direct protocol diagnostics;
-- `clients/macos/app` and `clients/macos/core-bridge`: the native SwiftUI app for macOS 26 and the C-ABI bridge it uses to reach `client-core`;
-- `clients/windows/filesystem-winfsp`: native WinFsp callbacks, path and `NTSTATUS` translation, and the Windows mount lifecycle;
-- `clients/windows/client-cli`: the `quickfs` executable — mount, unmount, pairing, and trust management.
+- `crates/client-commands`: the remote file commands shared by `quickfs-client-cli` and `quickfs remote`;
+- `clients/macos/app` and `clients/macos/core-bridge`: the native SwiftUI app for macOS 26 and the C-ABI bridge it uses to reach `client-core` — a static library on macOS and `quickfs_core_bridge.dll` on Windows;
+- `clients/windows/filesystem-winfsp`: native WinFsp callbacks, path and `NTSTATUS` translation, links as reparse points, xattrs as named streams, and the Windows mount lifecycle;
+- `clients/windows/client-cli`: the `quickfs` executable — mount, unmount, remote file commands, pairing, and trust management.
 
 See [Architecture](ARCHITECTURE.md) for the crate and trust boundaries.
 
@@ -280,7 +281,8 @@ target\release\quickfs.exe mount 127.0.0.1:4433 Q: --username alice
 ```
 
 The mount runs in the foreground. Press Control+C in that window, or run
-`quickfs unmount Q:` from another one, to unmount. See the
+`quickfs unmount Q:` from another one, to unmount. `quickfs remote <server> list /`
+and the other file commands work without mounting. See the
 [Windows client guide](docs/windows.md) for the mountpoint forms, the POSIX-to-Windows
 metadata mapping, and the Windows-specific limitations.
 
@@ -301,7 +303,7 @@ See [Filesystem semantics](docs/filesystem-semantics.md) for the precise behavio
 
 ## Windows and WinFsp boundaries
 
-Ordinary Explorer and application operations—create, delete, random I/O, rename and move, directory enumeration, truncation, timestamps, and flush—work through the native mount. Windows and POSIX genuinely differ in places, and the client states rather than papers over each one: names Win32 cannot round-trip are refused at creation but stay reachable if the server already holds them, names that are not valid UTF-8 are omitted from listings, symbolic links appear as ordinary files, and extended attributes, alternate data streams, hard links and `SetSecurity` are not exposed. POSIX permissions are mapped onto a security descriptor that grants only the mounting account, with rights taken from the owner mode bits; the server remains the real authorization boundary. The full table is in the [Windows client guide](docs/windows.md).
+Ordinary Explorer and application operations—create, delete, random I/O, rename and move (including case-only renames), directory enumeration, truncation, timestamps, flush, permissions through `icacls` and the read-only attribute, and volume rename—work through the native mount. Symbolic links are Windows symbolic links whose targets always resolve inside the volume, and extended attributes, including macOS resource forks, are named streams. Windows and POSIX genuinely differ in places, and the client states rather than papers over each one: names Win32 cannot round-trip are refused at creation but stay reachable if the server already holds them, names that are not valid UTF-8 are omitted from listings, hard links can be counted but not created, and byte-range locks are enforced only on the local machine. POSIX permissions are mapped onto a security descriptor that grants only the mounting account, with rights taken from the owner mode bits; the server remains the real authorization boundary. The full table is in the [Windows client guide](docs/windows.md).
 
 ## Documentation
 
