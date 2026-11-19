@@ -1667,3 +1667,28 @@ fn an_open_reports_the_stored_spelling_so_case_only_renames_reach_the_server() {
     );
     harness.close(handle);
 }
+
+#[test]
+fn written_bytes_reach_the_server_at_cleanup_not_only_at_close() {
+    // WinFsp sends `Close` long after `Cleanup` when the cache manager holds
+    // the file. The data must be on the server once the last handle is gone,
+    // or another client sees a file the application considers closed without
+    // the bytes it wrote.
+    let harness = Harness::empty();
+    let handle = harness.create_file(r"\late-close.txt");
+    harness
+        .filesystem
+        .write(handle.clone(), b"written", WriteMode::Normal { offset: 0 })
+        .unwrap();
+    harness
+        .filesystem
+        .cleanup(handle.clone(), None, CleanupFlags(0));
+    assert_eq!(
+        harness
+            .server
+            .contents(node(&harness.server, &["late-close.txt"])),
+        Some(b"written".to_vec()),
+        "cleanup must flush coalesced bytes"
+    );
+    harness.filesystem.close(handle);
+}

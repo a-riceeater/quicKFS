@@ -862,6 +862,19 @@ impl FileSystemInterface for WindowsFilesystem {
             self.stream_cleanup(&context, stream, delete);
             return;
         }
+        // The last user handle is gone, so whatever the application wrote is,
+        // as far as it knows, written. WinFsp defers `Close` — by seconds when
+        // the cache manager holds the file — and the adapter otherwise flushes
+        // a handle's coalesced bytes only at release. Flushing here makes the
+        // data visible to other opens and clients at the moment Windows says
+        // the file is closed, and lands it before anything set afterwards (a
+        // `SetFileTime` from the next open) instead of overwriting it.
+        let handle = context.file.lock().ok().and_then(|slot| *slot);
+        if let Some(handle) = handle
+            && context.writable()
+        {
+            let _ = self.block_on(self.adapter().flush_async(handle, None));
+        }
         if flags.is(CleanupFlags::SET_LAST_WRITE_TIME) || flags.is(CleanupFlags::SET_CHANGE_TIME) {
             self.set_modified_now(context.inode());
         }
