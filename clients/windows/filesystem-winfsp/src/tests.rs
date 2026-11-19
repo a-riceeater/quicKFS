@@ -1713,3 +1713,33 @@ fn a_directory_link_is_a_directory_to_the_access_check_too() {
         .unwrap();
     assert!(!attributes.is(FileAttributes::DIRECTORY));
 }
+
+#[test]
+fn an_explicit_last_write_time_survives_the_close_of_the_open_that_set_it() {
+    // WinFsp flags the cleanup of an open that only set a time with "stamp the
+    // modification time" when the file was written through an earlier open.
+    let harness = Harness::empty();
+    harness.write_file(r"\stamped.txt", b"x");
+    let handle = harness.open(r"\stamped.txt", FileAccessRights::FILE_WRITE_ATTRIBUTES);
+    // 2020-02-03T04:05:06Z as a FILETIME.
+    let when = crate::attributes::filetime_from_unix_ms(1_580_702_706_000);
+    harness
+        .filesystem
+        .set_basic_info(handle.clone(), FileAttributes::INVALID, 0, 0, when, 0)
+        .unwrap();
+    harness
+        .filesystem
+        .cleanup(handle.clone(), None, CleanupFlags::SET_LAST_WRITE_TIME);
+    harness.filesystem.close(handle);
+    let handle = harness.open(r"\stamped.txt", FileAccessRights::FILE_READ_ATTRIBUTES);
+    let info = harness.filesystem.get_file_info(handle.clone()).unwrap();
+    assert_eq!(info.last_write_time(), when);
+    harness.close(handle);
+}
+
+#[test]
+fn set_file_time_sentinels_are_not_times() {
+    assert_eq!(crate::attributes::unix_ms_from_filetime(0), None);
+    assert_eq!(crate::attributes::unix_ms_from_filetime(u64::MAX), None);
+    assert_eq!(crate::attributes::unix_ms_from_filetime(u64::MAX - 1), None);
+}

@@ -68,7 +68,10 @@ pub fn filetime_from_unix_ms(milliseconds: u64) -> u64 {
 /// not change this timestamp" in `SetBasicInformation`, and any time before the
 /// Unix epoch cannot be represented in the protocol's unsigned milliseconds.
 pub fn unix_ms_from_filetime(filetime: u64) -> Option<u64> {
-    if filetime == 0 {
+    // `SetFileTime` also passes all-ones ("stop updating this time on writes
+    // through this handle") and all-ones-minus-one ("resume"). Neither is a
+    // time; storing either would set a date near the year 60000.
+    if filetime == 0 || filetime >= u64::MAX - 1 {
         return None;
     }
     filetime

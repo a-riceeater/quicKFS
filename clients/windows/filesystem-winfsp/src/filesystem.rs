@@ -123,6 +123,11 @@ pub struct FileContext {
     /// first enumeration.
     directory: Mutex<Option<OpenDirectory>>,
     delete_on_close: AtomicBool,
+    /// Whether data was written or the size changed through this open.
+    modified: AtomicBool,
+    /// Whether the application set a last-write time through this open, which
+    /// must then survive the open's close rather than be stamped over.
+    explicit_write_time: AtomicBool,
     /// Set when this open names a stream rather than the node's own data.
     stream: Option<OpenStream>,
     /// The stored spelling of the path this open names, reported to WinFsp
@@ -145,6 +150,8 @@ impl FileContext {
             file: Mutex::new(None),
             directory: Mutex::new(None),
             delete_on_close: AtomicBool::new(false),
+            modified: AtomicBool::new(false),
+            explicit_write_time: AtomicBool::new(false),
             stream: None,
             normalized: Mutex::new(None),
         })
@@ -840,6 +847,7 @@ impl FileSystemInterface for WindowsFilesystem {
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
         }
+        context.modified.store(true, Ordering::Release);
         if let Some(stream) = &context.stream {
             return self.stream_overwrite(&context, stream);
         }
@@ -897,7 +905,16 @@ impl FileSystemInterface for WindowsFilesystem {
         {
             let _ = self.block_on(self.adapter().flush_async(handle, None));
         }
-        if flags.is(CleanupFlags::SET_LAST_WRITE_TIME) || flags.is(CleanupFlags::SET_CHANGE_TIME) {
+        // WinFsp asks for the modification time to be stamped from state it
+        // keeps per file, not per open, so the request also arrives on an open
+        // that only set an explicit time — and stamping then would overwrite
+        // the time the application just set. The server already moves the
+        // time on every write; stamp only for an open that changed the file
+        // and did not choose a time itself.
+        if (flags.is(CleanupFlags::SET_LAST_WRITE_TIME) || flags.is(CleanupFlags::SET_CHANGE_TIME))
+            && context.modified.load(Ordering::Acquire)
+            && !context.explicit_write_time.load(Ordering::Acquire)
+        {
             self.set_modified_now(context.inode());
         }
         if delete && let Some(location) = self.location_of(&context) {
@@ -976,6 +993,7 @@ impl FileSystemInterface for WindowsFilesystem {
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
         }
+        context.modified.store(true, Ordering::Release);
         if let Some(stream) = &context.stream {
             return self.stream_write(&context, stream, buffer, mode);
         }
@@ -1121,6 +1139,9 @@ impl FileSystemInterface for WindowsFilesystem {
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
         }
+        if changes.modified_unix_ms.is_some() {
+            context.explicit_write_time.store(true, Ordering::Release);
+        }
         let metadata = self
             .block_on(self.adapter().setattr_async(context.inode(), None, changes))
             .map_err(adapter_status)?;
@@ -1137,6 +1158,7 @@ impl FileSystemInterface for WindowsFilesystem {
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
         }
+        context.modified.store(true, Ordering::Release);
         if let Some(stream) = &context.stream {
             return self.stream_set_size(&context, stream, new_size, set_allocation_size);
         }
