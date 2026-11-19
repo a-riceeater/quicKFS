@@ -28,6 +28,7 @@
 
 pub mod attributes;
 pub mod path;
+pub mod reparse;
 pub mod resolve;
 pub mod status;
 
