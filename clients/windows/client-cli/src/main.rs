@@ -460,7 +460,7 @@ mod windows {
     }
 
     fn run_unmount(mountpoint: &str) -> Result<()> {
-        let mountpoint = MountPoint::parse(mountpoint)?;
+        let mountpoint = MountPoint::named(mountpoint)?;
         if mountpoint == MountPoint::NextAvailable {
             bail!("name the drive letter to unmount; `*` only chooses one when mounting");
         }

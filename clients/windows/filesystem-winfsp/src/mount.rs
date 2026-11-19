@@ -39,7 +39,8 @@ const MAX_COMPONENT_LENGTH: u16 = 255;
 pub enum MountPoint {
     /// A drive letter such as `Q:`.
     DriveLetter(char),
-    /// An empty directory on an existing NTFS volume.
+    /// A directory that does not exist yet, inside one that does. WinFsp
+    /// creates it for the life of the mount.
     Directory(String),
     /// Whichever drive letter is free, counting down from `Z:`.
     NextAvailable,
@@ -49,6 +50,34 @@ impl MountPoint {
     /// Parse the mountpoint spelling the CLI accepts: `Q`, `Q:`, `Q:\`, `*`, or
     /// a directory path.
     pub fn parse(value: &str) -> Result<Self, MountError> {
+        let parsed = Self::named(value)?;
+        let Self::Directory(trimmed) = &parsed else {
+            return Ok(parsed);
+        };
+        // WinFsp creates the directory itself, as a reparse point onto the
+        // volume, and removes it again on unmount, so it must not exist yet —
+        // WinFsp refuses an existing one with a name collision — while its
+        // parent must. That also means a mount can never hide files the user
+        // already keeps there.
+        let path = Path::new(trimmed);
+        if path.exists() {
+            return Err(MountError::InvalidMountPoint(format!(
+                "'{trimmed}' already exists; WinFsp creates the mount directory itself, \
+                 so name one that does not exist yet"
+            )));
+        }
+        match path.parent() {
+            Some(parent) if parent.is_dir() => Ok(parsed),
+            _ => Err(MountError::InvalidMountPoint(format!(
+                "'{trimmed}' is neither a drive letter nor a new directory inside an existing one"
+            ))),
+        }
+    }
+
+    /// Read a mountpoint's spelling without checking the filesystem, for
+    /// naming a mount that already exists — `quickfs unmount` — where the
+    /// directory is, by then, the mounted volume itself.
+    pub fn named(value: &str) -> Result<Self, MountError> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return Err(MountError::InvalidMountPoint(
@@ -65,15 +94,6 @@ impl MountPoint {
             && (rest.is_empty() || rest == ":")
         {
             return Ok(Self::DriveLetter(letter.to_ascii_uppercase()));
-        }
-        // Anything else has to be a directory, and it has to already exist and
-        // be empty: WinFsp cannot create it, and mounting over a directory with
-        // contents would hide the user's files behind the volume.
-        let path = Path::new(trimmed);
-        if !path.is_dir() {
-            return Err(MountError::InvalidMountPoint(format!(
-                "'{trimmed}' is neither a drive letter nor an existing directory"
-            )));
         }
         Ok(Self::Directory(trimmed.to_owned()))
     }
@@ -432,14 +452,23 @@ mod tests {
     }
 
     #[test]
-    fn a_mountpoint_directory_must_already_exist() {
+    fn a_mountpoint_directory_is_a_new_name_in_an_existing_directory() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().to_string_lossy().into_owned();
+        let mount = format!("{path}\\raid");
         assert_eq!(
-            MountPoint::parse(&path).unwrap(),
+            MountPoint::parse(&mount).unwrap(),
+            MountPoint::Directory(mount.clone())
+        );
+        // An existing directory is refused: WinFsp creates the directory.
+        assert!(MountPoint::parse(&path).is_err());
+        // So is one whose parent does not exist.
+        assert!(MountPoint::parse(&format!("{path}\\absent\\raid")).is_err());
+        // Naming a mount that exists needs no such checks.
+        assert_eq!(
+            MountPoint::named(&path).unwrap(),
             MountPoint::Directory(path.clone())
         );
-        assert!(MountPoint::parse(&format!("{path}\\absent")).is_err());
         assert!(MountPoint::parse("").is_err());
     }
 
@@ -489,8 +518,8 @@ mod tests {
     #[test]
     fn the_volume_name_prefers_explicit_then_renamed_export_then_folder() {
         let directory = tempfile::tempdir().unwrap();
+        // Not created: WinFsp creates a directory mountpoint itself.
         let folder = directory.path().join("raid");
-        std::fs::create_dir(&folder).unwrap();
         let in_folder = MountPoint::parse(&folder.to_string_lossy()).unwrap();
         let drive = MountPoint::DriveLetter('Q');
 
