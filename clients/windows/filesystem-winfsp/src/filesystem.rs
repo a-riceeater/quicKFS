@@ -30,12 +30,13 @@ use crate::{
     attributes::{self, allocation_size},
     handle::Handle,
     path::{self, PathError},
+    reparse,
     resolve::{Resolved, Resolver},
     status::{self, NtStatus},
 };
 use quickfs_fs_adapter::{Adapter, AdapterError, DirectoryListing, ROOT_INODE};
 use quickfs_protocol::{
-    AttributeChanges, FileAccess, FileOpenOptions, FilesystemCapabilities, Metadata, Name,
+    AttributeChanges, FileAccess, FileOpenOptions, FilesystemCapabilities, Metadata, Name, NodeId,
     NodeKind, RenameMode,
 };
 use std::{
@@ -60,6 +61,12 @@ pub const ALLOCATION_UNIT: u64 = 4_096;
 /// forwards an application's request at its full size, and the adapter bounds
 /// a single callback's I/O.
 const MAX_IO_PIECE: usize = quickfs_fs_adapter::MAX_CALLBACK_IO_SIZE as usize;
+
+/// Links followed when deciding whether a link points at a directory.
+const MAX_LINK_HOPS: usize = 8;
+
+/// Link-kind answers remembered before the cache starts over.
+const MAX_CACHED_LINK_KINDS: usize = 4_096;
 
 /// Default permissions for nodes this client creates. The server applies its
 /// own policy on top; these are only the request.
@@ -95,8 +102,13 @@ struct OpenDirectory {
 /// Per-open state. One of these exists for each successful `Create` or `Open`
 /// and lives until the matching `Close`.
 pub struct FileContext {
-    inode: u64,
-    kind: NodeKind,
+    /// The node this open names and its kind. Fixed for the life of the open,
+    /// except that `SetReparsePoint` replaces a freshly created placeholder
+    /// with the link it was created to become.
+    identity: Mutex<(u64, NodeKind)>,
+    /// Components of the path this open was made through, kept current across
+    /// renames. A link's target is resolved relative to its directory.
+    path: Mutex<Vec<String>>,
     granted_access: FileAccessRights,
     location: Mutex<Option<Location>>,
     /// The adapter's logical file handle, opened on first use.
@@ -112,10 +124,11 @@ impl FileContext {
         resolved: &Resolved,
         granted_access: FileAccessRights,
         location: Option<Location>,
+        path: Vec<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            inode: resolved.inode,
-            kind: resolved.kind(),
+            identity: Mutex::new((resolved.inode, resolved.kind())),
+            path: Mutex::new(path),
             granted_access,
             location: Mutex::new(location),
             file: Mutex::new(None),
@@ -124,8 +137,47 @@ impl FileContext {
         })
     }
 
+    fn inode(&self) -> u64 {
+        self.identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+    }
+
+    fn kind(&self) -> NodeKind {
+        self.identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+    }
+
+    fn replace_identity(&self, inode: u64, kind: NodeKind) {
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (inode, kind);
+    }
+
+    fn path(&self) -> Vec<String> {
+        self.path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_path(&self, path: Vec<String>) {
+        *self
+            .path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+    }
+
     fn is_directory(&self) -> bool {
-        self.kind == NodeKind::Directory
+        self.kind() == NodeKind::Directory
+    }
+
+    fn is_symlink(&self) -> bool {
+        self.kind() == NodeKind::Symlink
     }
 
     /// Whether this open was granted enough access to modify file contents.
@@ -189,6 +241,9 @@ impl SecurityDescriptors {
 pub struct WindowsFilesystem {
     resolver: Resolver,
     security: SecurityDescriptors,
+    /// Whether each link (by node and revision) points at a directory, which
+    /// Windows needs to know to present it as a directory link.
+    link_kinds: Mutex<HashMap<(NodeId, u64), bool>>,
     capabilities: FilesystemCapabilities,
     volume_label: U16CString,
 }
@@ -205,6 +260,7 @@ impl WindowsFilesystem {
         Ok(Self {
             resolver: Resolver::new(adapter),
             security: SecurityDescriptors::new(owner_sid),
+            link_kinds: Mutex::new(HashMap::new()),
             capabilities,
             volume_label,
         })
@@ -262,14 +318,113 @@ impl WindowsFilesystem {
         .set_last_access_time(attributes::filetime_from_unix_ms(metadata.accessed_unix_ms))
         .set_last_write_time(attributes::filetime_from_unix_ms(metadata.modified_unix_ms))
         .set_change_time(attributes::filetime_from_unix_ms(metadata.modified_unix_ms))
-        // The protocol node id is a UUID and does not fit a 64-bit index, so
-        // the adapter's stable inode is reported instead. It is unique and
-        // stable for the life of the mount, which is what an application uses
-        // it for.
-        .set_index_number(0)
-        .set_hard_links(0)
+        // The protocol node id is a persistent keyed digest of the server's
+        // device and inode, so folding it to 64 bits gives a file ID that is
+        // stable across remounts and reconnects, as NTFS file IDs are. Tools
+        // that detect renames or hard links by file ID depend on that.
+        .set_index_number(index_number(metadata.node))
+        .set_hard_links(metadata.link_count)
         .set_ea_size(0);
+        if metadata.kind == NodeKind::Symlink {
+            info.set_reparse_tag(reparse::IO_REPARSE_TAG_SYMLINK);
+        }
         info
+    }
+
+    /// [`Self::file_info`] for an entry that lives in `directory`, which is
+    /// what a link needs: whether it is presented as a directory link depends
+    /// on what its target is.
+    fn entry_info(
+        &self,
+        inode: u64,
+        metadata: &Metadata,
+        name: &Name,
+        directory: &[String],
+    ) -> FileInfo {
+        let mut info = self.file_info(metadata, name);
+        if metadata.kind == NodeKind::Symlink
+            && self.link_points_to_directory(inode, metadata, directory)
+        {
+            let attributes = info.file_attributes().0 | FileAttributes::DIRECTORY.0;
+            info.set_file_attributes(FileAttributes(attributes));
+        }
+        info
+    }
+
+    /// Whether the link `inode` in `directory` resolves to a directory,
+    /// following at most [`MAX_LINK_HOPS`] links. Anything unresolvable is a
+    /// file link, which is what Windows assumes of a link it cannot follow.
+    fn link_points_to_directory(
+        &self,
+        inode: u64,
+        metadata: &Metadata,
+        directory: &[String],
+    ) -> bool {
+        let key = (metadata.node, metadata.revision);
+        if let Ok(cache) = self.link_kinds.lock()
+            && let Some(known) = cache.get(&key)
+        {
+            return *known;
+        }
+        let mut hops = 0;
+        let mut current = (inode, directory.to_vec());
+        // The reference on each followed link is held until it has been read,
+        // and returned before the next hop.
+        let mut held: Option<Resolved> = None;
+        let answer = loop {
+            let target = self.block_on(self.adapter().readlink_async(current.0));
+            if let Some(previous) = held.take() {
+                self.resolver.release_resolved(&previous);
+            }
+            let Ok(target) = target else {
+                break false;
+            };
+            let Some(components) = reparse::target_components(&current.1, &target) else {
+                break false;
+            };
+            let Ok(resolved) = self.block_on(self.resolver.resolve(&components)) else {
+                break false;
+            };
+            match resolved.kind() {
+                NodeKind::Symlink if hops < MAX_LINK_HOPS => {
+                    hops += 1;
+                    let mut parent = components;
+                    parent.pop();
+                    current = (resolved.inode, parent);
+                    held = Some(resolved);
+                }
+                kind => {
+                    self.resolver.release_resolved(&resolved);
+                    break kind == NodeKind::Directory;
+                }
+            }
+        };
+        if let Ok(mut cache) = self.link_kinds.lock() {
+            if cache.len() >= MAX_CACHED_LINK_KINDS {
+                cache.clear();
+            }
+            cache.insert(key, answer);
+        }
+        answer
+    }
+
+    /// The reparse buffer for the link `inode` found at `path`.
+    fn link_reparse_data(
+        &self,
+        inode: u64,
+        path: &[String],
+        buffer: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        let target = self
+            .block_on(self.adapter().readlink_async(inode))
+            .map_err(adapter_status)?;
+        let directory = path.split_last().map(|(_, parent)| parent).unwrap_or(&[]);
+        let windows = reparse::windows_target(&target, directory)
+            .map_err(|_| status::STATUS_IO_REPARSE_DATA_INVALID)?;
+        reparse::encode_symlink(&windows, buffer).map_err(|error| match error {
+            reparse::ReparseError::BufferTooSmall => status::STATUS_BUFFER_TOO_SMALL,
+            _ => status::STATUS_IO_REPARSE_DATA_INVALID,
+        })
     }
 
     fn info_for(&self, inode: u64, name: &Name) -> Result<FileInfo, NtStatus> {
@@ -303,7 +458,7 @@ impl WindowsFilesystem {
             append: false,
         };
         let handle = self
-            .block_on(self.adapter().open_async(context.inode, options))
+            .block_on(self.adapter().open_async(context.inode(), options))
             .map_err(adapter_status)?;
         *slot = Some(handle);
         Ok(handle)
@@ -330,11 +485,11 @@ impl WindowsFilesystem {
             return Err(status::STATUS_NOT_A_DIRECTORY);
         }
         let handle = self
-            .block_on(self.adapter().opendir_async(context.inode))
+            .block_on(self.adapter().opendir_async(context.inode()))
             .map_err(adapter_status)?;
         let (listing, current, parent) = self
             .adapter()
-            .directory_listing_with_metadata(handle, context.inode)
+            .directory_listing_with_metadata(handle, context.inode())
             .map_err(|error| {
                 let _ = self.adapter().releasedir(handle);
                 adapter_status(error)
@@ -434,6 +589,10 @@ impl FileSystemInterface for WindowsFilesystem {
     const READ_DIRECTORY_DEFINED: bool = true;
     const GET_DIR_INFO_BY_NAME_DEFINED: bool = true;
     const SET_DELETE_DEFINED: bool = true;
+    const GET_REPARSE_POINT_DEFINED: bool = true;
+    const SET_REPARSE_POINT_DEFINED: bool = true;
+    const DELETE_REPARSE_POINT_DEFINED: bool = true;
+    const RESOLVE_REPARSE_POINTS_DEFINED: bool = true;
 
     fn get_volume_info(&self) -> Result<VolumeInfo, NtStatus> {
         let statistics = self
@@ -453,9 +612,24 @@ impl FileSystemInterface for WindowsFilesystem {
     fn get_security_by_name(
         &self,
         file_name: &U16CStr,
-        _find_reparse_point: impl Fn() -> Option<FileAttributes>,
+        find_reparse_point: impl Fn() -> Option<FileAttributes>,
     ) -> Result<(FileAttributes, PSecurityDescriptor, bool), NtStatus> {
-        let resolved = self.resolve_transient(file_name)?;
+        let resolved = match self.resolve_transient(file_name) {
+            Ok(resolved) => resolved,
+            // The walk stops at a link that is not the last component; WinFsp
+            // then reparses the name through it. The value it hands back is the
+            // index of that component, which is what WinFsp expects here.
+            Err(error) => {
+                return match find_reparse_point() {
+                    Some(index) => Ok((
+                        index,
+                        self.security.for_node(0o755, NodeKind::Directory)?,
+                        true,
+                    )),
+                    None => Err(error),
+                };
+            }
+        };
         let name = final_name(file_name);
         let attributes = FileAttributes(attributes::file_attributes(
             resolved.metadata.kind,
@@ -479,13 +653,14 @@ impl FileSystemInterface for WindowsFilesystem {
         }
         let (parent, name) = self.parent_and_name(file_name, true)?;
         let parent_inode = parent.inode;
+        let path = self.components(file_name)?;
         let result = if create_file_info
             .create_options
             .is(CreateOptions::FILE_DIRECTORY_FILE)
         {
-            self.create_directory(parent_inode, &name, create_file_info)
+            self.create_directory(parent_inode, &name, create_file_info, path)
         } else {
-            self.create_file(parent_inode, &name, create_file_info)
+            self.create_file(parent_inode, &name, create_file_info, path)
         };
         self.resolver.release_resolved(&parent);
         let (context, info) = result?;
@@ -538,16 +713,22 @@ impl FileSystemInterface for WindowsFilesystem {
         // Windows asks for a directory or a non-directory explicitly, and an
         // application that opened a directory expecting a file misbehaves in
         // ways that are hard to trace back here.
-        let mismatch =
-            if create_options.is(CreateOptions::FILE_DIRECTORY_FILE) && !resolved.is_directory() {
-                Some(status::STATUS_NOT_A_DIRECTORY)
-            } else if create_options.is(CreateOptions::FILE_NON_DIRECTORY_FILE)
-                && resolved.is_directory()
-            {
-                Some(status::STATUS_FILE_IS_A_DIRECTORY)
-            } else {
-                None
-            };
+        // A link is opened as itself here — WinFsp has already followed it
+        // unless the caller asked for the link — and a directory link is
+        // legitimately opened with either option.
+        let is_link = resolved.kind() == NodeKind::Symlink;
+        let mismatch = if is_link {
+            None
+        } else if create_options.is(CreateOptions::FILE_DIRECTORY_FILE) && !resolved.is_directory()
+        {
+            Some(status::STATUS_NOT_A_DIRECTORY)
+        } else if create_options.is(CreateOptions::FILE_NON_DIRECTORY_FILE)
+            && resolved.is_directory()
+        {
+            Some(status::STATUS_FILE_IS_A_DIRECTORY)
+        } else {
+            None
+        };
         if let Some(status) = mismatch {
             self.resolver.release_resolved(&resolved);
             return Err(status);
@@ -557,8 +738,12 @@ impl FileSystemInterface for WindowsFilesystem {
             .as_ref()
             .map(|location| location.name.clone())
             .unwrap_or_default();
-        let info = self.file_info(&resolved.metadata, &name);
-        let context = FileContext::new(&resolved, granted_access, location);
+        let directory = components
+            .split_last()
+            .map(|(_, parent)| parent)
+            .unwrap_or(&[]);
+        let info = self.entry_info(resolved.inode, &resolved.metadata, &name, directory);
+        let context = FileContext::new(&resolved, granted_access, location, components.clone());
         if create_options.is(CreateOptions::FILE_DELETE_ON_CLOSE) {
             context.delete_on_close.store(true, Ordering::Release);
         }
@@ -590,7 +775,7 @@ impl FileSystemInterface for WindowsFilesystem {
         let metadata = self
             .block_on(
                 self.adapter()
-                    .setattr_async(context.inode, Some(handle), changes),
+                    .setattr_async(context.inode(), Some(handle), changes),
             )
             .map_err(adapter_status)?;
         Ok(self.file_info(&metadata, &self.name_of(&context)))
@@ -611,7 +796,7 @@ impl FileSystemInterface for WindowsFilesystem {
         // every step here is best effort and errors are swallowed after being
         // attempted.
         if flags.is(CleanupFlags::SET_LAST_WRITE_TIME) || flags.is(CleanupFlags::SET_CHANGE_TIME) {
-            self.set_modified_now(context.inode);
+            self.set_modified_now(context.inode());
         }
         if (flags.is(CleanupFlags::DELETE) || context.delete_on_close.load(Ordering::Acquire))
             && let Some(location) = self.location_of(&context)
@@ -630,20 +815,8 @@ impl FileSystemInterface for WindowsFilesystem {
         };
         // Unconditional teardown: an interrupted or failed operation must not
         // leave a server-side descriptor or an inode reference behind.
-        if let Ok(mut slot) = context.file.lock()
-            && let Some(handle) = slot.take()
-        {
-            let _ = self.block_on(
-                self.adapter()
-                    .release_async(handle, context.writable(), None),
-            );
-        }
-        if let Ok(mut slot) = context.directory.lock()
-            && let Some(open) = slot.take()
-        {
-            let _ = self.adapter().releasedir(open.handle);
-        }
-        self.resolver.release(context.inode);
+        self.release_open_handles(&context);
+        self.resolver.release(context.inode());
     }
 
     fn read(
@@ -705,7 +878,7 @@ impl FileSystemInterface for WindowsFilesystem {
         }
         let handle = self.file_handle(&context)?;
         let current = self
-            .block_on(self.adapter().getattr_async(context.inode))
+            .block_on(self.adapter().getattr_async(context.inode()))
             .map_err(adapter_status)?;
 
         let (offset, buffer) = match mode {
@@ -744,7 +917,7 @@ impl FileSystemInterface for WindowsFilesystem {
             }
         }
         let metadata = self
-            .block_on(self.adapter().getattr_async(context.inode))
+            .block_on(self.adapter().getattr_async(context.inode()))
             .map_err(adapter_status)?;
         Ok((written, self.file_info(&metadata, &self.name_of(&context))))
     }
@@ -758,7 +931,7 @@ impl FileSystemInterface for WindowsFilesystem {
             return Ok(FileInfo::default());
         };
         if context.is_directory() {
-            return self.info_for(context.inode, &self.name_of(&context));
+            return self.info_for(context.inode(), &self.name_of(&context));
         }
         let handle = {
             let slot = context
@@ -771,12 +944,25 @@ impl FileSystemInterface for WindowsFilesystem {
             self.block_on(self.adapter().fsync_async(handle, false))
                 .map_err(adapter_status)?;
         }
-        self.info_for(context.inode, &self.name_of(&context))
+        self.info_for(context.inode(), &self.name_of(&context))
     }
 
     fn get_file_info(&self, context: Self::FileContext) -> Result<FileInfo, NtStatus> {
         let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
-        self.info_for(context.inode, &self.name_of(&context))
+        if context.is_symlink() {
+            let metadata = self
+                .block_on(self.adapter().getattr_async(context.inode()))
+                .map_err(adapter_status)?;
+            let path = context.path();
+            let directory = path.split_last().map(|(_, parent)| parent).unwrap_or(&[]);
+            return Ok(self.entry_info(
+                context.inode(),
+                &metadata,
+                &self.name_of(&context),
+                directory,
+            ));
+        }
+        self.info_for(context.inode(), &self.name_of(&context))
     }
 
     fn set_basic_info(
@@ -790,7 +976,7 @@ impl FileSystemInterface for WindowsFilesystem {
     ) -> Result<FileInfo, NtStatus> {
         let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
         let current = self
-            .block_on(self.adapter().getattr_async(context.inode))
+            .block_on(self.adapter().getattr_async(context.inode()))
             .map_err(adapter_status)?;
 
         // `INVALID_FILE_ATTRIBUTES` means "leave the attributes alone"; a zero
@@ -823,7 +1009,7 @@ impl FileSystemInterface for WindowsFilesystem {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
         }
         let metadata = self
-            .block_on(self.adapter().setattr_async(context.inode, None, changes))
+            .block_on(self.adapter().setattr_async(context.inode(), None, changes))
             .map_err(adapter_status)?;
         Ok(self.file_info(&metadata, &self.name_of(&context)))
     }
@@ -842,7 +1028,7 @@ impl FileSystemInterface for WindowsFilesystem {
             return Err(status::STATUS_FILE_IS_A_DIRECTORY);
         }
         let current = self
-            .block_on(self.adapter().getattr_async(context.inode))
+            .block_on(self.adapter().getattr_async(context.inode()))
             .map_err(adapter_status)?;
 
         // An allocation-size change is a hint about reserved space, not about
@@ -875,7 +1061,10 @@ impl FileSystemInterface for WindowsFilesystem {
             backup_unix_ms: None,
         };
         let metadata = self
-            .block_on(self.adapter().setattr_async(context.inode, handle, changes))
+            .block_on(
+                self.adapter()
+                    .setattr_async(context.inode(), handle, changes),
+            )
             .map_err(adapter_status)?;
         Ok(self.file_info(&metadata, &self.name_of(&context)))
     }
@@ -920,6 +1109,7 @@ impl FileSystemInterface for WindowsFilesystem {
             .location_of(&context)
             .ok_or(status::STATUS_INVALID_HANDLE)?;
         let (destination, new_name) = self.parent_and_name(new_file_name, true)?;
+        let new_path = self.components(new_file_name)?;
         let destination_inode = destination.inode;
         let mode = if replace_if_exists {
             RenameMode::Replace
@@ -944,13 +1134,14 @@ impl FileSystemInterface for WindowsFilesystem {
                 name: new_name,
             },
         );
+        context.set_path(new_path);
         Ok(())
     }
 
     fn get_security(&self, context: Self::FileContext) -> Result<PSecurityDescriptor, NtStatus> {
         let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
         let metadata = self
-            .block_on(self.adapter().getattr_async(context.inode))
+            .block_on(self.adapter().getattr_async(context.inode()))
             .map_err(adapter_status)?;
         self.security.for_node(metadata.mode, metadata.kind)
     }
@@ -982,7 +1173,7 @@ impl FileSystemInterface for WindowsFilesystem {
 
         // `.` and `..` are part of a Windows directory listing for everything
         // except the volume root, whose parent lies outside the export.
-        if context.inode != ROOT_INODE {
+        if context.inode() != ROOT_INODE {
             let dot = self.file_info(&current, &Name::from(".".to_owned()));
             if emit(vec![u16::from(b'.')], dot) == Some(false) {
                 return Ok(());
@@ -993,6 +1184,7 @@ impl FileSystemInterface for WindowsFilesystem {
             }
         }
 
+        let directory = context.path();
         for entry in &listing.entries {
             // A name the Windows namespace cannot express is skipped rather
             // than mangled: a mangled name would appear in Explorer and then
@@ -1001,7 +1193,7 @@ impl FileSystemInterface for WindowsFilesystem {
             let Some(name) = path::encode_entry_name(entry.name.as_bytes()) else {
                 continue;
             };
-            let info = self.file_info(&entry.metadata, &entry.name);
+            let info = self.entry_info(entry.inode, &entry.metadata, &entry.name, &directory);
             match emit(name, info) {
                 Some(true) => {}
                 // The buffer is full; WinFsp will call again with the last
@@ -1029,12 +1221,164 @@ impl FileSystemInterface for WindowsFilesystem {
         let result = self
             .block_on(
                 self.adapter()
-                    .lookup_async(context.inode, Name::from(name.clone())),
+                    .lookup_async(context.inode(), Name::from(name.clone())),
             )
             .map_err(adapter_status)?;
-        let info = self.file_info(&result.metadata, &Name::from(name));
+        let info = self.entry_info(
+            result.inode,
+            &result.metadata,
+            &Name::from(name),
+            &context.path(),
+        );
         self.resolver.release(result.inode);
         Ok(info)
+    }
+
+    fn get_reparse_point_by_name(
+        &self,
+        file_name: &U16CStr,
+        _is_directory: bool,
+        buffer: Option<&mut [u8]>,
+    ) -> Result<usize, NtStatus> {
+        let components = self.components(file_name)?;
+        // Held, not transient: a link is not a directory, so releasing it
+        // would let the adapter forget the inode before it is read.
+        let resolved = self
+            .block_on(self.resolver.resolve(&components))
+            .map_err(adapter_status)?;
+        let result = if resolved.kind() != NodeKind::Symlink {
+            Err(status::STATUS_NOT_A_REPARSE_POINT)
+        } else {
+            match buffer {
+                Some(buffer) => self.link_reparse_data(resolved.inode, &components, buffer),
+                // WinFsp only asks whether this component is a reparse point,
+                // and passes no size slot to fill. `winfsp_wrs` writes the size
+                // slot on every `Ok`, so success is reported through the status
+                // path, which writes nothing: `STATUS_SUCCESS` is what WinFsp
+                // tests for.
+                None => Err(status::STATUS_SUCCESS),
+            }
+        };
+        self.resolver.release_resolved(&resolved);
+        result
+    }
+
+    fn get_reparse_point(
+        &self,
+        context: Self::FileContext,
+        file_name: &U16CStr,
+        buffer: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
+        if !context.is_symlink() {
+            return Err(status::STATUS_NOT_A_REPARSE_POINT);
+        }
+        let path = self
+            .components(file_name)
+            .unwrap_or_else(|_| context.path());
+        self.link_reparse_data(context.inode(), &path, buffer)
+    }
+
+    fn set_reparse_point(
+        &self,
+        context: Self::FileContext,
+        _file_name: &U16CStr,
+        buffer: &mut [u8],
+    ) -> Result<(), NtStatus> {
+        let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
+        if !self.capabilities.writable {
+            return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        let target = match reparse::decode_symlink(buffer) {
+            Ok((target, relative)) => reparse::posix_target(&target, relative),
+            Err(error) => Err(error),
+        }
+        .map_err(|error| match error {
+            reparse::ReparseError::UnsupportedTag => status::STATUS_IO_REPARSE_TAG_NOT_HANDLED,
+            reparse::ReparseError::AbsoluteTarget => status::STATUS_ACCESS_DENIED,
+            _ => status::STATUS_IO_REPARSE_DATA_INVALID,
+        })?;
+        let location = self
+            .location_of(&context)
+            .ok_or(status::STATUS_INVALID_HANDLE)?;
+        // `CreateSymbolicLink` creates an empty file or directory first and
+        // then sets the link on it. quicKFS stores a link as its own kind of
+        // node, so the placeholder is replaced: it must still be empty, which
+        // is what makes this safe to do to a node that already existed.
+        let current = self
+            .block_on(self.adapter().getattr_async(context.inode()))
+            .map_err(adapter_status)?;
+        match current.kind {
+            NodeKind::File if current.size == 0 => {}
+            NodeKind::Directory => {
+                let (listing, _, _) = self.directory_snapshot(&context)?;
+                if !listing.entries.is_empty() {
+                    return Err(status::STATUS_DIRECTORY_NOT_EMPTY);
+                }
+            }
+            _ => return Err(status::STATUS_IO_REPARSE_DATA_INVALID),
+        }
+        self.release_open_handles(&context);
+        self.block_on(self.adapter().remove_async(
+            location.parent_inode,
+            location.name.clone(),
+            current.kind == NodeKind::Directory,
+        ))
+        .map_err(adapter_status)?;
+        let created = self
+            .block_on(self.adapter().create_symlink_async(
+                location.parent_inode,
+                location.name,
+                target,
+            ))
+            .map_err(adapter_status)?;
+        let previous = context.inode();
+        context.replace_identity(created.inode, NodeKind::Symlink);
+        self.resolver.release(previous);
+        Ok(())
+    }
+
+    fn delete_reparse_point(
+        &self,
+        context: Self::FileContext,
+        _file_name: &U16CStr,
+        _buffer: &mut [u8],
+    ) -> Result<(), NtStatus> {
+        let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
+        if !self.capabilities.writable {
+            return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        if !context.is_symlink() {
+            return Err(status::STATUS_NOT_A_REPARSE_POINT);
+        }
+        let location = self
+            .location_of(&context)
+            .ok_or(status::STATUS_INVALID_HANDLE)?;
+        // NTFS leaves an ordinary empty file behind when a link's reparse data
+        // is deleted; do the same.
+        self.block_on(self.adapter().remove_async(
+            location.parent_inode,
+            location.name.clone(),
+            false,
+        ))
+        .map_err(adapter_status)?;
+        let created = self
+            .block_on(self.adapter().create_file_async(
+                location.parent_inode,
+                location.name,
+                DEFAULT_FILE_MODE,
+                FileOpenOptions {
+                    access: FileAccess::ReadOnly,
+                    truncate: false,
+                    append: false,
+                },
+            ))
+            .map_err(adapter_status)?;
+        let _ = self.block_on(self.adapter().release_async(created.handle, false, None));
+        let previous = context.inode();
+        context.replace_identity(created.inode, NodeKind::File);
+        self.resolver.release(previous);
+        Ok(())
     }
 
     const DISPATCHER_STOPPED_DEFINED: bool = true;
@@ -1049,6 +1393,23 @@ impl FileSystemInterface for WindowsFilesystem {
 }
 
 impl WindowsFilesystem {
+    /// Close whatever server file and directory handles `context` holds.
+    fn release_open_handles(&self, context: &FileContext) {
+        if let Ok(mut slot) = context.file.lock()
+            && let Some(handle) = slot.take()
+        {
+            let _ = self.block_on(
+                self.adapter()
+                    .release_async(handle, context.writable(), None),
+            );
+        }
+        if let Ok(mut slot) = context.directory.lock()
+            && let Some(open) = slot.take()
+        {
+            let _ = self.adapter().releasedir(open.handle);
+        }
+    }
+
     fn name_of(&self, context: &FileContext) -> Name {
         self.location_of(context)
             .map(|location| location.name)
@@ -1060,6 +1421,7 @@ impl WindowsFilesystem {
         parent_inode: u64,
         name: &Name,
         create_file_info: CreateFileInfo,
+        path: Vec<String>,
     ) -> Result<(Arc<FileContext>, FileInfo), NtStatus> {
         let mode = if create_file_info
             .file_attributes
@@ -1097,7 +1459,7 @@ impl WindowsFilesystem {
             inode: created.inode,
             metadata: created.metadata,
         };
-        let context = FileContext::new(&resolved, create_file_info.granted_access, None);
+        let context = FileContext::new(&resolved, create_file_info.granted_access, None, path);
         if let Ok(mut slot) = context.file.lock() {
             *slot = Some(created.handle);
         }
@@ -1115,6 +1477,7 @@ impl WindowsFilesystem {
         parent_inode: u64,
         name: &Name,
         create_file_info: CreateFileInfo,
+        path: Vec<String>,
     ) -> Result<(Arc<FileContext>, FileInfo), NtStatus> {
         let created = self
             .block_on(self.adapter().create_directory_async(
@@ -1128,7 +1491,7 @@ impl WindowsFilesystem {
             inode: created.inode,
             metadata: created.metadata,
         };
-        let context = FileContext::new(&resolved, create_file_info.granted_access, None);
+        let context = FileContext::new(&resolved, create_file_info.granted_access, None, path);
         if create_file_info
             .create_options
             .is(CreateOptions::FILE_DELETE_ON_CLOSE)
@@ -1149,6 +1512,16 @@ const _: fn() = || {
     assert_shareable::<WindowsFilesystem>();
     assert_shareable::<FileContext>();
 };
+
+/// A 64-bit file ID for a node: its 128-bit identifier folded in half. Zero
+/// means "no file ID" to Windows, so it is avoided.
+fn index_number(node: NodeId) -> u64 {
+    let (high, low) = node.0.as_u64_pair();
+    match high ^ low {
+        0 => 1,
+        folded => folded,
+    }
+}
 
 /// The last component of a WinFsp path, for the hidden-attribute convention.
 /// A path that will not parse yields an empty name, which is never hidden.

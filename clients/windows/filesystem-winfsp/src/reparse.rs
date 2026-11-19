@@ -149,13 +149,11 @@ pub fn decode_symlink(buffer: &[u8]) -> Result<(String, bool), ReparseError> {
     let name = buffer
         .get(start..start + substitute_length)
         .ok_or(ReparseError::Malformed)?;
-    if name.len() % 2 != 0 {
+    let (pairs, rest) = name.as_chunks::<2>();
+    if !rest.is_empty() {
         return Err(ReparseError::Malformed);
     }
-    let units: Vec<u16> = name
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
+    let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
     let text = String::from_utf16(&units).map_err(|_| ReparseError::Malformed)?;
     Ok((text, flags & SYMLINK_FLAG_RELATIVE != 0))
 }
@@ -288,7 +286,7 @@ mod tests {
         assert_eq!(decode_symlink(&junction), Err(ReparseError::UnsupportedTag));
         assert_eq!(decode_symlink(&[0x0c, 0, 0]), Err(ReparseError::Malformed));
         let mut buffer = vec![0; 64];
-        let written = encode_symlink("abc", &mut buffer).unwrap();
+        encode_symlink("abc", &mut buffer).unwrap();
         assert_eq!(
             decode_symlink(&buffer[..SYMLINK_HEADER_BYTES + 2]),
             Err(ReparseError::Malformed)

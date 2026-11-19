@@ -283,7 +283,8 @@ pub fn volume_params(
         // Features this bridge does not implement. Advertising any of them
         // without the matching callbacks would make Windows issue requests that
         // fail deep inside an application instead of being cleanly unsupported.
-        .set_reparse_point(false)
+        // Symbolic links are presented as reparse points; see `reparse`.
+        .set_reparse_point(true)
         .set_named_streams(false)
         .set_extended_attributes(false)
         .set_hard_links(false);

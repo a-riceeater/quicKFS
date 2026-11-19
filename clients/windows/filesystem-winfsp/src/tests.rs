@@ -20,7 +20,7 @@ use crate::{
     status,
     testing::{MockFilesystem, adapter_for},
 };
-use quickfs_protocol::NodeId;
+use quickfs_protocol::{NodeId, ROOT_NODE};
 use std::sync::Arc;
 use widestring::U16CString;
 use winfsp_wrs::{
@@ -1126,4 +1126,215 @@ fn repeated_mount_teardown_returns_every_reference_and_handle() {
         );
     }
     eventually("every handle closed", || server.open_handles() == 0);
+}
+
+/// A tree with links: `\docs\` (a directory), `\docs\notes.txt`, and in the
+/// root `to-docs` (a directory link), `to-notes` (a file link), `dangling`,
+/// plus `\docs\rooted`, an absolute link.
+fn linked_tree() -> Harness {
+    let server = MockFilesystem::tree();
+    server.insert_symlink(ROOT_NODE, "to-docs", b"docs");
+    server.insert_symlink(ROOT_NODE, "to-notes", b"docs/notes.txt");
+    let docs = server.lookup_path(&["docs"]).unwrap();
+    server.insert_symlink(docs, "rooted", b"/readme.md");
+    server.insert_symlink(ROOT_NODE, "dangling", b"nowhere");
+    Harness::with(server)
+}
+
+fn open_link(harness: &Harness, path: &str) -> (Handle, FileInfo) {
+    harness
+        .try_open(
+            path,
+            CreateOptions::FILE_OPEN_REPARSE_POINT,
+            FileAccessRights::FILE_READ_ATTRIBUTES,
+        )
+        .unwrap()
+}
+
+#[test]
+fn links_are_symbolic_link_reparse_points_and_directory_links_are_directories() {
+    let harness = linked_tree();
+    for (path, directory) in [
+        ("\\to-docs", true),
+        ("\\to-notes", false),
+        ("\\dangling", false),
+        ("\\docs\\rooted", false),
+    ] {
+        let (handle, info) = open_link(&harness, path);
+        let attributes = info.file_attributes();
+        assert!(attributes.is(FileAttributes::REPARSE_POINT), "{path}");
+        assert_eq!(
+            info.reparse_tag(),
+            crate::reparse::IO_REPARSE_TAG_SYMLINK,
+            "{path}"
+        );
+        assert_eq!(
+            attributes.is(FileAttributes::DIRECTORY),
+            directory,
+            "{path}"
+        );
+        let again = harness.filesystem.get_file_info(handle.clone()).unwrap();
+        assert_eq!(again.file_attributes().0, attributes.0, "{path}");
+        harness.close(handle);
+    }
+}
+
+#[test]
+fn a_links_reparse_data_is_its_target_kept_inside_the_volume() {
+    let harness = linked_tree();
+    let mut buffer = vec![0u8; 512];
+    let mut read = |path: &str| {
+        let length = harness
+            .filesystem
+            .get_reparse_point_by_name(&wide(path), false, Some(&mut buffer))
+            .unwrap();
+        crate::reparse::decode_symlink(&buffer[..length]).unwrap()
+    };
+    assert_eq!(read("\\to-notes"), ("docs\\notes.txt".into(), true));
+    // `/readme.md` is a server path; it is presented relative to the export.
+    assert_eq!(read("\\docs\\rooted"), ("..\\readme.md".into(), true));
+
+    // A probe without a buffer only asks whether this is a reparse point.
+    assert_eq!(
+        harness
+            .filesystem
+            .get_reparse_point_by_name(&wide("\\to-docs"), true, None),
+        Err(status::STATUS_SUCCESS)
+    );
+    assert_eq!(
+        harness
+            .filesystem
+            .get_reparse_point_by_name(&wide("\\readme.md"), false, None),
+        Err(status::STATUS_NOT_A_REPARSE_POINT)
+    );
+
+    let (handle, _) = open_link(&harness, "\\to-docs");
+    let length = harness
+        .filesystem
+        .get_reparse_point(handle.clone(), &wide("\\to-docs"), &mut buffer)
+        .unwrap();
+    assert_eq!(
+        crate::reparse::decode_symlink(&buffer[..length]).unwrap(),
+        ("docs".into(), true)
+    );
+    harness.close(handle);
+}
+
+#[test]
+fn a_path_through_a_link_is_handed_back_to_windows_to_reparse() {
+    let harness = linked_tree();
+    let (_, _, reparse) = harness
+        .filesystem
+        .get_security_by_name(&wide("\\to-docs\\notes.txt"), || Some(FileAttributes(1)))
+        .unwrap();
+    assert!(reparse, "a link mid-path must be reported as a reparse");
+    // A genuinely absent path is still absent.
+    assert!(
+        harness
+            .filesystem
+            .get_security_by_name(&wide("\\missing\\x"), || None)
+            .is_err()
+    );
+}
+
+fn symlink_buffer(target: &str) -> Vec<u8> {
+    let mut buffer = vec![0u8; 512];
+    let length = crate::reparse::encode_symlink(target, &mut buffer).unwrap();
+    buffer.truncate(length);
+    buffer
+}
+
+#[test]
+fn creating_a_link_from_windows_replaces_the_placeholder_with_a_server_link() {
+    let harness = Harness::tree();
+    // `CreateSymbolicLink` creates an empty file, then sets the link on it.
+    let handle = harness.create_file("\\new-link");
+    let mut buffer = symlink_buffer("docs\\notes.txt");
+    harness
+        .filesystem
+        .set_reparse_point(handle.clone(), &wide("\\new-link"), &mut buffer)
+        .unwrap();
+    let info = harness.filesystem.get_file_info(handle.clone()).unwrap();
+    assert_eq!(info.reparse_tag(), crate::reparse::IO_REPARSE_TAG_SYMLINK);
+    harness.close(handle);
+
+    let link = node(&harness.server, &["new-link"]);
+    assert_eq!(
+        harness.server.kind(link),
+        Some(quickfs_protocol::NodeKind::Symlink)
+    );
+    assert_eq!(harness.server.contents(link).unwrap(), b"docs/notes.txt");
+    eventually("every handle closed", || harness.server.open_handles() == 0);
+
+    // A directory link starts as an empty directory.
+    let directory = harness.create_directory("\\dir-link");
+    let mut buffer = symlink_buffer("docs");
+    harness
+        .filesystem
+        .set_reparse_point(directory.clone(), &wide("\\dir-link"), &mut buffer)
+        .unwrap();
+    harness.close(directory);
+    let link = node(&harness.server, &["dir-link"]);
+    assert_eq!(harness.server.contents(link).unwrap(), b"docs");
+}
+
+#[test]
+fn a_link_that_would_mean_nothing_on_the_server_is_refused() {
+    let harness = Harness::tree();
+    let handle = harness.create_file("\\absolute");
+    let mut absolute = symlink_buffer("x");
+    // Clear SYMLINK_FLAG_RELATIVE: an absolute Windows target.
+    absolute[16..20].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        harness
+            .filesystem
+            .set_reparse_point(handle.clone(), &wide("\\absolute"), &mut absolute),
+        Err(status::STATUS_ACCESS_DENIED)
+    );
+    harness.close(handle);
+    // The placeholder is untouched.
+    let placeholder = node(&harness.server, &["absolute"]);
+    assert_eq!(
+        harness.server.kind(placeholder),
+        Some(quickfs_protocol::NodeKind::File)
+    );
+
+    // A file with contents is never silently replaced by a link.
+    let handle = harness.open("\\readme.md", FileAccessRights::FILE_WRITE_DATA);
+    let mut buffer = symlink_buffer("docs");
+    assert!(
+        harness
+            .filesystem
+            .set_reparse_point(handle.clone(), &wide("\\readme.md"), &mut buffer)
+            .is_err()
+    );
+    harness.close(handle);
+    assert_eq!(
+        harness
+            .server
+            .contents(node(&harness.server, &["readme.md"])),
+        Some(b"# readme".to_vec())
+    );
+}
+
+#[test]
+fn file_ids_are_distinct_nonzero_and_stable_and_link_counts_are_reported() {
+    let harness = Harness::tree();
+    let attributes = FileAccessRights::FILE_READ_ATTRIBUTES;
+    let (first, info) = harness
+        .try_open("\\readme.md", CreateOptions(0), attributes)
+        .unwrap();
+    let (second, other) = harness
+        .try_open("\\docs\\notes.txt", CreateOptions(0), attributes)
+        .unwrap();
+    assert_ne!(info.index_number(), 0);
+    assert_ne!(info.index_number(), other.index_number());
+    assert_eq!(info.hard_links(), 1);
+    harness.close(first);
+    harness.close(second);
+    let (again, info_again) = harness
+        .try_open("\\readme.md", CreateOptions(0), attributes)
+        .unwrap();
+    assert_eq!(info.index_number(), info_again.index_number());
+    harness.close(again);
 }

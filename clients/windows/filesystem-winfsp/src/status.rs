@@ -53,6 +53,10 @@ pub const STATUS_END_OF_FILE: NtStatus = 0xC000_0011u32 as NtStatus;
 pub const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005u32 as NtStatus;
 pub const STATUS_UNEXPECTED_NETWORK_ERROR: NtStatus = 0xC000_00C4u32 as NtStatus;
 pub const STATUS_CANNOT_DELETE: NtStatus = 0xC000_0121u32 as NtStatus;
+pub const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023u32 as NtStatus;
+pub const STATUS_NOT_A_REPARSE_POINT: NtStatus = 0xC000_0275u32 as NtStatus;
+pub const STATUS_IO_REPARSE_DATA_INVALID: NtStatus = 0xC000_0278u32 as NtStatus;
+pub const STATUS_IO_REPARSE_TAG_NOT_HANDLED: NtStatus = 0xC000_0279u32 as NtStatus;
 
 /// Translate an adapter error into the status WinFsp returns to the caller.
 pub fn status_from_adapter_error(error: &AdapterError) -> NtStatus {

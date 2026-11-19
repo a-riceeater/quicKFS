@@ -86,6 +86,19 @@ impl Node {
         }
     }
 
+    fn symlink(parent: NodeId, target: Vec<u8>) -> Self {
+        Self {
+            kind: NodeKind::Symlink,
+            mode: 0o777,
+            revision: 1,
+            modified_unix_ms: 1_700_000_000_000,
+            created_unix_ms: 1_700_000_000_000,
+            data: target,
+            children: BTreeMap::new(),
+            parent,
+        }
+    }
+
     fn metadata(&self, node: NodeId) -> Metadata {
         Metadata {
             node,
@@ -191,6 +204,18 @@ impl MockFilesystem {
         self.insert(parent, name, Node::file(parent, mode, data))
     }
 
+    /// A link whose target is the raw POSIX bytes `target`.
+    pub fn insert_symlink(&self, parent: NodeId, name: &str, target: &[u8]) -> NodeId {
+        self.insert(parent, name, Node::symlink(parent, target.to_vec()))
+    }
+
+    /// The kind stored for a node.
+    pub fn kind(&self, node: NodeId) -> Option<NodeKind> {
+        #[allow(clippy::expect_used)]
+        let state = self.state.lock().expect("test state must not be poisoned");
+        state.nodes.get(&node).map(|node| node.kind)
+    }
+
     fn insert(&self, parent: NodeId, name: &str, node: Node) -> NodeId {
         let id = NodeId(Uuid::new_v4());
         #[allow(clippy::expect_used)]
@@ -270,7 +295,7 @@ fn writable_capabilities() -> FilesystemCapabilities {
         supports_atomic_rename: true,
         supports_directory_sync: true,
         supports_preallocation: true,
-        supports_symlinks: false,
+        supports_symlinks: true,
         supports_xattrs: false,
         supports_hard_links: false,
         supports_special_nodes: false,
@@ -492,6 +517,45 @@ impl RemoteFilesystem for MockFilesystem {
             .ok_or_else(|| server(ErrorCode::Internal, "node vanished"))?
             .metadata(node);
         Ok(metadata)
+    }
+
+    async fn create_symlink(
+        &self,
+        parent: NodeId,
+        name: Name,
+        target: Vec<u8>,
+    ) -> ClientResult<Metadata> {
+        let mut state = self.locked()?;
+        let directory = state
+            .nodes
+            .get(&parent)
+            .ok_or_else(|| server(ErrorCode::NotFound, "no such parent"))?;
+        if directory.children.contains_key(&name) {
+            return Err(server(ErrorCode::AlreadyExists, "already exists"));
+        }
+        let node = NodeId(Uuid::new_v4());
+        let created = Node::symlink(parent, target);
+        let metadata = created.metadata(node);
+        state.nodes.insert(node, created);
+        state
+            .nodes
+            .get_mut(&parent)
+            .ok_or_else(|| server(ErrorCode::Internal, "parent vanished"))?
+            .children
+            .insert(name, node);
+        Ok(metadata)
+    }
+
+    async fn read_link(&self, node: NodeId) -> ClientResult<Vec<u8>> {
+        let state = self.locked()?;
+        let node = state
+            .nodes
+            .get(&node)
+            .ok_or_else(|| server(ErrorCode::NotFound, "no such node"))?;
+        if node.kind != NodeKind::Symlink {
+            return Err(server(ErrorCode::InvalidRequest, "not a link"));
+        }
+        Ok(node.data.clone())
     }
 
     async fn remove_node(&self, parent: NodeId, name: Name, directory: bool) -> ClientResult<()> {
