@@ -78,6 +78,24 @@ impl MountPoint {
         Ok(Self::Directory(trimmed.to_owned()))
     }
 
+    /// Turn `*` into the drive letter it will use: the highest free letter
+    /// from `Z:` down to `D:`, given the letters `used` (bit 0 is `A:`).
+    ///
+    /// Resolving it before mounting, rather than letting WinFsp pick, is what
+    /// lets the banner, the unmount event, and the "already mounted" check all
+    /// name the real letter, so `quickfs unmount Z:` reaches a mount made on
+    /// `*`. Other mountpoints are returned unchanged.
+    pub fn resolve(self, used: u32) -> Result<Self, MountError> {
+        if self != Self::NextAvailable {
+            return Ok(self);
+        }
+        ('D'..='Z')
+            .rev()
+            .find(|letter| used & (1 << (*letter as u32 - 'A' as u32)) == 0)
+            .map(Self::DriveLetter)
+            .ok_or_else(|| MountError::InvalidMountPoint("every drive letter is in use".into()))
+    }
+
     /// The form WinFsp wants: `Q:` for a drive, the path for a directory, and
     /// nothing at all to let it pick.
     fn to_winfsp(&self) -> Result<Option<U16CString>, MountError> {
@@ -388,6 +406,29 @@ mod tests {
             );
         }
         assert_eq!(MountPoint::parse("*").unwrap(), MountPoint::NextAvailable);
+    }
+
+    #[test]
+    fn the_next_available_letter_is_the_highest_free_one() {
+        let bit = |letter: char| 1u32 << (letter as u32 - 'A' as u32);
+        assert_eq!(
+            MountPoint::NextAvailable.resolve(bit('C')).unwrap(),
+            MountPoint::DriveLetter('Z')
+        );
+        assert_eq!(
+            MountPoint::NextAvailable
+                .resolve(bit('C') | bit('Z') | bit('Y'))
+                .unwrap(),
+            MountPoint::DriveLetter('X')
+        );
+        // A, B and C are never chosen, and a full set is an error.
+        assert!(MountPoint::NextAvailable.resolve(!bit('B')).is_err());
+        assert!(MountPoint::NextAvailable.resolve(u32::MAX).is_err());
+        // Anything already concrete is left alone, even if it is in use.
+        assert_eq!(
+            MountPoint::DriveLetter('Q').resolve(u32::MAX).unwrap(),
+            MountPoint::DriveLetter('Q')
+        );
     }
 
     #[test]

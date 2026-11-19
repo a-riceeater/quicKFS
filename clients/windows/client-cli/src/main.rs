@@ -461,6 +461,9 @@ mod windows {
 
     fn run_unmount(mountpoint: &str) -> Result<()> {
         let mountpoint = MountPoint::parse(mountpoint)?;
+        if mountpoint == MountPoint::NextAvailable {
+            bail!("name the drive letter to unmount; `*` only chooses one when mounting");
+        }
         if signal_unmount(&mountpoint.identifier())? {
             println!("Asked the client holding {mountpoint} to unmount.");
             Ok(())
@@ -522,7 +525,8 @@ mod windows {
                 "cache sizes and reconnect attempts must be positive, and reconnect backoff must not decrease"
             );
         }
-        let mountpoint = MountPoint::parse(mountpoint)?;
+        let mountpoint =
+            MountPoint::parse(mountpoint)?.resolve(quickfs_windows_support::used_drive_letters())?;
         let username = username
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--username or QUICKFS_USERNAME is required"))?;

@@ -33,7 +33,8 @@ use windows_sys::Win32::{
         TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
-        CreateDirectoryW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        CreateDirectoryW, GetLogicalDrives, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        LockFileEx,
     },
     System::{
         Diagnostics::ToolHelp::{
@@ -776,6 +777,13 @@ impl ParentProcess {
     }
 }
 
+/// The drive letters in use in this logon session — local volumes, mapped
+/// network drives and other mounts — as a bit mask with `A:` in bit 0.
+pub fn used_drive_letters() -> u32 {
+    // SAFETY: takes no arguments and reads no caller memory.
+    unsafe { GetLogicalDrives() }
+}
+
 /// The parent process ID recorded for this process, from a process snapshot.
 fn parent_process_id() -> Result<Option<u32>, WindowsError> {
     // SAFETY: plain call; an invalid handle is checked below.
@@ -884,6 +892,17 @@ mod tests {
         assert_eq!(granted & WRITE_DATA, 0);
 
         assert!(effective_access(&[0; 8], &me).is_err());
+    }
+
+    #[test]
+    fn the_system_drive_is_reported_as_in_use() {
+        let letter = std::env::var("SystemDrive")
+            .ok()
+            .and_then(|drive| drive.chars().next())
+            .unwrap_or('C')
+            .to_ascii_uppercase();
+        let bit = 1 << (letter as u32 - 'A' as u32);
+        assert_ne!(used_drive_letters() & bit, 0, "{letter}: must be in use");
     }
 
     #[test]

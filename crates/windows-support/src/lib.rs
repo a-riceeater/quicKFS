@@ -30,7 +30,7 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{
     ParentProcess, UnmountSignal, create_private_directory, current_user_sid, effective_access,
-    harden_private_path, lock_file, signal_unmount, validate_private_owner,
+    harden_private_path, lock_file, signal_unmount, used_drive_letters, validate_private_owner,
     winfsp_install_directory, winfsp_is_installed,
 };
 
