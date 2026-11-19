@@ -55,4 +55,7 @@ pub use quickfs_fs_adapter::{Adapter, AdapterError};
 #[cfg(windows)]
 pub use filesystem::{ALLOCATION_UNIT, FileContext, WindowsFilesystem};
 #[cfg(windows)]
-pub use mount::{Mount, MountConfig, MountError, MountPoint, mount};
+pub use mount::{
+    DEFAULT_VOLUME_NAME, Mount, MountConfig, MountError, MountPoint, is_usable_volume_name, mount,
+    resolve_volume_name,
+};

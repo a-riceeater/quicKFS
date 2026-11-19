@@ -125,9 +125,9 @@ impl fmt::Display for MountPoint {
 #[derive(Clone, Debug)]
 pub struct MountConfig {
     pub mountpoint: MountPoint,
-    /// Shown as the volume label in Explorer. WinFsp caps this at 32 UTF-16
-    /// units.
-    pub volume_name: String,
+    /// Shown as the volume label in Explorer. `None` picks one with
+    /// [`resolve_volume_name`]. WinFsp caps this at 32 UTF-16 units.
+    pub volume_name: Option<String>,
     /// Shown as the file system type, as `NTFS` or `FAT32` would be. WinFsp
     /// caps this at 16 UTF-16 units.
     pub filesystem_name: String,
@@ -137,10 +137,50 @@ impl Default for MountConfig {
     fn default() -> Self {
         Self {
             mountpoint: MountPoint::NextAvailable,
-            volume_name: "quicKFS".into(),
+            volume_name: None,
             filesystem_name: "quickfs".into(),
         }
     }
+}
+
+/// The label used when nothing more specific is available.
+pub const DEFAULT_VOLUME_NAME: &str = "quicKFS";
+
+/// Longest volume label WinFsp stores, in UTF-16 units.
+pub const MAX_VOLUME_LABEL_UNITS: usize = 32;
+
+/// Whether `name` fits WinFsp's label buffer and contains nothing a label
+/// cannot hold.
+pub fn is_usable_volume_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.encode_utf16().count() <= MAX_VOLUME_LABEL_UNITS
+        && !name.contains(['\\', '/', ':', '\0'])
+}
+
+/// Pick the Explorer label the same way the macOS client picks the Finder
+/// one, most specific first:
+/// 1. an explicit `--volume-name`;
+/// 2. a name the export was renamed to (a rename persists on the server);
+/// 3. the folder name of a directory mountpoint, so `C:\mnt\raid` shows "raid";
+/// 4. the generic default.
+pub fn resolve_volume_name(
+    explicit: Option<&str>,
+    export_label: &str,
+    mountpoint: &MountPoint,
+) -> String {
+    if let Some(name) = explicit {
+        return name.to_owned();
+    }
+    if export_label != DEFAULT_VOLUME_NAME && is_usable_volume_name(export_label) {
+        return export_label.to_owned();
+    }
+    if let MountPoint::Directory(path) = mountpoint
+        && let Some(folder) = Path::new(path).file_name().and_then(|name| name.to_str())
+        && is_usable_volume_name(folder)
+    {
+        return folder.to_owned();
+    }
+    DEFAULT_VOLUME_NAME.to_owned()
 }
 
 /// Why a mount could not start.
@@ -288,7 +328,12 @@ pub fn mount(
     owner_sid: String,
 ) -> Result<Mount, MountError> {
     let volume_params = volume_params(&capabilities, config)?;
-    let filesystem = WindowsFilesystem::new(adapter, capabilities, &config.volume_name, owner_sid)
+    let volume_name = resolve_volume_name(
+        config.volume_name.as_deref(),
+        &capabilities.volume_name,
+        &config.mountpoint,
+    );
+    let filesystem = WindowsFilesystem::new(adapter, capabilities, &volume_name, owner_sid)
         .map_err(|error| MountError::VolumeName(error.to_string()))?;
 
     // Warm the caches a freshly mounted volume is about to be asked for. The
@@ -391,6 +436,23 @@ mod tests {
         // Building the parameters twice for one export must not change it.
         let _ = volume_params(&first, &config).unwrap();
         assert_eq!(volume_serial_number(&first), volume_serial_number(&first));
+    }
+
+    #[test]
+    fn the_volume_name_prefers_explicit_then_renamed_export_then_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("raid");
+        std::fs::create_dir(&folder).unwrap();
+        let in_folder = MountPoint::parse(&folder.to_string_lossy()).unwrap();
+        let drive = MountPoint::DriveLetter('Q');
+
+        assert_eq!(resolve_volume_name(Some("Mine"), "Photos", &drive), "Mine");
+        assert_eq!(resolve_volume_name(None, "Photos", &drive), "Photos");
+        assert_eq!(resolve_volume_name(None, "quicKFS", &in_folder), "raid");
+        assert_eq!(resolve_volume_name(None, "quicKFS", &drive), "quicKFS");
+        // A label Windows cannot store falls through rather than truncating.
+        let long = "x".repeat(33);
+        assert_eq!(resolve_volume_name(None, &long, &in_folder), "raid");
     }
 
     #[test]

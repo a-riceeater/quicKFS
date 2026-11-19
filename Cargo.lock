@@ -1274,7 +1274,6 @@ dependencies = [
  "quickfs-transport-quic",
  "rpassword",
  "rustix",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "uuid",

@@ -26,6 +26,26 @@ fn main() -> anyhow::Result<()> {
     windows::run()
 }
 
+/// `println!` that never panics. Once an app that launched the mount exits,
+/// standard output is a broken pipe, and a panic there would abandon the
+/// unmount that follows.
+#[cfg(windows)]
+macro_rules! say {
+    ($($argument:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($argument)*);
+    }};
+}
+
+/// `eprintln!` that never panics, for the same reason as [`say!`].
+#[cfg(windows)]
+macro_rules! note {
+    ($($argument:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($argument)*);
+    }};
+}
+
 #[cfg(windows)]
 mod windows {
     use anyhow::{Context, Result, bail};
@@ -34,11 +54,11 @@ mod windows {
     use quickfs_client_core::{
         AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, MAX_CLIENT_READ_SIZE,
         ReconnectPolicy, RemoteFilesystem, ResilientFilesystem, ResilientFilesystemOptions,
-        ServerTrust, TrustStore, load_trusted_server_pin, parse_sha256_fingerprint,
+        ServerTrust, TrustStore, load_trusted_server_pin, mount_helper, parse_sha256_fingerprint,
     };
     use quickfs_filesystem_winfsp::{MountConfig, MountPoint, mount};
     use quickfs_transport_quic::{certificate_sha256, load_certificates};
-    use quickfs_windows_support::{UnmountSignal, require_winfsp, signal_unmount};
+    use quickfs_windows_support::{ParentProcess, UnmountSignal, require_winfsp, signal_unmount};
     use std::{
         net::SocketAddr,
         path::PathBuf,
@@ -131,9 +151,35 @@ mod windows {
             reconnect_initial_backoff_ms: u64,
             #[arg(long, default_value_t = 2_000)]
             reconnect_max_backoff_ms: u64,
-            /// Volume label shown in Explorer.
-            #[arg(long, default_value = "quicKFS", value_parser = parse_volume_name)]
-            volume_name: String,
+            /// Volume label shown in Explorer. Defaults to the export's renamed
+            /// label if it has one, otherwise a directory mountpoint's folder
+            /// name, otherwise `quicKFS`.
+            #[arg(long, value_parser = parse_volume_name)]
+            volume_name: Option<String>,
+            /// Read the password from the first line of standard input instead
+            /// of prompting on the console. An app launching the mount without
+            /// a console supplies its stored credential here.
+            #[arg(long)]
+            password_stdin: bool,
+            /// Rewrite this file every second with a JSON snapshot of the
+            /// mount's QUIC link (round-trip time, congestion window, byte and
+            /// packet counters).
+            #[arg(long, value_name = "PATH")]
+            stats_file: Option<PathBuf>,
+            /// Answer each `stats` line on standard input with one
+            /// `quickfs-stats <json>` line on standard output holding the same
+            /// snapshot `--stats-file` writes. Standard input stays open after
+            /// the password line.
+            #[arg(long)]
+            stats_on_request: bool,
+            /// Unmount when the launching process exits, so a crashed or killed
+            /// app cannot leave an orphaned mount holding the drive letter.
+            #[arg(long)]
+            exit_with_parent: bool,
+            /// Mount read-only even when the account may write. Every
+            /// modification is refused locally, before it reaches the server.
+            #[arg(long)]
+            read_only: bool,
         },
         /// Ask the process holding a mountpoint to unmount it.
         Unmount {
@@ -371,9 +417,26 @@ mod windows {
             reconnect_initial_backoff_ms,
             reconnect_max_backoff_ms,
             volume_name,
+            password_stdin,
+            stats_file,
+            stats_on_request,
+            exit_with_parent,
+            read_only,
         } = &cli.command
         else {
             bail!("internal error: mount dispatched for another command");
+        };
+        // Open the parent first: if it has already gone there is nobody to
+        // mount for, and holding its handle from the start means a later
+        // reuse of its process ID cannot be mistaken for it.
+        let parent = if *exit_with_parent {
+            Some(
+                ParentProcess::open()
+                    .context("failed to open the launching process")?
+                    .ok_or_else(|| anyhow::anyhow!("the launching process has already exited"))?,
+            )
+        } else {
+            None
         };
 
         if *transport_timeout_ms == 0 || *callback_timeout_ms == 0 {
@@ -428,7 +491,11 @@ mod windows {
             .context("failed to read the authenticated server certificate identity")?;
         identity_check.close();
 
-        let password = Zeroizing::new(rpassword::prompt_password("Password: ")?);
+        let password = if *password_stdin {
+            mount_helper::read_password_line(std::io::stdin().lock())?
+        } else {
+            Zeroizing::new(rpassword::prompt_password("Password: ")?)
+        };
         // Reconnect after the potentially long prompt and reapply exactly the
         // same trust policy before transmitting the credential.
         let connection = AuthenticatedConnectionConfig::new(
@@ -453,9 +520,20 @@ mod windows {
             ))
             .context("username/password authentication failed")?;
         let resilient: Arc<dyn RemoteFilesystem> = Arc::new(resilient);
-        let capabilities = runtime
+        if let Some(path) = stats_file.clone() {
+            mount_helper::spawn_stats_writer(runtime.handle(), Arc::clone(&resilient), path);
+        }
+        if *stats_on_request
+            && let Err(error) = mount_helper::spawn_stats_responder(Arc::clone(&resilient))
+        {
+            note!("link statistics are unavailable: {error}");
+        }
+        let mut capabilities = runtime
             .block_on(resilient.capabilities())
             .context("failed to query filesystem capabilities")?;
+        if *read_only {
+            capabilities.writable = false;
+        }
 
         let cache_namespace = CacheNamespace::new(
             server_identity,
@@ -508,29 +586,39 @@ mod windows {
         };
         let mounted = mount(adapter, capabilities, &config, owner_sid)
             .with_context(|| format!("failed to mount on {mountpoint}"))?;
-        println!(
+        say!(
             "Mounted {access} {} ({server}) on {mountpoint} with reconnect and offline read \
              caching. Press Control+C, or run `quickfs unmount {mountpoint}`, to unmount.",
             cli.server_name
         );
 
-        wait_for_shutdown(unmount_signal)?;
-        println!("Unmounting {mountpoint}...");
+        wait_for_shutdown(unmount_signal, parent)?;
+        say!("Unmounting {mountpoint}...");
         mounted.stop();
         Ok(())
     }
 
-    /// Block until the user asks the mount to stop, by either route.
+    /// Block until the mount is asked to stop, by any route.
     ///
-    /// Both routes have to be watched at once: Control+C is what an interactive
-    /// user reaches for, and the named event is the only way another window can
-    /// reach a mount that lives inside this process.
-    fn wait_for_shutdown(signal: UnmountSignal) -> Result<()> {
+    /// All routes are watched at once: Control+C is what an interactive user
+    /// reaches for, the named event is the only way another window can reach a
+    /// mount that lives inside this process, and the parent's exit is how an
+    /// app that launched the mount takes it down even when it crashes.
+    fn wait_for_shutdown(signal: UnmountSignal, parent: Option<ParentProcess>) -> Result<()> {
         let (sender, receiver) = mpsc::channel::<()>();
         let interrupt = sender.clone();
         ctrlc_handler(move || {
             let _ = interrupt.send(());
         })?;
+        if let Some(parent) = parent {
+            let orphaned = sender.clone();
+            std::thread::spawn(move || {
+                if parent.wait().is_ok() {
+                    note!("the launching process exited; unmounting");
+                    let _ = orphaned.send(());
+                }
+            });
+        }
         std::thread::spawn(move || {
             if signal.wait().is_ok() {
                 let _ = sender.send(());
@@ -585,9 +673,8 @@ mod windows {
     /// name is refused here rather than silently truncated into something the
     /// user did not choose.
     fn parse_volume_name(value: &str) -> std::result::Result<String, String> {
-        let units = value.encode_utf16().count();
-        if value.is_empty() || units > 32 || value.contains('\0') {
-            Err("volume name must contain 1 to 32 characters and no NUL".into())
+        if !quickfs_filesystem_winfsp::is_usable_volume_name(value) {
+            Err("volume name must contain 1 to 32 characters and none of \\ / : or NUL".into())
         } else {
             Ok(value.to_owned())
         }
