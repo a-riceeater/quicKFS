@@ -31,6 +31,7 @@ pub mod path;
 pub mod reparse;
 pub mod resolve;
 pub mod status;
+pub mod streams;
 
 #[cfg(windows)]
 pub mod filesystem;
