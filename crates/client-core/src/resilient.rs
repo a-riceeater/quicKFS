@@ -341,6 +341,35 @@ impl ResilientFilesystem {
         });
     }
 
+    /// Repeat a read or write the server turned away because its transfer
+    /// capacity was momentarily full.
+    ///
+    /// The daemon reserves read and write capacity before it does any work and
+    /// answers `Busy` ("retry later") when a reservation is unavailable, so a
+    /// refused request had no effect and is safe to send again. Capacity frees
+    /// as other transfers finish — in milliseconds — so the retry backs off
+    /// briefly and gives up after [`BUSY_RETRY_BUDGET`], inside the operation
+    /// deadline either way. Only transfers use this: elsewhere `Busy` is a
+    /// filesystem `EBUSY`, which waiting does not cure.
+    async fn retry_while_busy<T, Fut>(mut attempt: impl FnMut() -> Fut) -> Result<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        let started = Instant::now();
+        let mut delay = BUSY_RETRY_INITIAL_DELAY;
+        loop {
+            match attempt().await {
+                Err(ClientError::Server(quickfs_protocol::ErrorCode::Busy, _))
+                    if started.elapsed() < BUSY_RETRY_BUDGET =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(BUSY_RETRY_MAXIMUM_DELAY);
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn operation<T>(
         &self,
         mutation: bool,
@@ -832,10 +861,11 @@ impl RemoteFilesystem for ResilientFilesystem {
     ) -> Result<RangeRead> {
         self.operation(false, async {
             let (slot, state) = self.remote_handle(handle).await?;
-            match slot
-                .filesystem
-                .read_range_versioned(state.remote, offset, length)
-                .await
+            match Self::retry_while_busy(|| {
+                slot.filesystem
+                    .read_range_versioned(state.remote, offset, length)
+            })
+            .await
             {
                 // A read observing a revision the handle has not seen yet is not
                 // an error: another actor updated the file while it was open
@@ -853,10 +883,12 @@ impl RemoteFilesystem for ResilientFilesystem {
                     self.mark_failed(slot.generation);
                     let (_, reopened) = self.remote_handle(handle).await?;
                     let replacement = self.healthy_connection().await?;
-                    let read = replacement
-                        .filesystem
-                        .read_range_versioned(reopened.remote, offset, length)
-                        .await?;
+                    let read = Self::retry_while_busy(|| {
+                        replacement
+                            .filesystem
+                            .read_range_versioned(reopened.remote, offset, length)
+                    })
+                    .await?;
                     if read.revision != reopened.revision {
                         self.adopt_revision(handle, read.revision).await;
                     }
@@ -877,9 +909,7 @@ impl RemoteFilesystem for ResilientFilesystem {
         self.operation(true, async {
             let (slot, state) = self.remote_handle(handle).await?;
             let _mutation = state.mutation.lock().await;
-            match slot
-                .filesystem
-                .write_range(state.remote, offset, data)
+            match Self::retry_while_busy(|| slot.filesystem.write_range(state.remote, offset, data))
                 .await
             {
                 Ok(result) => {
@@ -970,7 +1000,10 @@ impl RemoteFilesystem for ResilientFilesystem {
     ) -> Result<XattrRead> {
         self.safe_call(move |filesystem| {
             let name = name.clone();
-            async move { filesystem.get_xattr(node, name, offset, length).await }
+            async move {
+                Self::retry_while_busy(|| filesystem.get_xattr(node, name.clone(), offset, length))
+                    .await
+            }
         })
         .await
     }
@@ -1200,6 +1233,11 @@ impl RemoteFilesystem for ResilientFilesystem {
     }
 }
 
+/// How long a transfer keeps retrying a server whose capacity is busy.
+const BUSY_RETRY_BUDGET: Duration = Duration::from_secs(5);
+const BUSY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(2);
+const BUSY_RETRY_MAXIMUM_DELAY: Duration = Duration::from_millis(100);
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1224,6 +1262,8 @@ mod tests {
         write_delay_ms: AtomicU64,
         opens: AtomicUsize,
         locks: Mutex<Vec<FileLock>>,
+        busy_reads: AtomicUsize,
+        busy_writes: AtomicUsize,
     }
 
     impl ScriptedFilesystem {
@@ -1239,11 +1279,25 @@ mod tests {
                 write_delay_ms: AtomicU64::new(0),
                 opens: AtomicUsize::new(0),
                 locks: Mutex::new(Vec::new()),
+                busy_reads: AtomicUsize::new(0),
+                busy_writes: AtomicUsize::new(0),
             }
         }
 
         fn transport_failure() -> ClientError {
             ClientError::Transport(TransportError::Timeout)
+        }
+
+        /// Spend one of `remaining` busy answers, if any are left.
+        fn busy(remaining: &AtomicUsize) -> Option<ClientError> {
+            remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .ok()
+                .map(|_| {
+                    ClientError::Server(ErrorCode::Busy, "server write capacity is busy".into())
+                })
         }
     }
 
@@ -1362,6 +1416,9 @@ mod tests {
             if self.fail_read.swap(false, Ordering::SeqCst) {
                 return Err(Self::transport_failure());
             }
+            if let Some(busy) = Self::busy(&self.busy_reads) {
+                return Err(busy);
+            }
             let start = usize::try_from(offset).unwrap();
             let end = usize::try_from(offset.saturating_add(length))
                 .unwrap()
@@ -1384,6 +1441,9 @@ mod tests {
             .await;
             if self.fail_write.swap(false, Ordering::SeqCst) {
                 return Err(Self::transport_failure());
+            }
+            if let Some(busy) = Self::busy(&self.busy_writes) {
+                return Err(busy);
             }
             Ok(WriteResult {
                 written: data.len() as u64,
@@ -1456,6 +1516,48 @@ mod tests {
             Err(ClientError::Server(ErrorCode::Timeout, message))
                 if message == "resilient operation deadline exceeded"
         )
+    }
+
+    #[tokio::test]
+    async fn reads_and_writes_ride_out_a_busy_server() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        first.busy_reads.store(3, Ordering::SeqCst);
+        first.busy_writes.store(3, Ordering::SeqCst);
+        let filesystem =
+            ResilientFilesystem::new(first.clone(), connector(first.clone()), test_options())
+                .await
+                .unwrap();
+        let (handle, _, _) = filesystem.open_file(FILE_NODE).await.unwrap();
+        assert_eq!(filesystem.read_range(handle, 0, 4).await.unwrap(), b"0123");
+        assert_eq!(
+            filesystem
+                .write_range(handle, 0, b"xy")
+                .await
+                .unwrap()
+                .written,
+            2
+        );
+        assert_eq!(first.busy_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(first.busy_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stays_busy_is_reported_within_the_deadline() {
+        let epoch = Uuid::new_v4();
+        let first = Arc::new(ScriptedFilesystem::new(epoch, 1));
+        first.busy_writes.store(usize::MAX, Ordering::SeqCst);
+        let filesystem = ResilientFilesystem::new(
+            first.clone(),
+            connector(first),
+            deadline_options(Duration::from_millis(300)),
+        )
+        .await
+        .unwrap();
+        let (handle, _, _) = filesystem.open_file(FILE_NODE).await.unwrap();
+        let started = Instant::now();
+        assert!(filesystem.write_range(handle, 0, b"x").await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
