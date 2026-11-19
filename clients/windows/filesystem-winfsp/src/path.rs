@@ -27,6 +27,8 @@
 /// capacity of WinFsp's `FSP_FSCTL_DIR_INFO::FileNameBuf`, so a longer name
 /// could not be returned from a directory enumeration even if the server
 /// accepted it.
+use quickfs_common::windows_names::{self, WindowsNameProblem};
+
 pub const MAX_COMPONENT_UTF16_UNITS: usize = 255;
 
 /// Why a Windows path or name cannot be used against a quicKFS export.
@@ -77,20 +79,6 @@ impl std::fmt::Display for PathError {
 }
 
 impl std::error::Error for PathError {}
-
-/// Characters Win32 refuses inside a path component. `\` and `/` are separators
-/// and are caught earlier; the rest are the reserved set plus the control
-/// characters.
-const RESERVED_CHARACTERS: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
-
-/// DOS device names. Win32 resolves these to devices no matter which directory
-/// they appear in, so a file created under one of them could never be opened
-/// again through an ordinary path.
-const RESERVED_NAMES: [&str; 24] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "CONIN$",
-    "CONOUT$",
-];
 
 /// Split an absolute WinFsp path into its components.
 ///
@@ -159,32 +147,15 @@ fn validate_component(component: &str) -> Result<(), PathError> {
 /// then reach through Explorer or any ordinary Win32 path.
 pub fn validate_creatable(name: &str) -> Result<(), PathError> {
     validate_component(name)?;
-    if name.chars().any(|character| {
-        RESERVED_CHARACTERS.contains(&character) || (character as u32) < 0x20 || character == '\\'
-    }) {
-        return Err(PathError::InvalidCharacter);
-    }
-    if name.ends_with('.') || name.ends_with(' ') {
-        return Err(PathError::TrailingDotOrSpace);
-    }
-    if is_reserved_device_name(name) {
-        return Err(PathError::ReservedName);
-    }
-    Ok(())
+    windows_names::check_creatable(name).map_err(|problem| match problem {
+        WindowsNameProblem::InvalidCharacter => PathError::InvalidCharacter,
+        WindowsNameProblem::TrailingDotOrSpace => PathError::TrailingDotOrSpace,
+        WindowsNameProblem::ReservedName => PathError::ReservedName,
+    })
 }
 
 /// Whether `name` is a DOS device name, with or without an extension.
-///
-/// `NUL`, `nul.txt` and `Nul.tar.gz` all resolve to the null device, so the
-/// stem before the first dot is what matters and the comparison is
-/// case-insensitive.
-pub fn is_reserved_device_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name);
-    // Win32 also strips trailing spaces from the stem before resolving it, so
-    // `"CON "` is still the console device.
-    let stem = stem.trim_end_matches(' ').to_ascii_uppercase();
-    RESERVED_NAMES.contains(&stem.as_str())
-}
+pub use quickfs_common::windows_names::is_reserved_device_name;
 
 /// Whether a name should carry `FILE_ATTRIBUTE_HIDDEN`.
 ///

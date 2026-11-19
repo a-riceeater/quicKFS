@@ -9,6 +9,7 @@ thiserror.workspace=true
 tokio.workspace=true
 quickfs-client-core={path="../../../crates/client-core"}
 quickfs-fs-adapter={path="../../../crates/fs-adapter"}
+quickfs-common={path="../../../crates/common"}
 quickfs-protocol={path="../../../crates/protocol"}
 [target.'cfg(windows)'.dependencies]
 widestring.workspace=true

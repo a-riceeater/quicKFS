@@ -79,6 +79,8 @@ pub fn validate_filename(name: &[u8]) -> Result<(), ValidationError> {
         Ok(())
     }
 }
+pub mod windows_names;
+
 pub fn init_logging() {
     init_logging_with_fallback(None);
 }
