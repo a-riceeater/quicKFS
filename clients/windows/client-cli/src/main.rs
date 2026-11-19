@@ -77,6 +77,10 @@ mod windows {
     /// fires. An internal scheduling margin, not a second timeout setting.
     const DEADLINE_ERROR_DELIVERY_GRACE: Duration = Duration::from_millis(100);
 
+    /// How long a graceful unmount may take before the process exits anyway,
+    /// matching the macOS helper's watchdog.
+    const UNMOUNT_WATCHDOG: Duration = Duration::from_secs(8);
+
     #[derive(Parser)]
     #[command(
         name = "quickfs",
@@ -665,6 +669,15 @@ mod windows {
 
         wait_for_shutdown(unmount_signal, parent)?;
         say!("Unmounting {mountpoint}...");
+        // Stopping the dispatcher waits for callbacks in flight, and one stuck
+        // on a dead link can take its whole deadline. Like the macOS helper,
+        // give a graceful unmount a bounded time and then exit regardless:
+        // WinFsp releases the volume with the process.
+        std::thread::spawn(|| {
+            std::thread::sleep(UNMOUNT_WATCHDOG);
+            note!("unmounting did not finish in time; exiting");
+            std::process::exit(1);
+        });
         mounted.stop();
         Ok(())
     }
