@@ -294,6 +294,42 @@ fn a_file_larger_than_one_transfer_is_written_and_read_in_pieces() {
 }
 
 #[test]
+fn a_single_request_larger_than_one_callback_is_split_rather_than_refused() {
+    // `ReadFile` or `WriteFile` of a whole file hands the bridge one buffer
+    // far beyond the adapter's per-callback bound. It must still succeed in
+    // full, exactly as the same call would on NTFS.
+    let harness = Harness::empty();
+    let size = quickfs_fs_adapter::MAX_CALLBACK_IO_SIZE as usize + 3 * 1024 * 1024 + 17;
+    let payload: Vec<u8> = (0..size).map(|index| (index % 253) as u8).collect();
+
+    let handle = harness.create_file("\\whole.bin");
+    let (written, info) = harness
+        .filesystem
+        .write(handle.clone(), &payload, WriteMode::Normal { offset: 0 })
+        .unwrap();
+    assert_eq!(written, size);
+    assert_eq!(info.file_size(), size as u64);
+    harness.close(handle);
+    assert_eq!(
+        harness
+            .server
+            .contents(node(&harness.server, &["whole.bin"])),
+        Some(payload.clone())
+    );
+
+    let handle = harness.open("\\whole.bin", FileAccessRights::FILE_READ_DATA);
+    // One byte larger than the file, as `read()` of a whole file asks.
+    let mut buffer = vec![0u8; size + 1];
+    let read = harness
+        .filesystem
+        .read(handle.clone(), &mut buffer, 0)
+        .unwrap();
+    assert_eq!(read, size);
+    assert_eq!(&buffer[..size], &payload[..]);
+    harness.close(handle);
+}
+
+#[test]
 fn nested_directories_are_created_enumerated_and_removed_in_order() {
     let harness = Harness::empty();
     for path in ["\\a", "\\a\\b", "\\a\\b\\c"] {

@@ -56,6 +56,11 @@ use winfsp_wrs::{
 /// disk".
 pub const ALLOCATION_UNIT: u64 = 4_096;
 
+/// Largest piece of one read or write handed to the adapter at a time. Windows
+/// forwards an application's request at its full size, and the adapter bounds
+/// a single callback's I/O.
+const MAX_IO_PIECE: usize = quickfs_fs_adapter::MAX_CALLBACK_IO_SIZE as usize;
+
 /// Default permissions for nodes this client creates. The server applies its
 /// own policy on top; these are only the request.
 const DEFAULT_FILE_MODE: u32 = 0o644;
@@ -652,19 +657,37 @@ impl FileSystemInterface for WindowsFilesystem {
             return Err(status::STATUS_FILE_IS_A_DIRECTORY);
         }
         let handle = self.file_handle(&context)?;
-        let length = u64::try_from(buffer.len()).map_err(|_| status::STATUS_INVALID_PARAMETER)?;
-        let data = self
-            .block_on(self.adapter().read_async(handle, offset, length))
-            .map_err(adapter_status)?;
-        if data.is_empty() && !buffer.is_empty() {
+        // Windows passes an application's read through at whatever size it
+        // asked for — `ReadFile` of a whole file is common — while one adapter
+        // callback is bounded. Fill the buffer in bounded pieces.
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let want = (buffer.len() - filled).min(MAX_IO_PIECE);
+            let position = offset
+                .checked_add(filled as u64)
+                .ok_or(status::STATUS_INVALID_PARAMETER)?;
+            let data = match self.block_on(self.adapter().read_async(handle, position, want as u64))
+            {
+                Ok(data) => data,
+                // Bytes already copied are a valid short read; the error
+                // surfaces on the caller's next read at the following offset.
+                Err(_) if filled > 0 => break,
+                Err(error) => return Err(adapter_status(error)),
+            };
+            let received = data.len().min(want);
+            buffer[filled..filled + received].copy_from_slice(&data[..received]);
+            filled += received;
+            if received < want {
+                break;
+            }
+        }
+        if filled == 0 && !buffer.is_empty() {
             // Windows distinguishes "read nothing because the file ended" from
             // "read nothing successfully"; applications loop forever on the
             // latter.
             return Err(status::STATUS_END_OF_FILE);
         }
-        let length = data.len().min(buffer.len());
-        buffer[..length].copy_from_slice(&data[..length]);
-        Ok(length)
+        Ok(filled)
     }
 
     fn write(
@@ -702,10 +725,24 @@ impl FileSystemInterface for WindowsFilesystem {
         if buffer.is_empty() {
             return Ok((0, self.file_info(&current, &self.name_of(&context))));
         }
-        let written = self
-            .block_on(self.adapter().write_async(handle, offset, buffer))
-            .map_err(adapter_status)?;
-        let written = usize::try_from(written).map_err(|_| status::STATUS_IO_DEVICE_ERROR)?;
+        let mut written = 0;
+        for piece in buffer.chunks(MAX_IO_PIECE) {
+            let position = offset
+                .checked_add(written as u64)
+                .ok_or(status::STATUS_INVALID_PARAMETER)?;
+            let landed = match self.block_on(self.adapter().write_async(handle, position, piece)) {
+                Ok(landed) => {
+                    usize::try_from(landed).map_err(|_| status::STATUS_IO_DEVICE_ERROR)?
+                }
+                // Report what reached the file; the caller retries the rest.
+                Err(_) if written > 0 => break,
+                Err(error) => return Err(adapter_status(error)),
+            };
+            written += landed;
+            if landed < piece.len() {
+                break;
+            }
+        }
         let metadata = self
             .block_on(self.adapter().getattr_async(context.inode))
             .map_err(adapter_status)?;
