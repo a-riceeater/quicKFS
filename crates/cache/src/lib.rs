@@ -169,6 +169,14 @@ pub trait RangeCache: Send + Sync {
     /// assemble it from larger, overlapping, or adjacent entries of the same
     /// node revision.
     async fn get(&self, key: RangeKey) -> Option<Vec<u8>>;
+    /// Return the requested range only when it is already resident in memory,
+    /// copying just the requested bytes and never touching disk. This is the
+    /// fast path for small reads inside a block that is already loaded; a
+    /// `None` means "go the ordinary way", not "absent".
+    async fn get_resident(&self, key: RangeKey) -> Option<Vec<u8>> {
+        let _ = key;
+        None
+    }
     async fn insert(&self, key: RangeKey, value: Vec<u8>);
     async fn store_readthrough(&self, key: RangeKey, value: Vec<u8>) {
         self.insert(key, value).await;
@@ -272,6 +280,10 @@ impl RangeCache for MemoryCache {
             })
             .collect();
         assemble_range(key, segments).map(|assembled| assembled.data)
+    }
+
+    async fn get_resident(&self, key: RangeKey) -> Option<Vec<u8>> {
+        RangeCache::get(self, key).await
     }
 
     async fn insert(&self, key: RangeKey, value: Vec<u8>) {
@@ -1495,6 +1507,10 @@ impl RangeCache for NonBlockingPersistentCache {
             .flatten();
         let (loaded_key, value) = loaded?;
         self.hot_ranges.insert(loaded_key, value);
+        self.hot_ranges.get(key)
+    }
+
+    async fn get_resident(&self, key: RangeKey) -> Option<Vec<u8>> {
         self.hot_ranges.get(key)
     }
 

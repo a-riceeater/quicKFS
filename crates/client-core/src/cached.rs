@@ -8,8 +8,8 @@ use crate::{
 use async_trait::async_trait;
 use futures::future::join_all;
 use quickfs_cache::{
-    DirectoryCache, FilesystemStateCache, MemoryCache, MetadataCache, NodeCacheInvalidation,
-    RangeCache, RangeKey, RevisionKey,
+    DirectoryCache, FilesystemStateCache, MetadataCache, NodeCacheInvalidation, RangeCache,
+    RangeKey, RevisionKey,
 };
 use quickfs_protocol::{
     AttributeChanges, DirectoryEntry, DirectoryView, DirectoryViewEntry, DirectoryViewOptions,
@@ -655,7 +655,7 @@ impl Fetcher {
         inner_handle: FileHandle,
         expected_revision: u64,
         block: RangeKey,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Arc<Vec<u8>>> {
         let fetch = {
             let mut fetches = self.range_fetches.lock().await;
             fetches
@@ -712,9 +712,9 @@ impl Fetcher {
         {
             fetches.remove(&block);
         }
-        result
-            .map(|data| data.as_ref().clone())
-            .map_err(ClientError::from)
+        // Shared rather than copied: a demand read slices only the bytes it
+        // needs out of the block, so a 4 KiB read must not first copy 1 MiB.
+        result.map_err(ClientError::from)
     }
 }
 
@@ -1275,7 +1275,34 @@ impl CachedFilesystem {
                 data: Vec::new(),
             });
         }
-        let assembled = MemoryCache::default();
+        let requested = RangeKey {
+            file: RevisionKey {
+                node: state.node,
+                revision: state.revision,
+            },
+            offset,
+            length: length.min(state.size.saturating_sub(offset)),
+        };
+        // Fast path: bytes already resident in memory are copied out directly.
+        // Small sequential reads — Windows applications commonly read 4 KiB at
+        // a time — would otherwise materialize the whole covering block for
+        // every call. The read still feeds the read-ahead controller, as a hit.
+        if let Some(data) = RangeCache::get_resident(self.cache.as_ref(), requested).await {
+            let returned = u64::try_from(data.len()).unwrap_or(0);
+            self.maybe_prefetch(
+                state,
+                inner_handle,
+                offset,
+                returned,
+                Duration::ZERO,
+                self.demand_block_size(length),
+            )
+            .await;
+            return Ok(RangeRead {
+                revision: state.revision,
+                data,
+            });
+        }
         // Every block, including a cache lookup, passes through the per-block
         // gate. Concurrent kernel read-ahead callbacks therefore share one
         // persistent-cache verification or one network request instead of all
@@ -1294,6 +1321,7 @@ impl CachedFilesystem {
         // That gradient is exactly what drives the controller.
         let demand_started = Instant::now();
         let mut offline_error = false;
+        let mut fetched = Vec::with_capacity(blocks.len());
         for (block, result) in join_all(reads).await {
             match result {
                 Ok(data) => {
@@ -1303,11 +1331,7 @@ impl CachedFilesystem {
                         return Err(ClientError::UnexpectedResponse);
                     }
                     if actual > 0 {
-                        let actual_key = RangeKey {
-                            length: actual,
-                            ..block
-                        };
-                        RangeCache::insert(&assembled, actual_key, data).await;
+                        fetched.push((block.offset, data));
                     }
                 }
                 Err(error) if is_offline(&error) => offline_error = true,
@@ -1315,15 +1339,7 @@ impl CachedFilesystem {
             }
         }
         let demand_elapsed = demand_started.elapsed();
-        let requested = RangeKey {
-            file: RevisionKey {
-                node: state.node,
-                revision: state.revision,
-            },
-            offset,
-            length: length.min(state.size.saturating_sub(offset)),
-        };
-        if let Some(data) = RangeCache::get(&assembled, requested).await {
+        if let Some(data) = slice_blocks(requested, &fetched) {
             let returned = u64::try_from(data.len()).unwrap_or(0);
             self.maybe_prefetch(
                 state,
@@ -1351,6 +1367,33 @@ impl CachedFilesystem {
             Err(ClientError::UnexpectedResponse)
         }
     }
+}
+
+/// Copy `requested` out of contiguous fetched blocks, given as
+/// `(offset, bytes)` in ascending offset order. Only the requested bytes are
+/// copied. `None` when the blocks leave a gap before the end of the request,
+/// which is what a block cut short by an unavailable server looks like.
+fn slice_blocks(requested: RangeKey, blocks: &[(u64, Arc<Vec<u8>>)]) -> Option<Vec<u8>> {
+    let end = requested.offset.checked_add(requested.length)?;
+    let mut data = Vec::with_capacity(usize::try_from(requested.length).ok()?);
+    let mut cursor = requested.offset;
+    for (block_offset, bytes) in blocks {
+        if cursor == end {
+            break;
+        }
+        let block_end = block_offset.checked_add(u64::try_from(bytes.len()).ok()?)?;
+        if *block_offset > cursor {
+            return None;
+        }
+        if block_end <= cursor {
+            continue;
+        }
+        let start = usize::try_from(cursor - block_offset).ok()?;
+        let stop = usize::try_from(block_end.min(end) - block_offset).ok()?;
+        data.extend_from_slice(bytes.get(start..stop)?);
+        cursor = block_end.min(end);
+    }
+    (cursor == end).then_some(data)
 }
 
 fn is_offline(error: &ClientError) -> bool {
@@ -2803,6 +2846,30 @@ mod tests {
             inner.max_in_flight.load(Ordering::SeqCst)
         );
         assert_eq!(inner.reads.load(Ordering::SeqCst) as u64, blocks);
+    }
+
+    #[test]
+    fn slicing_copies_only_the_request_and_refuses_gaps() {
+        let key = |offset, length| RangeKey {
+            file: RevisionKey {
+                node: NodeId(Uuid::from_u128(9)),
+                revision: 1,
+            },
+            offset,
+            length,
+        };
+        let first = Arc::new((0..8_u8).collect::<Vec<_>>());
+        let second = Arc::new((8..12_u8).collect::<Vec<_>>());
+        let blocks = vec![(0, Arc::clone(&first)), (8, Arc::clone(&second))];
+        assert_eq!(slice_blocks(key(2, 3), &blocks).unwrap(), vec![2, 3, 4]);
+        // Spans the block boundary.
+        assert_eq!(slice_blocks(key(6, 4), &blocks).unwrap(), vec![6, 7, 8, 9]);
+        // Runs past what was fetched (a short final block).
+        assert!(slice_blocks(key(10, 4), &blocks).is_none());
+        // A missing middle block is a gap, not a shorter answer.
+        let gapped = vec![(0, first), (16, second)];
+        assert!(slice_blocks(key(6, 12), &gapped).is_none());
+        assert_eq!(slice_blocks(key(3, 0), &blocks).unwrap(), Vec::<u8>::new());
     }
 
     /// The controller starts a fresh cold stream on a far seek and resets all
