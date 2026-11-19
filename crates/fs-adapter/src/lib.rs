@@ -441,6 +441,21 @@ impl Adapter {
         self.lookup_from_listing(parent_inode, &listing, &name)
     }
 
+    /// The stored spelling of the entry `inode` inside `parent_inode`, when the
+    /// parent's listing is already cached. Lookup is case-insensitive, so the
+    /// name a caller asked for need not be the name on the server; a
+    /// case-insensitive presentation such as Windows needs the stored one to
+    /// report back. Never touches the network: `None` means "not known here".
+    pub fn stored_entry_name(&self, parent_inode: u64, inode: u64) -> Option<Name> {
+        self.cached_directory(parent_inode)
+            .ok()
+            .flatten()?
+            .entries
+            .iter()
+            .find(|entry| entry.inode == inode)
+            .map(|entry| entry.name.clone())
+    }
+
     pub async fn getattr_async(&self, inode: u64) -> Result<Metadata, AdapterError> {
         let record = self.inode_record(inode)?;
         let mut metadata = match self.cached_metadata(record.node)? {

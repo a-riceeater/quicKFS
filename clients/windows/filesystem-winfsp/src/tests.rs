@@ -1624,3 +1624,46 @@ fn setting_a_dacl_changes_only_the_owners_mode_bits() {
     assert_eq!(mode_of(&harness, &["readme.md"]) & 0o777, 0o744);
     harness.close(handle);
 }
+
+#[test]
+fn an_open_reports_the_stored_spelling_so_case_only_renames_reach_the_server() {
+    // WinFsp keeps an upper-cased name for an open it was given no normalized
+    // name for, and then treats a rename to the upper-case spelling as a
+    // rename onto itself. Reporting the stored spelling avoids that.
+    let harness = Harness::tree();
+    let (handle, _) = harness
+        .try_open(
+            r"\README.MD",
+            CreateOptions(0),
+            FileAccessRights::FILE_READ_DATA,
+        )
+        .unwrap();
+    assert_eq!(
+        harness
+            .filesystem
+            .normalized_name(&handle)
+            .unwrap()
+            .to_string()
+            .unwrap(),
+        r"\readme.md"
+    );
+    harness.close(handle);
+
+    let (handle, _) = harness
+        .try_open(
+            r"\docs\NOTES.TXT",
+            CreateOptions(0),
+            FileAccessRights::FILE_READ_DATA,
+        )
+        .unwrap();
+    assert_eq!(
+        harness
+            .filesystem
+            .normalized_name(&handle)
+            .unwrap()
+            .to_string()
+            .unwrap(),
+        r"\docs\notes.txt"
+    );
+    harness.close(handle);
+}

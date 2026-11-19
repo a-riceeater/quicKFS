@@ -36,7 +36,7 @@
 //! end user only have to define the methods (and the corresponding `xxx_DEFINED`) he uses.
 
 use std::sync::Arc;
-use widestring::U16CStr;
+use widestring::{U16CStr, U16CString};
 use windows_sys::Win32::Foundation::{STATUS_BUFFER_OVERFLOW, STATUS_REPARSE, STATUS_SUCCESS};
 use winfsp_wrs_sys::{
     FspFileSystemAddDirInfo, FspFileSystemFindReparsePoint, FspFileSystemResolveReparsePoints,
@@ -496,6 +496,15 @@ pub trait FileSystemInterface {
         unreachable!("To be used, trait method must be overwritten !");
     }
 
+    /// quicKFS change: the stored spelling of the full path just opened or
+    /// created, for WinFsp's file name normalization. A case-insensitive file
+    /// system should report it; without it WinFsp upper-cases the name it
+    /// keeps, which among other things makes a rename that only changes a
+    /// name to upper case a silent no-op. `None` leaves WinFsp's default.
+    fn normalized_name(&self, _file_context: &Self::FileContext) -> Option<U16CString> {
+        None
+    }
+
     /// Get reparse point given a file name.
     ///
     /// This method is used as a callback parameter to `FspFileSystemFindReparsePoint` &
@@ -658,6 +667,22 @@ impl TrampolineInterface {
     /// - FileInfo - [out] Pointer to a structure that will receive the file
     ///   information on successful return from this call. This information
     ///   includes file attributes, file times, etc.
+    /// quicKFS change: report a normalized name through the
+    /// `FSP_FSCTL_OPEN_FILE_INFO` that `Create` and `Open` really receive.
+    unsafe fn write_normalized_name(file_info: *mut FSP_FSCTL_FILE_INFO, name: Option<U16CString>) {
+        let Some(name) = name else {
+            return;
+        };
+        let open = file_info.cast::<winfsp_wrs_sys::FSP_FSCTL_OPEN_FILE_INFO>();
+        let buffer = (*open).NormalizedName;
+        let bytes = name.as_slice().len() * std::mem::size_of::<u16>();
+        if buffer.is_null() || bytes > usize::from((*open).NormalizedNameSize) {
+            return;
+        }
+        std::ptr::copy_nonoverlapping(name.as_ptr(), buffer, name.as_slice().len());
+        (*open).NormalizedNameSize = bytes as u16;
+    }
+
     unsafe extern "C" fn open_ext<C: FileSystemInterface>(
         file_system: *mut FSP_FILE_SYSTEM,
         file_name: PWSTR,
@@ -676,8 +701,10 @@ impl TrampolineInterface {
             FileAccessRights(granted_access),
         ) {
             Ok((fctx, finfo)) => {
+                let normalized = C::normalized_name(fs, &fctx);
                 C::FileContext::write(fctx, p_file_context);
                 *file_info = finfo.0;
+                Self::write_normalized_name(file_info, normalized);
                 STATUS_SUCCESS
             }
             Err(e) => e,
@@ -1465,8 +1492,10 @@ impl TrampolineInterface {
             sd,
         ) {
             Ok((fctx, finfo)) => {
+                let normalized = C::normalized_name(fs, &fctx);
                 C::FileContext::write(fctx, p_file_context);
                 *file_info = finfo.0;
+                Self::write_normalized_name(file_info, normalized);
                 STATUS_SUCCESS
             }
             Err(e) => e,
@@ -1542,8 +1571,10 @@ impl TrampolineInterface {
             extra_buffer_is_reparse_point != 0,
         ) {
             Ok((fctx, finfo)) => {
+                let normalized = C::normalized_name(fs, &fctx);
                 C::FileContext::write(fctx, p_file_context);
                 *file_info = finfo.0;
+                Self::write_normalized_name(file_info, normalized);
                 STATUS_SUCCESS
             }
             Err(e) => e,

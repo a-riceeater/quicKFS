@@ -457,6 +457,7 @@ impl FileContext {
             directory: Mutex::new(None),
             delete_on_close: AtomicBool::new(false),
             stream: Some(stream),
+            normalized: Mutex::new(None),
         })
     }
 

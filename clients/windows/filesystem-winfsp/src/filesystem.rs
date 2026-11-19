@@ -125,6 +125,9 @@ pub struct FileContext {
     delete_on_close: AtomicBool,
     /// Set when this open names a stream rather than the node's own data.
     stream: Option<OpenStream>,
+    /// The stored spelling of the path this open names, reported to WinFsp
+    /// for file name normalization.
+    normalized: Mutex<Option<U16CString>>,
 }
 
 impl FileContext {
@@ -143,6 +146,7 @@ impl FileContext {
             directory: Mutex::new(None),
             delete_on_close: AtomicBool::new(false),
             stream: None,
+            normalized: Mutex::new(None),
         })
     }
 
@@ -183,6 +187,13 @@ impl FileContext {
 
     fn is_directory(&self) -> bool {
         self.kind() == NodeKind::Directory
+    }
+
+    fn set_normalized(&self, name: Option<U16CString>) {
+        *self
+            .normalized
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
     }
 
     fn is_symlink(&self) -> bool {
@@ -668,7 +679,12 @@ impl FileSystemInterface for WindowsFilesystem {
         }
         let target = self.stream_target(file_name)?;
         if let Some(stream) = target.stream {
-            return self.create_stream(&target.components, stream, create_file_info);
+            let (handle, info) =
+                self.create_stream(&target.components, stream, create_file_info)?;
+            if let Some(context) = handle.get() {
+                context.set_normalized(Some(file_name.to_ucstring()));
+            }
+            return Ok((handle, info));
         }
         let (parent, name) = self.parent_and_name(file_name, true)?;
         let parent_inode = parent.inode;
@@ -683,6 +699,7 @@ impl FileSystemInterface for WindowsFilesystem {
         };
         self.resolver.release_resolved(&parent);
         let (context, info) = result?;
+        context.set_normalized(Some(file_name.to_ucstring()));
         self.set_location(&context, Location { parent_inode, name });
         Ok((Handle::new(context), info))
     }
@@ -730,15 +747,23 @@ impl FileSystemInterface for WindowsFilesystem {
             }
         };
 
+        let normalized = self.normalized_path(&components, location.as_ref(), resolved.inode);
         if let Some(stream) = target.stream {
-            return self.open_stream(
+            let stream_suffix = format!(":{}", String::from_utf8_lossy(stream.as_bytes()));
+            let (handle, info) = self.open_stream(
                 resolved,
                 location,
                 components,
                 stream,
                 create_options,
                 granted_access,
-            );
+            )?;
+            if let Some(context) = handle.get() {
+                context.set_normalized(normalized.and_then(|base| {
+                    U16CString::from_str(format!("{}{stream_suffix}", base.to_string_lossy())).ok()
+                }));
+            }
+            return Ok((handle, info));
         }
 
         // Windows asks for a directory or a non-directory explicitly, and an
@@ -775,6 +800,7 @@ impl FileSystemInterface for WindowsFilesystem {
             .unwrap_or(&[]);
         let info = self.entry_info(resolved.inode, &resolved.metadata, &name, directory);
         let context = FileContext::new(&resolved, granted_access, location, components.clone());
+        context.set_normalized(normalized);
         if create_options.is(CreateOptions::FILE_DELETE_ON_CLOSE) {
             context.delete_on_close.store(true, Ordering::Release);
         }
@@ -1519,6 +1545,10 @@ impl FileSystemInterface for WindowsFilesystem {
 
     const DISPATCHER_STOPPED_DEFINED: bool = true;
 
+    fn normalized_name(&self, file_context: &Self::FileContext) -> Option<U16CString> {
+        file_context.get()?.normalized.lock().ok()?.clone()
+    }
+
     fn dispatcher_stopped(&self, _normally: bool) {
         // The volume is going away: return every retained translation and close
         // whatever server handles are still open, so an abrupt unmount does not
@@ -1529,6 +1559,26 @@ impl FileSystemInterface for WindowsFilesystem {
 }
 
 impl WindowsFilesystem {
+    /// The path `components` names, with the final component in its stored
+    /// spelling when the parent's listing already knows it.
+    fn normalized_path(
+        &self,
+        components: &[String],
+        location: Option<&Location>,
+        inode: u64,
+    ) -> Option<U16CString> {
+        let mut parts: Vec<String> = components.to_vec();
+        if let (Some(last), Some(location)) = (parts.last_mut(), location)
+            && let Some(stored) = self
+                .adapter()
+                .stored_entry_name(location.parent_inode, inode)
+            && let Ok(stored) = String::from_utf8(stored.as_bytes().to_vec())
+        {
+            *last = stored;
+        }
+        U16CString::from_str(format!("\\{}", parts.join("\\"))).ok()
+    }
+
     /// Close whatever server file and directory handles `context` holds.
     fn release_open_handles(&self, context: &FileContext) {
         if let Ok(mut slot) = context.file.lock()
