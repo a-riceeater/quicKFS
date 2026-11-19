@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Windows platform support for the quicKFS client.
 //!
-//! Four things live here, and nothing else:
+//! Five things live here, and nothing else:
 //!
 //! * [`require_winfsp`] — the actionable startup check for the WinFsp runtime,
 //!   mirroring `quickfs-macos-support`'s macFUSE check.
@@ -9,6 +9,8 @@
 //!   security descriptors the WinFsp bridge presents for every node.
 //! * [`UnmountSignal`] and [`signal_unmount`], the named event that lets
 //!   `quickfs unmount Q:` reach the process holding the mount.
+//! * [`ParentProcess`], which lets a mount started by an app unmount itself
+//!   when that app exits, as `quickfs-mount --exit-with-parent` does on macOS.
 //! * The private-state primitives ([`create_private_directory`],
 //!   [`harden_private_path`], [`validate_private_owner`], [`lock_file`]) that
 //!   give the trust database and the offline cache the same protection on
@@ -25,8 +27,9 @@ mod windows;
 
 #[cfg(windows)]
 pub use windows::{
-    UnmountSignal, create_private_directory, current_user_sid, harden_private_path, lock_file,
-    signal_unmount, validate_private_owner, winfsp_install_directory, winfsp_is_installed,
+    ParentProcess, UnmountSignal, create_private_directory, current_user_sid, harden_private_path,
+    lock_file, signal_unmount, validate_private_owner, winfsp_install_directory,
+    winfsp_is_installed,
 };
 
 /// The official WinFsp download and installation website.

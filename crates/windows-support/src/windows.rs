@@ -15,8 +15,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-        LocalFree, MAX_PATH, WAIT_OBJECT_0,
+        ERROR_ALREADY_EXISTS, ERROR_SUCCESS, FILETIME, GetLastError, HANDLE, HLOCAL,
+        INVALID_HANDLE_VALUE, LocalFree, MAX_PATH, WAIT_OBJECT_0,
     },
     Security::{
         ACL,
@@ -32,11 +32,16 @@ use windows_sys::Win32::{
         CreateDirectoryW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     },
     System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
         IO::OVERLAPPED,
         Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW},
         Threading::{
-            CreateEventW, EVENT_MODIFY_STATE, GetCurrentProcess, INFINITE, OpenEventW,
-            OpenProcessToken, SetEvent, WaitForSingleObject,
+            CreateEventW, EVENT_MODIFY_STATE, GetCurrentProcess, GetProcessTimes, INFINITE,
+            OpenEventW, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, SetEvent, WaitForSingleObject,
         },
     },
 };
@@ -225,8 +230,8 @@ struct OwnedHandle(HANDLE);
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-            // SAFETY: the handle came from `OpenProcessToken` and is closed
-            // exactly once.
+            // SAFETY: every `OwnedHandle` wraps a handle this module opened,
+            // and it is closed exactly once.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
         }
     }
@@ -568,10 +573,119 @@ pub fn signal_unmount(identifier: &str) -> Result<bool, WindowsError> {
     Ok(true)
 }
 
+/// The process that launched this one, held open so its exit can be awaited.
+///
+/// Windows has no reparenting signal like Unix's change of `getppid`, but a
+/// process handle becomes signalled when the process exits. The handle is
+/// opened once, at startup; from then on the parent's process ID can be reused
+/// without affecting the wait, because the handle names the original object.
+pub struct ParentProcess {
+    handle: OwnedHandle,
+}
+
+// SAFETY: a process `HANDLE` is a process-wide kernel object reference, not
+// thread-affine; `WaitForSingleObject` and `CloseHandle` may be called on it
+// from any thread. The mount CLI moves one to a waiter thread.
+unsafe impl Send for ParentProcess {}
+
+impl ParentProcess {
+    /// Open this process's parent.
+    ///
+    /// Returns `None` when the parent has already exited — either it cannot be
+    /// found at all, or the process now holding its ID started after this one,
+    /// which means the ID was reused by an unrelated process.
+    pub fn open() -> Result<Option<Self>, WindowsError> {
+        let Some(parent_id) = parent_process_id()? else {
+            return Ok(None);
+        };
+        // SAFETY: plain call with value arguments; a null return is checked.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                parent_id,
+            )
+        };
+        if handle.is_null() {
+            return Ok(None);
+        }
+        let handle = OwnedHandle(handle);
+        // SAFETY: the pseudo-handle for this process needs no closing.
+        let own_start = process_start_time(unsafe { GetCurrentProcess() })?;
+        if process_start_time(handle.0)? > own_start {
+            return Ok(None);
+        }
+        Ok(Some(Self { handle }))
+    }
+
+    /// Block until the parent exits.
+    pub fn wait(&self) -> Result<(), WindowsError> {
+        // SAFETY: the handle is owned by `self`, was opened with `SYNCHRONIZE`,
+        // and outlives the call.
+        let outcome = unsafe { WaitForSingleObject(self.handle.0, INFINITE) };
+        if outcome == WAIT_OBJECT_0 {
+            Ok(())
+        } else {
+            Err(last_error("WaitForSingleObject"))
+        }
+    }
+}
+
+/// The parent process ID recorded for this process, from a process snapshot.
+fn parent_process_id() -> Result<Option<u32>, WindowsError> {
+    // SAFETY: plain call; an invalid handle is checked below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(last_error("CreateToolhelp32Snapshot"));
+    }
+    let snapshot = OwnedHandle(snapshot);
+    let own_id = std::process::id();
+    // SAFETY: `PROCESSENTRY32W` is plain data for which all-zero is valid.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: `entry` is a valid, correctly sized out-parameter for the
+    // snapshot handle owned above, for this and every following call.
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+    while more {
+        if entry.th32ProcessID == own_id {
+            return Ok(Some(entry.th32ParentProcessID));
+        }
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+    }
+    Ok(None)
+}
+
+/// When a process started, as a `FILETIME` tick count.
+fn process_start_time(process: HANDLE) -> Result<u64, WindowsError> {
+    let mut times = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: `process` is a valid handle with query access, and each pointer
+    // names a distinct live `FILETIME` for the duration of the call.
+    if unsafe { GetProcessTimes(process, created, exited, kernel, user) } == 0 {
+        return Err(last_error("GetProcessTimes"));
+    }
+    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_parent_of_a_test_process_is_found_and_still_running() {
+        // `cargo test` starts the test binary and waits for it, so the parent
+        // is alive for the whole test.
+        let parent = ParentProcess::open().unwrap();
+        assert!(parent.is_some(), "the running test harness's parent exists");
+        // SAFETY: the handle is owned by `parent`; a zero timeout only polls.
+        let outcome = unsafe { WaitForSingleObject(parent.unwrap().handle.0, 0) };
+        assert_ne!(outcome, WAIT_OBJECT_0, "the parent must not look exited");
+    }
 
     #[test]
     fn the_current_account_sid_is_well_formed() {
