@@ -285,7 +285,8 @@ pub fn volume_params(
         // fail deep inside an application instead of being cleanly unsupported.
         // Symbolic links are presented as reparse points; see `reparse`.
         .set_reparse_point(true)
-        .set_named_streams(false)
+        // Extended attributes are presented as named streams; see `streams`.
+        .set_named_streams(capabilities.supports_xattrs)
         .set_extended_attributes(false)
         .set_hard_links(false);
     let _ = params.set_file_system_name(&filesystem_name);

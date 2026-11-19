@@ -928,7 +928,17 @@ fn a_read_only_export_refuses_every_mutation_with_a_write_protected_volume() {
 #[test]
 fn names_windows_cannot_round_trip_are_refused_at_creation_but_not_at_lookup() {
     let harness = Harness::empty();
-    for name in ["bad:name.txt", "star*.txt", "trailing.", "CON"] {
+    // With named streams, `bad:name.txt` is the stream `name.txt` of `bad`,
+    // and creating a stream on a file that does not exist fails exactly as it
+    // does on NTFS. Either way, no file with a colon in its name is created.
+    assert_eq!(
+        harness
+            .try_create("\\bad:name.txt", CreateOptions(0), Harness::read_write())
+            .err(),
+        Some(status::STATUS_OBJECT_NAME_NOT_FOUND)
+    );
+    assert!(harness.server.lookup_path(&["bad:name.txt"]).is_none());
+    for name in ["star*.txt", "trailing.", "CON"] {
         assert_eq!(
             harness
                 .try_create(
@@ -943,7 +953,9 @@ fn names_windows_cannot_round_trip_are_refused_at_creation_but_not_at_lookup() {
     }
 
     // The same names, created on the server as a Linux client would, stay
-    // reachable so they can be read and deleted from Windows.
+    // reachable so they can be read and deleted from Windows. A fresh mount,
+    // because the attempts above loaded the root listing before these existed.
+    let harness = Harness::empty();
     for name in ["bad:name.txt", "star*.txt", "trailing.", "CON"] {
         harness.server.insert_file(
             quickfs_protocol::ROOT_NODE,
@@ -1337,4 +1349,192 @@ fn file_ids_are_distinct_nonzero_and_stable_and_link_counts_are_reported() {
         .unwrap();
     assert_eq!(info.index_number(), info_again.index_number());
     harness.close(again);
+}
+
+/// `\readme.md` carrying two attributes, one of them a name Windows cannot
+/// spell as a stream.
+fn attributed_tree() -> Harness {
+    let server = MockFilesystem::tree();
+    let readme = server.lookup_path(&["readme.md"]).unwrap();
+    server.insert_xattr(readme, "com.apple.FinderInfo", b"finder");
+    server.insert_xattr(readme, "user.a/b", b"hidden");
+    Harness::with(server)
+}
+
+fn stream_names(buffer: &[u8]) -> Vec<(String, u64)> {
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while at + 2 <= buffer.len() {
+        let size = usize::from(u16::from_le_bytes([buffer[at], buffer[at + 1]]));
+        if size == 0 {
+            break;
+        }
+        let stream_size = u64::from_le_bytes(buffer[at + 8..at + 16].try_into().unwrap());
+        let units: Vec<u16> = buffer[at + 24..at + size]
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        entries.push((String::from_utf16(&units).unwrap(), stream_size));
+        at += size.div_ceil(8) * 8;
+    }
+    entries
+}
+
+#[test]
+fn attributes_are_listed_as_named_streams_after_the_default_stream() {
+    let harness = attributed_tree();
+    let handle = harness.open("\\readme.md", FileAccessRights::FILE_READ_ATTRIBUTES);
+    let mut buffer = vec![0u8; 1024];
+    let used = harness
+        .filesystem
+        .get_stream_info(handle.clone(), &mut buffer)
+        .unwrap();
+    assert_eq!(
+        stream_names(&buffer[..used]),
+        vec![(String::new(), 8), ("com.apple.FinderInfo".to_owned(), 6),],
+        "the default stream, then every attribute Windows can spell"
+    );
+    harness.close(handle);
+}
+
+#[test]
+fn a_stream_reads_its_attribute_and_reports_its_own_size() {
+    let harness = attributed_tree();
+    let (handle, info) = harness
+        .try_open(
+            "\\readme.md:com.apple.FinderInfo",
+            CreateOptions(0),
+            FileAccessRights::FILE_READ_DATA,
+        )
+        .unwrap();
+    assert_eq!(info.file_size(), 6);
+    assert!(!info.file_attributes().is(FileAttributes::DIRECTORY));
+    let mut buffer = [0u8; 16];
+    let read = harness
+        .filesystem
+        .read(handle.clone(), &mut buffer, 0)
+        .unwrap();
+    assert_eq!(&buffer[..read], b"finder");
+    assert_eq!(
+        harness.filesystem.read(handle.clone(), &mut buffer, 6),
+        Err(status::STATUS_END_OF_FILE)
+    );
+    harness.close(handle);
+
+    // The `:$DATA` spelling names the same stream.
+    let (handle, _) = harness
+        .try_open(
+            "\\readme.md:com.apple.FinderInfo:$DATA",
+            CreateOptions(0),
+            FileAccessRights::FILE_READ_DATA,
+        )
+        .unwrap();
+    harness.close(handle);
+}
+
+#[test]
+fn an_absent_stream_is_not_found_so_windows_creates_it() {
+    let harness = attributed_tree();
+    assert_eq!(
+        harness
+            .try_open(
+                "\\readme.md:Zone.Identifier",
+                CreateOptions(0),
+                FileAccessRights::FILE_READ_DATA,
+            )
+            .err(),
+        Some(status::STATUS_OBJECT_NAME_NOT_FOUND)
+    );
+}
+
+#[test]
+fn writing_a_new_stream_stores_an_attribute_and_leaves_the_file_alone() {
+    let harness = attributed_tree();
+    let (handle, _) = harness.create(
+        "\\readme.md:Zone.Identifier",
+        CreateOptions(0),
+        Harness::read_write(),
+    );
+    let mark = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+    let (written, info) = harness
+        .filesystem
+        .write(handle.clone(), mark, WriteMode::Normal { offset: 0 })
+        .unwrap();
+    assert_eq!(written, mark.len());
+    assert_eq!(info.file_size(), mark.len() as u64);
+    harness.close(handle);
+
+    let readme = node(&harness.server, &["readme.md"]);
+    assert_eq!(
+        harness.server.xattr(readme, "Zone.Identifier").unwrap(),
+        mark.to_vec()
+    );
+    assert_eq!(harness.server.contents(readme), Some(b"# readme".to_vec()));
+
+    // Creating it again collides, as on NTFS.
+    assert_eq!(
+        harness
+            .try_create(
+                "\\readme.md:Zone.Identifier",
+                CreateOptions(0),
+                Harness::read_write(),
+            )
+            .err(),
+        Some(status::STATUS_OBJECT_NAME_COLLISION)
+    );
+}
+
+#[test]
+fn rewriting_truncating_and_deleting_a_stream_reach_the_attribute() {
+    let harness = attributed_tree();
+    let readme = node(&harness.server, &["readme.md"]);
+    let path = "\\readme.md:com.apple.FinderInfo";
+
+    let handle = harness.open(path, Harness::read_write());
+    harness
+        .filesystem
+        .write(handle.clone(), b"XY", WriteMode::Normal { offset: 1 })
+        .unwrap();
+    harness.filesystem.flush(handle.clone()).unwrap();
+    assert_eq!(
+        harness
+            .server
+            .xattr(readme, "com.apple.FinderInfo")
+            .unwrap(),
+        b"fXYder"
+    );
+    harness
+        .filesystem
+        .set_file_size(handle.clone(), 3, false)
+        .unwrap();
+    harness.close(handle);
+    assert_eq!(
+        harness
+            .server
+            .xattr(readme, "com.apple.FinderInfo")
+            .unwrap(),
+        b"fXY"
+    );
+
+    let handle = harness.open(path, Harness::read_write());
+    harness.close_deleting(handle);
+    assert_eq!(harness.server.xattr(readme, "com.apple.FinderInfo"), None);
+    // Deleting a stream never deletes the file carrying it.
+    assert_eq!(harness.server.contents(readme), Some(b"# readme".to_vec()));
+}
+
+#[test]
+fn a_stored_name_containing_a_colon_still_opens_as_that_file() {
+    let harness = Harness::tree();
+    harness
+        .server
+        .insert_file(ROOT_NODE, "made:on-linux", 0o644, b"linux".to_vec());
+    let handle = harness.open("\\made:on-linux", FileAccessRights::FILE_READ_DATA);
+    let mut buffer = [0u8; 8];
+    let read = harness
+        .filesystem
+        .read(handle.clone(), &mut buffer, 0)
+        .unwrap();
+    assert_eq!(&buffer[..read], b"linux");
+    harness.close(handle);
 }

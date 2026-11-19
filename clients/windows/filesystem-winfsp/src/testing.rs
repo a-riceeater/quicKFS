@@ -17,13 +17,13 @@
 use async_trait::async_trait;
 use quickfs_client_core::{
     ClientError, CreatedFile, OpenedFile, RangeRead, RemoteFilesystem, Result as ClientResult,
-    WriteResult,
+    WriteResult, XattrRead,
 };
 use quickfs_fs_adapter::Adapter;
 use quickfs_protocol::{
     AttributeChanges, DirectoryEntry, DirectoryView, DirectoryViewEntry, DirectoryViewOptions,
     ErrorCode, FileHandle, FileOpenOptions, FilesystemCapabilities, FilesystemStats, Metadata,
-    Name, NodeId, NodeKind, ROOT_NODE, RenameMode,
+    Name, NodeId, NodeKind, ROOT_NODE, RenameMode, XattrSetMode,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -57,6 +57,7 @@ struct Node {
     /// `read_directory` depends on.
     children: BTreeMap<Name, NodeId>,
     parent: NodeId,
+    xattrs: BTreeMap<Name, Vec<u8>>,
 }
 
 impl Node {
@@ -70,6 +71,7 @@ impl Node {
             data: Vec::new(),
             children: BTreeMap::new(),
             parent,
+            xattrs: BTreeMap::new(),
         }
     }
 
@@ -83,6 +85,7 @@ impl Node {
             data,
             children: BTreeMap::new(),
             parent,
+            xattrs: BTreeMap::new(),
         }
     }
 
@@ -96,6 +99,7 @@ impl Node {
             data: target,
             children: BTreeMap::new(),
             parent,
+            xattrs: BTreeMap::new(),
         }
     }
 
@@ -209,6 +213,31 @@ impl MockFilesystem {
         self.insert(parent, name, Node::symlink(parent, target.to_vec()))
     }
 
+    /// Store an extended attribute directly on the server.
+    pub fn insert_xattr(&self, node: NodeId, name: &str, value: &[u8]) {
+        #[allow(clippy::expect_used)]
+        let mut state = self.state.lock().expect("test state must not be poisoned");
+        #[allow(clippy::expect_used)]
+        state
+            .nodes
+            .get_mut(&node)
+            .expect("node must exist")
+            .xattrs
+            .insert(Name::from(name.to_owned()), value.to_vec());
+    }
+
+    /// An extended attribute as the server holds it.
+    pub fn xattr(&self, node: NodeId, name: &str) -> Option<Vec<u8>> {
+        #[allow(clippy::expect_used)]
+        let state = self.state.lock().expect("test state must not be poisoned");
+        state
+            .nodes
+            .get(&node)?
+            .xattrs
+            .get(&Name::from(name.to_owned()))
+            .cloned()
+    }
+
     /// The kind stored for a node.
     pub fn kind(&self, node: NodeId) -> Option<NodeKind> {
         #[allow(clippy::expect_used)]
@@ -296,7 +325,7 @@ fn writable_capabilities() -> FilesystemCapabilities {
         supports_directory_sync: true,
         supports_preallocation: true,
         supports_symlinks: true,
-        supports_xattrs: false,
+        supports_xattrs: true,
         supports_hard_links: false,
         supports_special_nodes: false,
         supports_copy_file_range: false,
@@ -544,6 +573,93 @@ impl RemoteFilesystem for MockFilesystem {
             .children
             .insert(name, node);
         Ok(metadata)
+    }
+
+    async fn get_xattr(
+        &self,
+        node: NodeId,
+        name: Name,
+        offset: u64,
+        length: u64,
+    ) -> ClientResult<XattrRead> {
+        let state = self.locked()?;
+        let value = state
+            .nodes
+            .get(&node)
+            .ok_or_else(|| server(ErrorCode::NotFound, "no such node"))?
+            .xattrs
+            .get(&name)
+            .ok_or_else(|| server(ErrorCode::NoAttribute, "no such attribute"))?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(value.len());
+        let end = start
+            .saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
+            .min(value.len());
+        Ok(XattrRead {
+            total_size: value.len() as u64,
+            data: value[start..end].to_vec(),
+        })
+    }
+
+    async fn set_xattr(
+        &self,
+        node: NodeId,
+        name: Name,
+        value: &[u8],
+        mode: XattrSetMode,
+        position: u32,
+    ) -> ClientResult<()> {
+        let mut state = self.locked()?;
+        let xattrs = &mut state
+            .nodes
+            .get_mut(&node)
+            .ok_or_else(|| server(ErrorCode::NotFound, "no such node"))?
+            .xattrs;
+        match (mode, xattrs.contains_key(&name)) {
+            (XattrSetMode::Create, true) => {
+                return Err(server(ErrorCode::AlreadyExists, "attribute exists"));
+            }
+            (XattrSetMode::Replace, false) => {
+                return Err(server(ErrorCode::NoAttribute, "no such attribute"));
+            }
+            _ => {}
+        }
+        let position = position as usize;
+        let stored = xattrs.entry(name).or_default();
+        if position == 0 {
+            *stored = value.to_vec();
+        } else {
+            if stored.len() < position + value.len() {
+                stored.resize(position + value.len(), 0);
+            }
+            stored[position..position + value.len()].copy_from_slice(value);
+        }
+        Ok(())
+    }
+
+    async fn list_xattrs(&self, node: NodeId) -> ClientResult<Vec<Name>> {
+        let state = self.locked()?;
+        Ok(state
+            .nodes
+            .get(&node)
+            .ok_or_else(|| server(ErrorCode::NotFound, "no such node"))?
+            .xattrs
+            .keys()
+            .cloned()
+            .collect())
+    }
+
+    async fn remove_xattr(&self, node: NodeId, name: Name) -> ClientResult<()> {
+        let mut state = self.locked()?;
+        state
+            .nodes
+            .get_mut(&node)
+            .ok_or_else(|| server(ErrorCode::NotFound, "no such node"))?
+            .xattrs
+            .remove(&name)
+            .map(|_| ())
+            .ok_or_else(|| server(ErrorCode::NoAttribute, "no such attribute"))
     }
 
     async fn read_link(&self, node: NodeId) -> ClientResult<Vec<u8>> {

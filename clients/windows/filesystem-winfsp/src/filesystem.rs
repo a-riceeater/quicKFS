@@ -52,6 +52,9 @@ use winfsp_wrs::{
     FileInfo, FileSystemInterface, PSecurityDescriptor, SecurityDescriptor, VolumeInfo, WriteMode,
 };
 
+mod stream_ops;
+use stream_ops::OpenStream;
+
 /// Bytes per allocation unit reported to Windows. One sector, which is what a
 /// modern NTFS volume reports and what Explorer divides by to show "size on
 /// disk".
@@ -117,6 +120,8 @@ pub struct FileContext {
     /// first enumeration.
     directory: Mutex<Option<OpenDirectory>>,
     delete_on_close: AtomicBool,
+    /// Set when this open names a stream rather than the node's own data.
+    stream: Option<OpenStream>,
 }
 
 impl FileContext {
@@ -134,6 +139,7 @@ impl FileContext {
             file: Mutex::new(None),
             directory: Mutex::new(None),
             delete_on_close: AtomicBool::new(false),
+            stream: None,
         })
     }
 
@@ -287,18 +293,6 @@ impl WindowsFilesystem {
 
     fn components(&self, file_name: &U16CStr) -> Result<Vec<String>, NtStatus> {
         path::components(file_name.as_slice()).map_err(path_status)
-    }
-
-    /// Resolve a path, returning the node without holding a reference the
-    /// caller has to remember to release. Directories keep their reference in
-    /// the resolver's retained set, which is what keeps their listing cached.
-    fn resolve_transient(&self, file_name: &U16CStr) -> Result<Resolved, NtStatus> {
-        let components = self.components(file_name)?;
-        let resolved = self
-            .block_on(self.resolver.resolve(&components))
-            .map_err(adapter_status)?;
-        self.resolver.release_resolved(&resolved);
-        Ok(resolved)
     }
 
     fn file_info(&self, metadata: &Metadata, name: &Name) -> FileInfo {
@@ -593,6 +587,7 @@ impl FileSystemInterface for WindowsFilesystem {
     const SET_REPARSE_POINT_DEFINED: bool = true;
     const DELETE_REPARSE_POINT_DEFINED: bool = true;
     const RESOLVE_REPARSE_POINTS_DEFINED: bool = true;
+    const GET_STREAM_INFO_DEFINED: bool = true;
 
     fn get_volume_info(&self) -> Result<VolumeInfo, NtStatus> {
         let statistics = self
@@ -614,7 +609,12 @@ impl FileSystemInterface for WindowsFilesystem {
         file_name: &U16CStr,
         find_reparse_point: impl Fn() -> Option<FileAttributes>,
     ) -> Result<(FileAttributes, PSecurityDescriptor, bool), NtStatus> {
-        let resolved = match self.resolve_transient(file_name) {
+        let target = self.stream_target(file_name)?;
+        let resolved = match self
+            .block_on(self.resolver.resolve(&target.components))
+            .map_err(adapter_status)
+            .inspect(|resolved| self.resolver.release_resolved(resolved))
+        {
             Ok(resolved) => resolved,
             // The walk stops at a link that is not the last component; WinFsp
             // then reparses the name through it. The value it hands back is the
@@ -630,7 +630,11 @@ impl FileSystemInterface for WindowsFilesystem {
                 };
             }
         };
-        let name = final_name(file_name);
+        let name = target
+            .components
+            .last()
+            .map(|name| Name::from(name.clone()))
+            .unwrap_or_default();
         let attributes = FileAttributes(attributes::file_attributes(
             resolved.metadata.kind,
             resolved.metadata.mode,
@@ -650,6 +654,10 @@ impl FileSystemInterface for WindowsFilesystem {
     ) -> Result<(Self::FileContext, FileInfo), NtStatus> {
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        let target = self.stream_target(file_name)?;
+        if let Some(stream) = target.stream {
+            return self.create_stream(&target.components, stream, create_file_info);
         }
         let (parent, name) = self.parent_and_name(file_name, true)?;
         let parent_inode = parent.inode;
@@ -674,7 +682,8 @@ impl FileSystemInterface for WindowsFilesystem {
         create_options: CreateOptions,
         granted_access: FileAccessRights,
     ) -> Result<(Self::FileContext, FileInfo), NtStatus> {
-        let components = self.components(file_name)?;
+        let target = self.stream_target(file_name)?;
+        let components = target.components;
         // Resolving the parent and then looking the child up inside it costs
         // exactly the same walk as resolving the whole path, and it yields the
         // parent inode this handle will need if it is later deleted or
@@ -709,6 +718,17 @@ impl FileSystemInterface for WindowsFilesystem {
                 )
             }
         };
+
+        if let Some(stream) = target.stream {
+            return self.open_stream(
+                resolved,
+                location,
+                components,
+                stream,
+                create_options,
+                granted_access,
+            );
+        }
 
         // Windows asks for a directory or a non-directory explicitly, and an
         // application that opened a directory expecting a file misbehaves in
@@ -761,6 +781,9 @@ impl FileSystemInterface for WindowsFilesystem {
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
         }
+        if let Some(stream) = &context.stream {
+            return self.stream_overwrite(&context, stream);
+        }
         if context.is_directory() {
             return Err(status::STATUS_FILE_IS_A_DIRECTORY);
         }
@@ -795,12 +818,17 @@ impl FileSystemInterface for WindowsFilesystem {
         // way an ordinary callback can — there is nobody left to report to — so
         // every step here is best effort and errors are swallowed after being
         // attempted.
+        let delete =
+            flags.is(CleanupFlags::DELETE) || context.delete_on_close.load(Ordering::Acquire);
+        if let Some(stream) = &context.stream {
+            // Deleting a stream removes the attribute, never the file.
+            self.stream_cleanup(&context, stream, delete);
+            return;
+        }
         if flags.is(CleanupFlags::SET_LAST_WRITE_TIME) || flags.is(CleanupFlags::SET_CHANGE_TIME) {
             self.set_modified_now(context.inode());
         }
-        if (flags.is(CleanupFlags::DELETE) || context.delete_on_close.load(Ordering::Acquire))
-            && let Some(location) = self.location_of(&context)
-        {
+        if delete && let Some(location) = self.location_of(&context) {
             let _ = self.block_on(self.adapter().remove_async(
                 location.parent_inode,
                 location.name,
@@ -826,6 +854,9 @@ impl FileSystemInterface for WindowsFilesystem {
         offset: u64,
     ) -> Result<usize, NtStatus> {
         let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
+        if let Some(stream) = &context.stream {
+            return self.stream_read(&context, stream, buffer, offset);
+        }
         if context.is_directory() {
             return Err(status::STATUS_FILE_IS_A_DIRECTORY);
         }
@@ -872,6 +903,9 @@ impl FileSystemInterface for WindowsFilesystem {
         let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        if let Some(stream) = &context.stream {
+            return self.stream_write(&context, stream, buffer, mode);
         }
         if context.is_directory() {
             return Err(status::STATUS_FILE_IS_A_DIRECTORY);
@@ -930,6 +964,10 @@ impl FileSystemInterface for WindowsFilesystem {
         let Some(context) = context.get().cloned() else {
             return Ok(FileInfo::default());
         };
+        if let Some(stream) = &context.stream {
+            self.stream_flush(&context, stream)?;
+            return self.stream_info_of(&context, stream);
+        }
         if context.is_directory() {
             return self.info_for(context.inode(), &self.name_of(&context));
         }
@@ -949,6 +987,9 @@ impl FileSystemInterface for WindowsFilesystem {
 
     fn get_file_info(&self, context: Self::FileContext) -> Result<FileInfo, NtStatus> {
         let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
+        if let Some(stream) = &context.stream {
+            return self.stream_info_of(&context, stream);
+        }
         if context.is_symlink() {
             let metadata = self
                 .block_on(self.adapter().getattr_async(context.inode()))
@@ -1023,6 +1064,9 @@ impl FileSystemInterface for WindowsFilesystem {
         let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        if let Some(stream) = &context.stream {
+            return self.stream_set_size(&context, stream, new_size, set_allocation_size);
         }
         if context.is_directory() {
             return Err(status::STATUS_FILE_IS_A_DIRECTORY);
@@ -1104,6 +1148,11 @@ impl FileSystemInterface for WindowsFilesystem {
         let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
         if !self.capabilities.writable {
             return Err(status::STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        if context.stream.is_some() {
+            // NTFS can rename one stream to another; nothing Windows ships
+            // relies on it, and an attribute has no rename operation.
+            return Err(status::STATUS_INVALID_PARAMETER);
         }
         let source = self
             .location_of(&context)
@@ -1232,6 +1281,15 @@ impl FileSystemInterface for WindowsFilesystem {
         );
         self.resolver.release(result.inode);
         Ok(info)
+    }
+
+    fn get_stream_info(
+        &self,
+        context: Self::FileContext,
+        buffer: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        let context = context.get().ok_or(status::STATUS_INVALID_HANDLE)?.clone();
+        self.list_streams(&context, buffer)
     }
 
     fn get_reparse_point_by_name(
@@ -1521,12 +1579,4 @@ fn index_number(node: NodeId) -> u64 {
         0 => 1,
         folded => folded,
     }
-}
-
-/// The last component of a WinFsp path, for the hidden-attribute convention.
-/// A path that will not parse yields an empty name, which is never hidden.
-fn final_name(file_name: &U16CStr) -> Name {
-    path::split_parent(file_name.as_slice())
-        .map(|(_, name)| Name::from(name))
-        .unwrap_or_default()
 }
