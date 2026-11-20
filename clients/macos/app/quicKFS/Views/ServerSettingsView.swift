@@ -173,6 +173,8 @@ struct ServerSettingsView: View {
                     LabeledContent("Connections per download", value: "\(draft.transfer.connections)")
                 }
                 .help("Large downloads stripe across this many connections. On a lossy or relayed link each connection slows down on its own, so several together move more. Each one is an extra login on the server.")
+                Toggle("BBR for uploads", isOn: $draft.transfer.bbr)
+                    .help("Pace what this Mac sends with BBR instead of Cubic. Holds much more speed on lossy or long-distance links. Covers browser uploads and copies onto the mounted volume (from the next mount). Downloads follow the server's own setting.")
                 Toggle("Size requests to the link", isOn: $draft.transfer.adaptive)
                     .help("Keep only a few seconds of data in flight, so slow or relayed links do not time out.")
                 Stepper(value: $draft.transfer.maxDepth, in: 1...32) {

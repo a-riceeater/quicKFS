@@ -10,6 +10,7 @@
 //! a fast link (in-flight can double per completion) and cuts hard after a
 //! failure.
 
+use quickfs_client_core::CongestionControl;
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
@@ -50,6 +51,9 @@ pub struct Tuning {
     /// its own congestion window, so on a lossy path where one connection's
     /// rate collapses, several together move proportionally more.
     pub connections: usize,
+    /// How this client paces what it sends. Uploads follow it; downloads
+    /// follow the server's own setting.
+    pub congestion: CongestionControl,
 }
 
 impl Default for Tuning {
@@ -61,19 +65,22 @@ impl Default for Tuning {
             retry_window: DEFAULT_RETRY_WINDOW,
             stall_timeout: Duration::from_secs(30),
             connections: 1,
+            congestion: CongestionControl::default(),
         }
     }
 }
 
 /// The optional `transfer` object of a `connect` request. Missing fields keep
 /// their defaults, and out-of-range values are clamped rather than rejected.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct TuningRequest {
     pub adaptive: Option<bool>,
     pub max_depth: Option<usize>,
     pub max_chunk_bytes: Option<u64>,
     pub retry_window_ms: Option<u64>,
     pub connections: Option<usize>,
+    /// `cubic`, `newreno`, or `bbr`; anything else keeps the default.
+    pub congestion_control: Option<String>,
 }
 
 impl Tuning {
@@ -98,6 +105,10 @@ impl Tuning {
                 .connections
                 .unwrap_or(defaults.connections)
                 .clamp(1, MAX_CONNECTIONS),
+            congestion: request
+                .congestion_control
+                .and_then(|name| name.parse().ok())
+                .unwrap_or(defaults.congestion),
         }
     }
 
@@ -370,6 +381,7 @@ mod tests {
                 max_chunk_bytes: Some(1),
                 retry_window_ms: Some(5_000),
                 connections: Some(9),
+                congestion_control: Some("warp".into()),
             }),
             Duration::from_secs(60),
         );
@@ -379,5 +391,18 @@ mod tests {
         assert_eq!(tuning.retry_window, Duration::from_secs(5));
         assert_eq!(tuning.connections, MAX_CONNECTIONS);
         assert_eq!(tuning.target_latency(), Duration::from_secs(10));
+        assert_eq!(tuning.congestion, CongestionControl::Cubic);
+    }
+
+    #[test]
+    fn a_named_congestion_controller_is_used() {
+        let request: TuningRequest =
+            serde_json::from_str(r#"{"congestion_control": "bbr"}"#).unwrap();
+        let tuning = Tuning::from_request(Some(request), Duration::from_secs(30));
+        assert_eq!(tuning.congestion, CongestionControl::Bbr);
+        assert_eq!(
+            Tuning::from_request(None, Duration::from_secs(30)).congestion,
+            CongestionControl::Cubic
+        );
     }
 }

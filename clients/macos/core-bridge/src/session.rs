@@ -7,8 +7,9 @@ use crate::{
     pipeline::{Tuning, TuningRequest},
 };
 use quickfs_client_core::{
-    AuthenticatedConnectionConfig, ReconnectPolicy, RemoteFilesystem, ResilientFilesystem,
-    ResilientFilesystemOptions, ServerTrust, load_trusted_server_pin, resolve_path,
+    AuthenticatedConnectionConfig, CongestionControl, ReconnectPolicy, RemoteFilesystem,
+    ResilientFilesystem, ResilientFilesystemOptions, ServerTrust, load_trusted_server_pin,
+    resolve_path,
 };
 use quickfs_protocol::{
     AttributeChanges, FileAccess, FileOpenOptions, FilesystemCapabilities, Name, NodeId, NodeKind,
@@ -53,6 +54,7 @@ struct Login {
     username: String,
     password: Zeroizing<String>,
     timeout: Duration,
+    congestion: CongestionControl,
 }
 
 impl Login {
@@ -64,7 +66,8 @@ impl Login {
             self.username.clone(),
             self.password.to_string(),
             self.timeout,
-        );
+        )
+        .with_congestion(self.congestion);
         let resilient =
             ResilientFilesystem::connect_authenticated(config, resilient_options()).await?;
         Ok(Arc::new(resilient))
@@ -192,6 +195,7 @@ pub async fn connect(
         username,
         password,
         timeout,
+        congestion: tuning.congestion,
     };
     let filesystem = login.connect().await?;
     let capabilities = filesystem.capabilities().await?;

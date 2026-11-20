@@ -63,6 +63,9 @@ struct TransferOptions: Codable, Hashable, Sendable {
     /// Separate connections a large download stripes across. More helps on
     /// lossy links, at one extra login on the server each.
     var connections = 1
+    /// Pace what this Mac sends with BBR instead of Cubic. Uploads and writes
+    /// to the mounted volume follow it; downloads follow the server's setting.
+    var bbr = false
 
     init() {}
 
@@ -75,6 +78,7 @@ struct TransferOptions: Codable, Hashable, Sendable {
         maxDepth = (try? values.decodeIfPresent(Int.self, forKey: .maxDepth)) ?? defaults.maxDepth
         maxChunkKiB = (try? values.decodeIfPresent(Int.self, forKey: .maxChunkKiB)) ?? defaults.maxChunkKiB
         connections = (try? values.decodeIfPresent(Int.self, forKey: .connections)) ?? defaults.connections
+        bbr = (try? values.decodeIfPresent(Bool.self, forKey: .bbr)) ?? defaults.bbr
     }
 
     var timeoutMs: JSONValue { .uint(UInt64(max(1, stallTimeoutSeconds)) * 1_000) }
@@ -86,6 +90,7 @@ struct TransferOptions: Codable, Hashable, Sendable {
             "max_chunk_bytes": .uint(UInt64(max(128, maxChunkKiB)) * 1_024),
             "retry_window_ms": .uint(UInt64(max(1, retryMinutes)) * 60_000),
             "connections": .uint(UInt64(min(4, max(1, connections)))),
+            "congestion_control": .string(bbr ? "bbr" : "cubic"),
         ]
     }
 }

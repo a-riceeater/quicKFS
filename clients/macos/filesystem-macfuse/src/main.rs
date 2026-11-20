@@ -60,9 +60,9 @@ mod macos {
     use clap::{Parser, ValueEnum};
     use quickfs_cache::{CacheNamespace, NonBlockingPersistentCache};
     use quickfs_client_core::{
-        AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, MAX_CLIENT_READ_SIZE,
-        ReconnectPolicy, RemoteFilesystem, ResilientFilesystem, ResilientFilesystemOptions,
-        ServerTrust, load_trusted_server_pin, mount_helper,
+        AuthenticatedConnectionConfig, CachePolicy, CachedFilesystem, CongestionControl,
+        MAX_CLIENT_READ_SIZE, ReconnectPolicy, RemoteFilesystem, ResilientFilesystem,
+        ResilientFilesystemOptions, ServerTrust, load_trusted_server_pin, mount_helper,
     };
     use quickfs_filesystem_macfuse::{Adapter, MacFuseBackend, MountConfig, mount};
     use quickfs_transport_quic::load_certificates;
@@ -159,6 +159,12 @@ mod macos {
         reconnect_initial_backoff_ms: u64,
         #[arg(long, default_value_t = 2_000)]
         reconnect_max_backoff_ms: u64,
+        /// How this client paces what it sends: `cubic` (default), `newreno`,
+        /// or `bbr`. It governs writes such as Finder copies onto the volume;
+        /// reads follow the server's own setting. BBR holds far more
+        /// throughput on lossy or long-RTT links but is experimental in quinn.
+        #[arg(long, env = "QUICKFS_CONGESTION_CONTROL")]
+        congestion_control: Option<CongestionControl>,
         /// Validate the server with the operating system's public/managed roots.
         #[arg(long, env = "QUICKFS_TRUST_SYSTEM_ROOTS", conflicts_with = "ca_cert")]
         trust_system_roots: bool,
@@ -232,8 +238,14 @@ mod macos {
                 .context("failed to create the shared Tokio runtime")?,
         );
 
+        let congestion = cli.congestion_control.unwrap_or_default();
         let identity_check = runtime
-            .block_on(trust.connect(cli.server, &cli.server_name, transport_timeout))
+            .block_on(trust.connect_using(
+                cli.server,
+                &cli.server_name,
+                transport_timeout,
+                congestion,
+            ))
             .with_context(|| {
                 format!("failed to authenticate server via {}", trust.description())
             })?;
@@ -256,7 +268,8 @@ mod macos {
             username.clone(),
             password.to_string(),
             transport_timeout,
-        );
+        )
+        .with_congestion(congestion);
         let resilient = runtime
             .block_on(ResilientFilesystem::connect_authenticated(
                 connection,

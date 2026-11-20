@@ -305,6 +305,7 @@ final class MountController {
             arguments += ["--volume-name", name.replacingOccurrences(of: ",", with: " ")]
         }
         if options.backend == .fskit { arguments += ["--macfuse-backend", "fskit"] }
+        if profile.transfer.bbr { arguments += ["--congestion-control", "bbr"] }
         arguments += profile.trust.mountArguments
         return arguments
     }
