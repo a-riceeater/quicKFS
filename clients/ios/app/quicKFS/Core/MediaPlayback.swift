@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import AVFoundation
 import Observation
+import os
 import UniformTypeIdentifiers
 
 /// Plays a remote video or audio file while it streams.
@@ -76,6 +77,7 @@ final class MediaPlayback {
         let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
         self.player = player
+        observeStalls(player: player, item: item)
         statusObservation = item.observe(\.status) { [weak self] item, _ in
             guard item.status == .failed else { return }
             let message = item.error?.localizedDescription ?? "This file cannot be played."
@@ -85,10 +87,34 @@ final class MediaPlayback {
         player.play()
     }
 
+    @ObservationIgnored private var stallObservers: [any NSObjectProtocol] = []
+    @ObservationIgnored private var waitObservation: NSKeyValueObservation?
+
+    /// Log what the player itself reports when it runs dry.
+    private func observeStalls(player: AVPlayer, item: AVPlayerItem) {
+        let center = NotificationCenter.default
+        stallObservers.append(center.addObserver(
+            forName: AVPlayerItem.playbackStalledNotification, object: item, queue: nil
+        ) { _ in mediaLog.notice("player stalled") })
+        stallObservers.append(center.addObserver(
+            forName: AVPlayerItem.newErrorLogEntryNotification, object: item, queue: nil
+        ) { notification in
+            let entry = (notification.object as? AVPlayerItem)?.errorLog()?.events.last
+            mediaLog.error("player error \(entry?.errorStatusCode ?? 0, privacy: .public): \(entry?.errorComment ?? "", privacy: .public)")
+        })
+        waitObservation = player.observe(\.timeControlStatus) { player, _ in
+            let reason = player.reasonForWaitingToPlay?.rawValue ?? "none"
+            mediaLog.info("time control \(player.timeControlStatus.rawValue, privacy: .public), waiting: \(reason, privacy: .public)")
+        }
+    }
+
     /// Stop playback and release the remote file.
     func close() {
         closed = true
         statusObservation = nil
+        waitObservation = nil
+        for observer in stallObservers { NotificationCenter.default.removeObserver(observer) }
+        stallObservers.removeAll()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
@@ -98,6 +124,9 @@ final class MediaPlayback {
         stream = nil
     }
 }
+
+/// Streaming diagnostics: `log stream --predicate 'subsystem == "org.quickfs.client" AND category == "media"'`.
+let mediaLog = Logger(subsystem: "org.quickfs.client", category: "media")
 
 /// Answers AVFoundation's byte-range requests from a `RemoteStream`.
 final class MediaResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
@@ -149,21 +178,38 @@ final class MediaResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unche
     }
 
     private func serve(_ request: AVAssetResourceLoadingRequest, from start: UInt64, to end: UInt64) {
+        let begun = ContinuousClock.now
         var offset = start
+        var slowest = Duration.zero
+        func summary(_ outcome: String) {
+            let elapsed = ContinuousClock.now - begun
+            let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+            let rate = seconds > 0 ? Double(offset - start) / seconds / 1e6 : 0
+            mediaLog.info("range \(start, privacy: .public)..<\(end, privacy: .public) \(outcome, privacy: .public): \(offset - start, privacy: .public) B in \(seconds, format: .fixed(precision: 2), privacy: .public) s (\(rate, format: .fixed(precision: 1), privacy: .public) MB/s), slowest read \(slowest.description, privacy: .public)")
+        }
+        mediaLog.info("range \(start, privacy: .public)..<\(end, privacy: .public) requested")
         while offset < end {
-            if request.isCancelled || request.isFinished || isStopped { return }
+            if request.isCancelled || request.isFinished || isStopped { return summary("cancelled") }
             do {
+                let started = ContinuousClock.now
                 let data = try stream.read(at: offset, count: Int(min(UInt64(Self.chunk), end - offset)))
+                let took = ContinuousClock.now - started
+                slowest = max(slowest, took)
+                if took > .milliseconds(500) {
+                    mediaLog.notice("slow read at \(offset, privacy: .public): \(took.description, privacy: .public)")
+                }
                 if data.isEmpty { break }
-                if request.isCancelled || isStopped { return }
+                if request.isCancelled || isStopped { return summary("cancelled") }
                 request.dataRequest?.respond(with: data)
                 offset += UInt64(data.count)
             } catch {
+                mediaLog.error("read at \(offset, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 if !request.isCancelled { request.finishLoading(with: error) }
-                return
+                return summary("failed")
             }
         }
         if !request.isCancelled, !request.isFinished { request.finishLoading() }
+        summary("finished")
     }
 }
 

@@ -14,12 +14,12 @@ enum DebugHooks {
         return arguments[index + 1]
     }
 
-    /// `-debugServer "host:port|user|password|sha256"`: pin the fingerprint
-    /// and save the server, unless one with that host already exists.
+    /// `-debugServer "host:port|user|password|sha256[|tls-name]"`: pin the
+    /// fingerprint and save the server, unless one with that host exists.
     static func seed(_ model: AppModel) async {
         guard let spec = value("-debugServer") else { return }
         let parts = spec.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-        guard parts.count == 4 else { return }
+        guard parts.count == 4 || parts.count == 5 else { return }
         if let existing = model.profiles.first(where: { $0.host == parts[0] }) {
             model.selection = existing.id
             return
@@ -27,15 +27,16 @@ enum DebugHooks {
         struct Resolved: Decodable, Sendable { let addresses: [String]; let serverName: String }
         guard let resolved: Resolved = try? await Core.call("resolve", ["host": .string(parts[0])]) else { return }
         let address = resolved.addresses.first { !$0.hasPrefix("[") } ?? resolved.addresses[0]
+        let serverName = parts.count == 5 ? parts[4] : resolved.serverName
         _ = try? await Core.call("trust_import", [
             "state_dir": .string(Paths.state.path),
-            "server": ["address": .string(address), "server_name": .string(resolved.serverName)],
+            "server": ["address": .string(address), "server_name": .string(serverName)],
             "sha256": .string(parts[3]),
         ], as: EmptyReply.self)
         await model.refreshPins()
         model.add(
             ServerProfile(name: "Debug", host: parts[0], address: address,
-                          serverName: resolved.serverName, username: parts[1]),
+                          serverName: serverName, username: parts[1]),
             password: parts[2])
     }
 
