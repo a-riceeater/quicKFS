@@ -20,6 +20,7 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 zeroize = { workspace = true, features = ["serde"] }
+quickfs-cache = { path = "../../../crates/cache" }
 quickfs-client-core = { path = "../../../crates/client-core" }
 quickfs-macos-support = { path = "../../../crates/macos-support" }
 quickfs-protocol = { path = "../../../crates/protocol" }

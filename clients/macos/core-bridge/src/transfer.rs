@@ -1860,7 +1860,7 @@ pub async fn write_at(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use async_trait::async_trait;
     use quickfs_client_core::{CreatedFile, OpenedFile, RangeRead, WriteResult};
@@ -1872,7 +1872,7 @@ mod tests {
     /// An in-memory server whose reads and writes fail on request, the way a
     /// stalled link makes them fail.
     #[derive(Default)]
-    struct FlakyFs {
+    pub(crate) struct FlakyFs {
         files: Mutex<HashMap<NodeId, Vec<u8>>>,
         names: Mutex<HashMap<Vec<u8>, NodeId>>,
         handles: Mutex<HashMap<FileHandle, NodeId>>,
@@ -1891,7 +1891,7 @@ mod tests {
     }
 
     impl FlakyFs {
-        fn with_file(node: NodeId, data: Vec<u8>) -> Self {
+        pub(crate) fn with_file(node: NodeId, data: Vec<u8>) -> Self {
             let fs = Self::default();
             lock(&fs.files).insert(node, data);
             fs
@@ -2039,7 +2039,14 @@ mod tests {
                     return Err(Self::stalled());
                 }
             }
-            let node = lock(&self.handles)[&handle];
+            // Read-ahead may still read a handle after it closed; a real
+            // server answers that with an error, not a crash.
+            let Some(node) = lock(&self.handles).get(&handle).copied() else {
+                return Err(ClientError::Server(
+                    quickfs_protocol::ErrorCode::InvalidHandle,
+                    "closed".into(),
+                ));
+            };
             let files = lock(&self.files);
             let data = &files[&node];
             let start = (offset as usize).min(data.len());
@@ -2105,7 +2112,7 @@ mod tests {
         }
     }
 
-    fn session(fs: Arc<FlakyFs>, tuning: Tuning) -> Arc<Session> {
+    pub(crate) fn session(fs: Arc<FlakyFs>, tuning: Tuning) -> Arc<Session> {
         Arc::new(Session::new(
             fs,
             FilesystemCapabilities {

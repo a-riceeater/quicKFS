@@ -15,9 +15,10 @@ mod model;
 mod pipeline;
 mod platform;
 mod session;
+mod stream;
 mod transfer;
 
-pub use ffi::{quickfs_bridge_call, quickfs_bridge_free};
+pub use ffi::{quickfs_bridge_call, quickfs_bridge_free, quickfs_bridge_stream_read};
 
 use model::{BridgeError, BridgeResult, Endpoint, TrustSpec, node_id};
 use quickfs_client_core::{
@@ -211,6 +212,18 @@ enum Request {
     CacheClear {
         cache_dir: PathBuf,
     },
+    /// Open a file for random-access reads through the session's cached
+    /// view; bytes come back through `quickfs_bridge_stream_read`.
+    StreamOpen {
+        session: u64,
+        node: Uuid,
+        cache_dir: PathBuf,
+        #[serde(default)]
+        cache_max_bytes: Option<u64>,
+    },
+    StreamClose {
+        stream: u64,
+    },
 }
 
 const fn default_directory_mode() -> u32 {
@@ -247,6 +260,17 @@ pub fn call_json(request: &str) -> String {
         Err(error) => json!({ "error": { "code": error.code(), "message": error.to_string() } }),
     };
     value.to_string()
+}
+
+/// Read up to `capacity` bytes of an open stream, or the JSON error reply
+/// `call_json` would have sent. The safe core of the binary read ABI: media
+/// arrives as raw bytes, never hex inside JSON.
+pub fn stream_read(stream: u64, offset: u64, capacity: u64) -> Result<Vec<u8>, String> {
+    runtime()
+        .and_then(|runtime| runtime.block_on(stream::read(stream, offset, capacity)))
+        .map_err(|error| {
+            json!({ "error": { "code": error.code(), "message": error.to_string() } }).to_string()
+        })
 }
 
 async fn dispatch(
@@ -326,7 +350,10 @@ async fn dispatch(
             )
             .await
         }
-        Request::Disconnect { session } => Ok(session::disconnect(session)),
+        Request::Disconnect { session } => {
+            stream::forget_session(session);
+            Ok(session::disconnect(session))
+        }
         Request::Ping { session: id } => session::ping(&*session::session(id)?).await,
         Request::Capabilities { session: id } => {
             let session = session::session(id)?;
@@ -496,7 +523,17 @@ async fn dispatch(
             Ok(json!({ "link": session.filesystem.link_stats() }))
         }
         Request::CacheUsage { cache_dir } => cache::usage(&cache_dir),
-        Request::CacheClear { cache_dir } => cache::clear(&cache_dir),
+        Request::CacheClear { cache_dir } => {
+            stream::release_caches(&cache_dir)?;
+            cache::clear(&cache_dir)
+        }
+        Request::StreamOpen {
+            session,
+            node,
+            cache_dir,
+            cache_max_bytes,
+        } => stream::open(session, node, &cache_dir, cache_max_bytes).await,
+        Request::StreamClose { stream: id } => stream::close(id).await,
     }
 }
 

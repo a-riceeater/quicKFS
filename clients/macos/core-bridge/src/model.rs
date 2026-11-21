@@ -26,6 +26,12 @@ pub enum BridgeError {
     UnknownTransfer,
     #[error("cancelled")]
     Cancelled,
+    #[error("this stream has closed; open the file again")]
+    UnknownStream,
+    #[error("{0}")]
+    Busy(String),
+    #[error("{0}")]
+    Cache(#[from] quickfs_cache::CacheError),
 }
 
 pub type BridgeResult<T> = Result<T, BridgeError>;
@@ -66,6 +72,9 @@ impl BridgeError {
             Self::UnknownSession => "session".into(),
             Self::UnknownTransfer => "transfer".into(),
             Self::Cancelled => "cancelled".into(),
+            Self::UnknownStream => "stream".into(),
+            Self::Busy(_) => "busy".into(),
+            Self::Cache(_) => "cache".into(),
         }
     }
 }

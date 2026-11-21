@@ -45,6 +45,10 @@ pub struct Session {
     /// What an extra connection needs to log in, held in zeroizing memory
     /// like the resilient layer's own reconnect copy.
     login: Option<Login>,
+    /// The server certificate's SHA-256, which keys the streaming cache.
+    /// Known up front for a pinned server; read once with a handshake
+    /// otherwise.
+    identity: tokio::sync::OnceCell<[u8; 32]>,
 }
 
 struct Login {
@@ -100,7 +104,45 @@ impl Session {
             tuning,
             extra: tokio::sync::Mutex::new(Vec::new()),
             login: None,
+            identity: tokio::sync::OnceCell::new_with(Some([7; 32])),
         }
+    }
+
+    /// Who the session authenticated as; scopes cached data to one account.
+    pub fn username(&self) -> &str {
+        self.login
+            .as_ref()
+            .map_or("test", |login| login.username.as_str())
+    }
+
+    /// The server certificate's SHA-256 fingerprint. A pinned server's pin is
+    /// that fingerprint already; a server trusted by name costs one extra
+    /// handshake, once per session, the same check the mount makes.
+    pub async fn server_identity(&self) -> BridgeResult<[u8; 32]> {
+        self.identity
+            .get_or_try_init(|| async {
+                let login = self
+                    .login
+                    .as_ref()
+                    .ok_or_else(|| BridgeError::invalid("this session has no server identity"))?;
+                if let ServerTrust::Pinned(fingerprint) = &login.trust {
+                    return Ok(*fingerprint);
+                }
+                let check = login
+                    .trust
+                    .connect_using(
+                        login.server,
+                        &login.server_name,
+                        login.timeout,
+                        login.congestion,
+                    )
+                    .await?;
+                let fingerprint = check.peer_certificate_fingerprint();
+                check.close();
+                Ok(fingerprint?)
+            })
+            .await
+            .copied()
     }
 
     /// Up to `wanted` extra connections, opening missing ones in parallel.
@@ -149,6 +191,14 @@ fn with_sessions<T>(body: impl FnOnce(&mut HashMap<u64, Arc<Session>>) -> T) -> 
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     body(guard.get_or_insert_with(HashMap::new))
+}
+
+/// Make a test session reachable by id, as `connect` does.
+#[cfg(test)]
+pub fn register(session: Arc<Session>) -> u64 {
+    let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    with_sessions(|sessions| sessions.insert(id, session));
+    id
 }
 
 pub fn session(id: u64) -> BridgeResult<Arc<Session>> {
@@ -210,6 +260,7 @@ pub async fn connect(
                 tuning,
                 extra: tokio::sync::Mutex::new(Vec::new()),
                 login: Some(login),
+                identity: tokio::sync::OnceCell::new(),
             }),
         )
     });

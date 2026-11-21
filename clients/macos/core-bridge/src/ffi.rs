@@ -31,6 +31,51 @@ pub unsafe extern "C" fn quickfs_bridge_call(request: *const c_char) -> *mut c_c
         .into_raw()
 }
 
+/// Read up to `capacity` bytes of stream `stream` at `offset` into `buffer`,
+/// storing the count in `*length`. Returns null on success (a count below
+/// `capacity` means the end of the file), or an owned JSON error reply to
+/// release with [`quickfs_bridge_free`]. Blocks the calling thread.
+///
+/// # Safety
+/// `buffer` must be valid for writes of `capacity` bytes and `length` valid
+/// for one `usize` write, both for the duration of the call. Either may be
+/// null only when `capacity` is zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn quickfs_bridge_stream_read(
+    stream: u64,
+    offset: u64,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        crate::stream_read(stream, offset, u64::try_from(capacity).unwrap_or(u64::MAX))
+    })
+    .unwrap_or_else(|_| {
+        Err(r#"{"error":{"code":"panic","message":"the quicKFS core failed unexpectedly"}}"#.into())
+    });
+    match result {
+        Ok(data) => {
+            let count = data.len().min(capacity);
+            if count > 0 && !buffer.is_null() {
+                // SAFETY: the caller guarantees `capacity` writable bytes and
+                // `count <= capacity`; the source is a separate allocation.
+                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, count) };
+            }
+            if !length.is_null() {
+                // SAFETY: the caller guarantees `length` is writable.
+                unsafe { length.write(count) };
+            }
+            std::ptr::null_mut()
+        }
+        Err(reply) => CString::new(reply)
+            .unwrap_or_else(|_| {
+                c"{\"error\":{\"code\":\"panic\",\"message\":\"invalid reply\"}}".to_owned()
+            })
+            .into_raw(),
+    }
+}
+
 /// Release a reply returned by [`quickfs_bridge_call`]. Null is ignored.
 ///
 /// # Safety

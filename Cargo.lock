@@ -1256,6 +1256,7 @@ dependencies = [
  "async-trait",
  "futures",
  "hex",
+ "quickfs-cache",
  "quickfs-client-core",
  "quickfs-common",
  "quickfs-macos-support",
