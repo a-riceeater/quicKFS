@@ -36,8 +36,13 @@ struct ServerBrowser: View {
     var body: some View {
         NavigationStack(path: path) {
             FolderView(crumb: browser.path[0], title: profile.name, state: state)
+                .environment(ui)
                 .navigationDestination(for: BrowserModel.Crumb.self) { crumb in
+                    // On iPhone the split view folds this stack into its own,
+                    // and a pushed view inherits the split view's environment,
+                    // not this stack's, so each folder gets the UI state itself.
                     FolderView(crumb: crumb, title: crumb.name, state: state)
+                        .environment(ui)
                 }
         }
         .environment(ui)
