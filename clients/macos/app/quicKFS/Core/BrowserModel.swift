@@ -185,6 +185,9 @@ final class BrowserModel {
     var selection: Set<UUID> = []
     var sortOrder = [KeyPathComparator(\RemoteNode.displayName, comparator: .localizedStandard)]
     var showHidden = false
+    /// The last listing of each folder on the current path, so returning to
+    /// one shows it at once while it refreshes. Bounded by the path depth.
+    private(set) var listings: [UUID: [RemoteNode]] = [:]
 
     init(connection: ServerConnection, log: ConsoleLog) {
         self.connection = connection
@@ -195,7 +198,15 @@ final class BrowserModel {
     var writable: Bool { connection.capabilities?.writable ?? false }
     var selected: [RemoteNode] { entries.filter { selection.contains($0.id) } }
 
-    var visibleEntries: [RemoteNode] {
+    var visibleEntries: [RemoteNode] { visible(entries) }
+
+    /// What a folder on the current path shows: the live listing for the
+    /// current folder, the last one seen for an ancestor.
+    func visibleEntries(in node: UUID) -> [RemoteNode] {
+        node == directory ? visibleEntries : visible(listings[node] ?? [])
+    }
+
+    private func visible(_ entries: [RemoteNode]) -> [RemoteNode] {
         let filtered = showHidden ? entries : entries.filter { !$0.displayName.hasPrefix(".") }
         let sorted = filtered.sorted(using: sortOrder)
         // Folders first, as Finder does when sorting by name.
@@ -209,17 +220,23 @@ final class BrowserModel {
     // MARK: Navigation
 
     func reload() async {
+        let target = directory
         loading = true
         defer { loading = false }
         do {
             let listing: DirectoryListing = try await connection.request(
-                "list", ["node": .uuid(directory)])
+                "list", ["node": .uuid(target)])
+            if path.contains(where: { $0.node == target }) { listings[target] = listing.entries }
+            // Navigated elsewhere while this listing was in flight.
+            guard directory == target else { return }
             entries = listing.entries
             error = nil
             selection = selection.filter { id in entries.contains { $0.id == id } }
-        } catch let failure as CoreError {
+        } catch let failure as CoreError where directory == target {
             error = failure
             entries = []
+        } catch is CoreError {
+            // A failure for a folder no longer shown is not worth reporting.
         } catch {
             self.error = CoreError(code: "client", message: error.localizedDescription)
         }
@@ -281,11 +298,22 @@ final class BrowserModel {
         } catch {}
     }
 
+    /// Show `crumbs` (the root first) as the current path, the way a
+    /// navigation stack pushes and pops folders, and refresh the listing.
+    func navigate(to crumbs: [Crumb]) {
+        guard crumbs != path, crumbs.first?.node == RemoteNode.rootID else { return }
+        go(to: crumbs)
+        Task { await reload() }
+    }
+
     private func go(to crumbs: [Crumb]) {
         backStack.append(path)
         forwardStack.removeAll()
         path = crumbs
         selection = []
+        let onPath = Set(crumbs.map(\.node))
+        listings = listings.filter { onPath.contains($0.key) }
+        entries = listings[directory] ?? []
     }
 
     // MARK: Mutations
