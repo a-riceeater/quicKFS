@@ -86,6 +86,7 @@ The main components are:
 - `clients/macos/client-cli`: trust, authentication, administration, and direct protocol diagnostics;
 - `crates/client-commands`: the remote file commands shared by `quickfs-client-cli` and `quickfs remote`;
 - `clients/macos/app` and `clients/macos/core-bridge`: the native SwiftUI app for macOS 26 and the C-ABI bridge it uses to reach `client-core` — a static library on macOS and `quickfs_core_bridge.dll` on Windows;
+- `clients/ios`: the native SwiftUI app for iPhone and iPad, built on the same bridge and the macOS app's Swift core, with streaming previews;
 - `clients/windows/filesystem-winfsp`: native WinFsp callbacks, path and `NTSTATUS` translation, links as reparse points, xattrs as named streams, and the Windows mount lifecycle;
 - `clients/windows/client-cli`: the `quickfs` executable — mount, unmount, remote file commands, pairing, and trust management.
 
