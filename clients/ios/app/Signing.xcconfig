@@ -1,0 +1,15 @@
+// Code signing for the quicKFS iOS app.
+//
+// Simulator builds need no signing. To run on an iPhone or iPad, create
+// Local.xcconfig next to this file (it is gitignored) with your team, for
+// example:
+//
+//   DEVELOPMENT_TEAM = ABCDE12345
+//
+// Xcode then manages the provisioning profile. Run `xcodegen generate`
+// afterwards.
+
+CODE_SIGN_STYLE = Automatic
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

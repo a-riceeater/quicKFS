@@ -1,0 +1,74 @@
+# Generate the Xcode project with `xcodegen generate` from this directory.
+# The .xcodeproj is a build artifact and is not committed.
+#
+# The app compiles the macOS app's platform-neutral Core sources directly
+# (listed below) so both apps share one bridge client, one data model, and
+# one transfer engine. Everything under quicKFS/ here is iOS only.
+name: quicKFS-iOS
+options:
+  bundleIdPrefix: org.quickfs
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+settings:
+  base:
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    SWIFT_VERSION: 6.0
+    # The Rust core is built for arm64 devices and Apple silicon simulators.
+    ARCHS: arm64
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+targets:
+  quicKFS:
+    type: application
+    platform: iOS
+    sources:
+      - path: quicKFS
+      - path: ../../macos/app/quicKFS/Core/Bridge.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/BrowserModel.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/ConsoleLog.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/Format.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/Keychain.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/Models.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/Pairing.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/Paths.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/PreviewLoader.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/RateMeter.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/ServerConnection.swift
+        group: Shared
+      - path: ../../macos/app/quicKFS/Core/Telemetry.swift
+        group: Shared
+    preBuildScripts:
+      - name: Build quicKFS core
+        script: exec "${PROJECT_DIR}/scripts/build-core.sh"
+        basedOnDependencyAnalysis: false
+    # Signing comes from Signing.xcconfig, which includes an optional,
+    # gitignored Local.xcconfig with your own team.
+    configFiles:
+      Debug: Signing.xcconfig
+      Release: Signing.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: quicKFS
+        PRODUCT_BUNDLE_IDENTIFIER: org.quickfs.client.ios
+        INFOPLIST_FILE: quicKFS/Resources/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_OBJC_BRIDGING_HEADER: ../../macos/app/quicKFS/Bridge/quicKFS-Bridging-Header.h
+        LIBRARY_SEARCH_PATHS: $(BUILT_PRODUCTS_DIR)/quickfs-core
+        OTHER_LDFLAGS: -lquickfs_core_bridge -framework Security -framework SystemConfiguration -framework CoreFoundation
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SWIFT_STRICT_CONCURRENCY: complete
+        DEAD_CODE_STRIPPING: YES
