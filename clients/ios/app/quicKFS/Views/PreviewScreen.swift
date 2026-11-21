@@ -9,6 +9,11 @@ import SwiftUI
 /// after the first block instead of after the whole file. Images stream into
 /// memory. Everything else downloads to a private temporary file for Quick
 /// Look, as on the Mac. The first bytes are always one tap away as hex.
+///
+/// The screen owns the player and the document fetch and ends them only when
+/// the preview closes. Not on `onDisappear`: entering full screen video, or
+/// any full-screen presentation, takes this screen out of the window, and
+/// SwiftUI reports that as disappearing while playback must go on.
 struct PreviewScreen: View {
     enum Mode { case media, image, document }
 
@@ -18,14 +23,20 @@ struct PreviewScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var mode: Mode
+    @State private var playback: MediaPlayback?
+    @State private var document: PreviewLoader?
     @State private var showsBytes = false
     @State private var downloaded = false
 
-    init(node: RemoteNode, connection: ServerConnection, browser: BrowserModel) {
+    init(node: RemoteNode, connection: ServerConnection, browser: BrowserModel, cacheBytes: UInt64) {
         self.node = node
         self.connection = connection
         self.browser = browser
-        _mode = State(initialValue: Self.mode(for: node))
+        let mode = Self.mode(for: node)
+        _mode = State(initialValue: mode)
+        _playback = State(initialValue: mode == .media
+            ? MediaPlayback(node: node, connection: connection, cacheBytes: cacheBytes) : nil)
+        _document = State(initialValue: mode == .document ? PreviewLoader(node: node, connection: connection) : nil)
     }
 
     static func mode(for node: RemoteNode) -> Mode {
@@ -41,7 +52,7 @@ struct PreviewScreen: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Close", systemImage: "xmark") { dismiss() }
+                        Button("Close", systemImage: "xmark", action: close)
                     }
                     ToolbarItemGroup(placement: .primaryAction) {
                         Button("Bytes", systemImage: "number") { showsBytes = true }
@@ -63,15 +74,47 @@ struct PreviewScreen: View {
     private var content: some View {
         switch mode {
         case .media:
-            MediaPreview(node: node, connection: connection, cacheBytes: model.streamCacheBytes) {
-                mode = .document
-            }
+            if let playback { MediaPreview(playback: playback, fallback: openAsDocument) }
         case .image:
-            ImagePreview(node: node, connection: connection, cacheBytes: model.streamCacheBytes) {
-                mode = .document
-            }
+            ImagePreview(node: node, connection: connection, cacheBytes: model.streamCacheBytes,
+                         fallback: openAsDocument)
         case .document:
-            DocumentPreview(node: node, connection: connection)
+            if let document { DocumentPreview(loader: document) }
+        }
+    }
+
+    /// Release the stream or the temporary copy, then leave.
+    private func close() {
+        playback?.close()
+        document?.close()
+        dismiss()
+    }
+
+    private func openAsDocument() {
+        playback?.close()
+        playback = nil
+        if document == nil { document = PreviewLoader(node: node, connection: connection) }
+        mode = .document
+    }
+}
+
+extension View {
+    /// Run `action` the first time this view appears, and never again when it
+    /// reappears after a full-screen presentation covered it.
+    func onFirstAppear(_ action: @escaping () -> Void) -> some View {
+        modifier(FirstAppear(action: action))
+    }
+}
+
+private struct FirstAppear: ViewModifier {
+    let action: () -> Void
+    @State private var done = false
+
+    func body(content: Content) -> some View {
+        content.onAppear {
+            guard !done else { return }
+            done = true
+            action()
         }
     }
 }
@@ -79,13 +122,8 @@ struct PreviewScreen: View {
 // MARK: - Media
 
 private struct MediaPreview: View {
-    @State private var playback: MediaPlayback
+    let playback: MediaPlayback
     let fallback: () -> Void
-
-    init(node: RemoteNode, connection: ServerConnection, cacheBytes: UInt64, fallback: @escaping () -> Void) {
-        _playback = State(initialValue: MediaPlayback(node: node, connection: connection, cacheBytes: cacheBytes))
-        self.fallback = fallback
-    }
 
     var body: some View {
         ZStack {
@@ -102,8 +140,9 @@ private struct MediaPreview: View {
                 .environment(\.colorScheme, .dark)
             }
         }
-        .task { await playback.open() }
-        .onDisappear { playback.close() }
+        // Not `.task`: hiding the view cancels a task, and the player must
+        // keep its stream while full screen covers this view.
+        .onFirstAppear { Task { await playback.open() } }
     }
 }
 
@@ -116,6 +155,9 @@ private struct PlayerView: UIViewControllerRepresentable {
         controller.player = player
         controller.allowsPictureInPicturePlayback = true
         controller.canStartPictureInPictureAutomaticallyFromInline = true
+        #if DEBUG
+        DebugHooks.enterFullScreenIfRequested(controller)
+        #endif
         return controller
     }
 
@@ -212,11 +254,7 @@ private struct ZoomableImage: UIViewRepresentable {
 // MARK: - Document
 
 private struct DocumentPreview: View {
-    @State private var loader: PreviewLoader
-
-    init(node: RemoteNode, connection: ServerConnection) {
-        _loader = State(initialValue: PreviewLoader(node: node, connection: connection))
-    }
+    let loader: PreviewLoader
 
     var body: some View {
         ZStack {
@@ -257,8 +295,7 @@ private struct DocumentPreview: View {
                 }
             }
         }
-        .task { await loader.open() }
-        .onDisappear { loader.close() }
+        .onFirstAppear { Task { await loader.open() } }
     }
 }
 

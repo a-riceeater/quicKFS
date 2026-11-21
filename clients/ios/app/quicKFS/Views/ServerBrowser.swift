@@ -53,7 +53,8 @@ struct ServerBrowser: View {
             #endif
         }
         .fullScreenCover(item: $ui.previewing) { node in
-            PreviewScreen(node: node, connection: state.connection, browser: browser)
+            PreviewScreen(node: node, connection: state.connection, browser: browser,
+                          cacheBytes: model.streamCacheBytes)
         }
         .sheet(item: $ui.prompt) { prompt in NamePromptSheet(prompt: prompt, browser: browser, server: profile.id) }
         .sheet(item: $ui.inspecting) { node in

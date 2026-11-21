@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #if DEBUG
-import Foundation
+import UIKit
 
 /// Launch arguments that drive the app without touches, for checks in the
 /// simulator on debug builds only (`xcrun simctl launch … -debugServer …`).
@@ -55,6 +55,19 @@ enum DebugHooks {
         if arguments.contains("-debugTransfers") {
             try? await Task.sleep(for: .seconds(1))
             ui.showingTransfers = true
+        }
+    }
+
+    /// `-debugFullScreen`: put the player into full screen a few seconds in,
+    /// as tapping its full-screen button would. AVKit has no public call for
+    /// this, so debug builds use its private one.
+    static func enterFullScreenIfRequested(_ controller: UIViewController) {
+        guard arguments.contains("-debugFullScreen") else { return }
+        let selector = NSSelectorFromString("enterFullScreenAnimated:completionHandler:")
+        Task { @MainActor [weak controller] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let controller, controller.responds(to: selector) else { return }
+            controller.perform(selector, with: NSNumber(value: true), with: nil)
         }
     }
 
