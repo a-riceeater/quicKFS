@@ -24,14 +24,16 @@ A video does not need to be downloaded before it plays. The player is given a pr
 - `quickfs_bridge_stream_read(stream, offset, buffer, capacity, &length)` copies raw bytes into the caller's buffer. It returns null on success, or a JSON error reply. No hex, no JSON, no copy beyond the one into the buffer.
 - `stream_close {stream}` releases the file.
 
-Reads go through client-core's `CachedFilesystem`, the same layer the Mac's mount uses, so a player reading forward gets its adaptive read-ahead: the next blocks are already in flight before AVFoundation asks for them. Every block also lands in a persistent cache, so seeking back or watching again costs no network.
+Reads go through client-core's `CachedFilesystem`, the same layer the Mac's mount uses, so every block lands in a persistent cache and seeking back or watching again costs no network.
 
-Resource use, per server session:
+Read-ahead belongs to the stream, not the cache. AVFoundation does not read front to back: about every half second of video it opens a request at the next segment, takes a megabyte or two, cancels, and fills the gap behind it later. The cache's sequential detector, tuned for the kernel's steady page-ins, took every jump for a random read, so each segment started with a cold fetch (100 to 350 ms over Wi-Fi), and high-bitrate video stalled. The stream instead follows the furthest byte asked for and keeps the next 64 MiB fetched, whatever order the requests come in, starting over at a real seek. Measured with a 95 Mb/s 4K clip from a LAN server over Wi-Fi (30 ms round trips): before, the player reached 143 MiB in 60 s with constant buffering; after, 664 MiB in 60 s, which is real time, with no stalls. `cargo run --release -p quickfs-core-bridge --example stream-bench` reads a file the way a player does and reports every wait.
+
+Resource use, per stream:
 
 | What | Bound |
 | --- | --- |
-| Cache and read-ahead block | 2 MiB (the mount uses 16 MiB; a player cannot start before its first block arrives, so smaller blocks start sooner: about 0.5 s on a 4 MB/s relayed link) |
-| Read-ahead window | grows to at most 64 MiB, with at most 32 MiB in flight on the wire |
+| Cache block | 2 MiB (the mount uses 16 MiB; a player cannot start before its first block arrives, so smaller blocks start sooner) |
+| Read-ahead | 64 MiB past the furthest byte read (about 5 s at 100 Mb/s), at most 6 blocks (12 MiB) on the wire, so a read after a seek is not stuck behind a convoy |
 | One read reply | at most 4 MiB; the player takes 1 MiB per response |
 | Disk | the streaming cache budget per server, epoch, and account (2 GiB by default, set in Settings). It lives in Caches, which iOS may also clear when storage runs low |
 
