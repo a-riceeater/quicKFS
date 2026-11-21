@@ -18,7 +18,9 @@ SwiftUI app ── JSON over a C ABI ──────► quickfs-core-bridge (
 
 ## Streaming previews
 
-A video does not need to be downloaded before it plays. The player is given a private URL scheme, so AVFoundation asks the app, not the network, for each byte range it wants: the header, the index (often at the end of the file), then the stretch after the playhead, and a new stretch on every seek. `MediaPlayback` answers those ranges from a *stream*, a file the bridge keeps open:
+A video does not need to be downloaded before it plays. Between the phone and the server nothing changes: bytes travel over the same authenticated QUIC connection as everything else. Inside the phone, `MediaPlayback` hands AVPlayer an `http://127.0.0.1:<port>/<random>/<name>` URL served by `MediaHTTPServer`, a small HTTP/1.1 server that answers Range requests from a *stream*, a file the bridge keeps open. The listener is bound to the loopback address, so nothing off the device can reach it, and it only answers the random per-preview path, so other apps cannot read the file. It stops when the preview closes.
+
+Why HTTP on loopback instead of a custom URL scheme with `AVAssetResourceLoader`: with long, high-bitrate videos the custom-scheme path would ask for the head of a segment, never request the rest, and wait for it forever, until the person seeked. Every request it made had been answered. AVPlayer's HTTP stack schedules its own range requests and cancels them by closing the connection, which also stops the reads here. On the same 95 Mb/s 4K clip over Wi-Fi, three 60 s runs went from three stalls (two never recovering) to playing in real time, with one recovered stall in three runs. From a server on the same machine there were no stalls at all.
 
 - `stream_open {session, node, cache_dir, cache_max_bytes}` returns `{stream, size, revision}`.
 - `quickfs_bridge_stream_read(stream, offset, buffer, capacity, &length)` copies raw bytes into the caller's buffer. It returns null on success, or a JSON error reply. No hex, no JSON, no copy beyond the one into the buffer.
