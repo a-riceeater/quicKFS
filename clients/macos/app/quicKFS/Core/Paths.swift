@@ -28,6 +28,7 @@ enum Paths {
         return base.appendingPathComponent("org.quickfs.client", isDirectory: true)
     }()
 
+    #if os(macOS)
     /// Mounts default to ~/Volumes/<server> so no administrator rights are needed.
     static var defaultMountRoot: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(
@@ -37,6 +38,7 @@ enum Paths {
     static var mountHelper: URL {
         Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/quickfs-mount")
     }
+    #endif
 
     static func prepare() {
         let manager = FileManager.default
@@ -48,6 +50,19 @@ enum Paths {
             // tighten folders left behind by older builds too.
             try? manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         }
+    }
+
+    /// Where a saved enterprise CA bundle is now. iOS moves the app's
+    /// container when the app updates, so a bundle the app keeps in its own
+    /// `certificates` folder is found again by name.
+    static func certificateLocation(_ path: String) -> String {
+        #if os(iOS)
+        guard !FileManager.default.fileExists(atPath: path) else { return path }
+        return applicationSupport.appendingPathComponent("certificates", isDirectory: true)
+            .appendingPathComponent((path as NSString).lastPathComponent).path
+        #else
+        return path
+        #endif
     }
 
     /// A Finder-safe folder name: no slashes or colons, never empty.

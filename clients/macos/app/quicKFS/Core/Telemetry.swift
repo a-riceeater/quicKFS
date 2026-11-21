@@ -62,6 +62,22 @@ struct TelemetrySample: Identifiable, Sendable {
     let lossFraction: Double
 }
 
+/// One link snapshot from the mount helper and when it arrived.
+struct LinkReading: Equatable {
+    let link: LinkSnapshot
+    let at: Date
+    let helperStarted: Date
+}
+
+/// A mounted volume's own connection, which telemetry adds to the
+/// browsing session's. Only platforms that mount provide one.
+@MainActor
+protocol MountLinkSource: AnyObject {
+    var isMounted: Bool { get }
+    var linkReading: LinkReading? { get }
+    func requestLinkStats()
+}
+
 /// Live link telemetry for one server.
 ///
 /// Each second it samples both links the app may have open: its own
@@ -89,14 +105,15 @@ final class Telemetry {
     @ObservationIgnored private var watchers = 0
     @ObservationIgnored private var task: Task<Void, Never>?
     private let connection: ServerConnection
-    private let mount: MountController
+    /// The mount helper's link, where the platform mounts at all.
+    private let mount: (any MountLinkSource)?
     private let log: ConsoleLog
 
     static let window = 120
     /// A mount reply older than this no longer counts as live.
     private static let mountReplyLifetime: TimeInterval = 3
 
-    init(connection: ServerConnection, mount: MountController, log: ConsoleLog) {
+    init(connection: ServerConnection, mount: (any MountLinkSource)?, log: ConsoleLog) {
         self.connection = connection
         self.mount = mount
         self.log = log
@@ -106,7 +123,10 @@ final class Telemetry {
     var peakReceive: Double { samples.map(\.receiveRate).max() ?? 0 }
     var peakSend: Double { samples.map(\.sendRate).max() ?? 0 }
     /// When the running mount helper started, from its own report.
-    var mountStarted: Date? { mount.isMounted ? mount.linkReading?.helperStarted : nil }
+    var mountStarted: Date? {
+        guard let mount, mount.isMounted else { return nil }
+        return mount.linkReading?.helperStarted
+    }
 
     /// Standard deviation of recent round-trip times, in milliseconds.
     var jitterMs: Double {
@@ -147,7 +167,7 @@ final class Telemetry {
     private func sample() async {
         // Ask the helper first: its reply usually arrives while the session
         // request is in flight, so both readings describe the same second.
-        mount.requestLinkStats()
+        mount?.requestLinkStats()
         var readings: [LinkMixer.Link: LinkMixer.Reading] = [:]
         if connection.isOnline {
             struct Reply: Decodable, Sendable { let link: LinkSnapshot? }
@@ -155,7 +175,7 @@ final class Telemetry {
                 readings[.session] = .init(snapshot: link, at: .now)
             }
         }
-        if mount.isMounted, let reading = mount.linkReading,
+        if let mount, mount.isMounted, let reading = mount.linkReading,
            Date.now.timeIntervalSince(reading.at) < Self.mountReplyLifetime {
             readings[.mount] = .init(snapshot: reading.link, at: reading.at)
         }

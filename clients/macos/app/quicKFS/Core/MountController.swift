@@ -4,13 +4,6 @@ import Darwin
 import Foundation
 import Observation
 
-/// One link snapshot from the mount helper and when it arrived.
-struct LinkReading: Equatable {
-    let link: LinkSnapshot
-    let at: Date
-    let helperStarted: Date
-}
-
 /// One `quickfs-mount` helper process for one server.
 ///
 /// The helper owns the FUSE session for its whole lifetime: SIGINT starts a
@@ -310,3 +303,5 @@ final class MountController {
         return arguments
     }
 }
+
+extension MountController: MountLinkSource {}

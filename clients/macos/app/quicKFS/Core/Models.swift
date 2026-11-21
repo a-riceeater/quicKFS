@@ -13,7 +13,8 @@ enum TrustMode: Codable, Hashable, Sendable {
     var request: JSONValue {
         switch self {
         case .pinned: ["kind": "pinned"]
-        case .enterpriseCA(let path): ["kind": "enterprise_ca", "certificate": .string(path)]
+        case .enterpriseCA(let path):
+            ["kind": "enterprise_ca", "certificate": .string(Paths.certificateLocation(path))]
         case .systemRoots: ["kind": "system_roots"]
         }
     }
@@ -119,6 +120,7 @@ struct ServerProfile: Codable, Identifiable, Hashable, Sendable {
         ["address": .string(address), "server_name": .string(serverName)]
     }
 
+    #if os(macOS)
     var mountpointURL: URL {
         if let path = mount.mountpoint, !path.isEmpty {
             return URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
@@ -126,6 +128,7 @@ struct ServerProfile: Codable, Identifiable, Hashable, Sendable {
         return Paths.defaultMountRoot.appendingPathComponent(
             Paths.safeFolderName(name), isDirectory: true)
     }
+    #endif
 }
 
 struct Capabilities: Decodable, Hashable, Sendable {

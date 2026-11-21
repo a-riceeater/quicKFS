@@ -169,27 +169,3 @@ private struct PermissionEditor: View {
         .onChange(of: node) { mode = node.mode & 0o7777 }
     }
 }
-
-extension Data {
-    init(hex: String) {
-        var bytes = [UInt8]()
-        bytes.reserveCapacity(hex.utf8.count / 2)
-        var high: UInt8?
-        for character in hex.utf8 {
-            let value: UInt8
-            switch character {
-            case 48...57: value = character - 48
-            case 97...102: value = character - 87
-            case 65...70: value = character - 55
-            default: continue
-            }
-            if let current = high {
-                bytes.append(current << 4 | value)
-                high = nil
-            } else {
-                high = value
-            }
-        }
-        self.init(bytes)
-    }
-}

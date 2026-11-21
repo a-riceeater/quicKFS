@@ -95,25 +95,6 @@ struct ServerGlyph: View {
     }
 }
 
-enum Format {
-    static func bytes(_ value: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(clamping: value), countStyle: .file)
-    }
-
-    static func milliseconds(_ value: Double) -> String {
-        value < 10 ? String(format: "%.1f ms", value) : String(format: "%.0f ms", value)
-    }
-
-    static func mode(_ mode: UInt32, directory: Bool) -> String {
-        let flags: [(UInt32, Character)] = [
-            (0o400, "r"), (0o200, "w"), (0o100, "x"),
-            (0o040, "r"), (0o020, "w"), (0o010, "x"),
-            (0o004, "r"), (0o002, "w"), (0o001, "x"),
-        ]
-        return String(directory ? "d" : "-") + String(flags.map { mode & $0.0 != 0 ? $0.1 : "-" })
-    }
-}
-
 /// A compact empty or message state: a large symbol, one line, optional actions.
 struct Placard<Actions: View>: View {
     let symbol: String

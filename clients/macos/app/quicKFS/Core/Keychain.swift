@@ -56,15 +56,18 @@ enum Keychain {
     }
 
     private static func baseQuery(_ profile: UUID) -> [String: Any] {
-        [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: profile.uuidString,
-            // The app is not sandboxed and has no keychain-access-group
-            // entitlement, so use the login keychain directly. Letting
-            // Security probe the data-protection keychain first can stall
-            // indefinitely for ad-hoc signed builds.
-            kSecUseDataProtectionKeychain as String: false,
         ]
+        #if os(macOS)
+        // The app is not sandboxed and has no keychain-access-group
+        // entitlement, so use the login keychain directly. Letting
+        // Security probe the data-protection keychain first can stall
+        // indefinitely for ad-hoc signed builds. iOS has only that keychain.
+        query[kSecUseDataProtectionKeychain as String] = false
+        #endif
+        return query
     }
 }
