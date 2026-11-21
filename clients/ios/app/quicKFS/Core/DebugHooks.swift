@@ -52,7 +52,15 @@ enum DebugHooks {
         if let path = value("-debugDownload"), let node = await node(at: path, browser: browser) {
             browser.download([node], into: Paths.downloads)
         }
-        if let panel = value("-debugPanel").flatMap(ServerPanel.Tab.init(rawValue:)) { ui.panel = panel }
+        if let panel = value("-debugPanel").flatMap(ServerPanel.Tab.init(rawValue:)) {
+            // With a preview open, `-debugPanelAfter <seconds>` lets it play first.
+            if let delay = value("-debugPanelAfter").flatMap(Double.init), ui.previewing != nil {
+                try? await Task.sleep(for: .seconds(delay))
+                ui.previewing = nil
+                try? await Task.sleep(for: .seconds(1))
+            }
+            ui.panel = panel
+        }
         if arguments.contains("-debugTransfers") {
             try? await Task.sleep(for: .seconds(1))
             ui.showingTransfers = true

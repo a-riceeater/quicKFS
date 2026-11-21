@@ -28,14 +28,15 @@ struct PreviewScreen: View {
     @State private var showsBytes = false
     @State private var downloaded = false
 
-    init(node: RemoteNode, connection: ServerConnection, browser: BrowserModel, cacheBytes: UInt64) {
+    init(node: RemoteNode, connection: ServerConnection, browser: BrowserModel, cacheBytes: UInt64,
+         log: ConsoleLog) {
         self.node = node
         self.connection = connection
         self.browser = browser
         let mode = Self.mode(for: node)
         _mode = State(initialValue: mode)
         _playback = State(initialValue: mode == .media
-            ? MediaPlayback(node: node, connection: connection, cacheBytes: cacheBytes) : nil)
+            ? MediaPlayback(node: node, connection: connection, cacheBytes: cacheBytes, log: log) : nil)
         _document = State(initialValue: mode == .document ? PreviewLoader(node: node, connection: connection) : nil)
     }
 

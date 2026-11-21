@@ -54,7 +54,7 @@ struct ServerBrowser: View {
         }
         .fullScreenCover(item: $ui.previewing) { node in
             PreviewScreen(node: node, connection: state.connection, browser: browser,
-                          cacheBytes: model.streamCacheBytes)
+                          cacheBytes: model.streamCacheBytes, log: state.log)
         }
         .sheet(item: $ui.prompt) { prompt in NamePromptSheet(prompt: prompt, browser: browser, server: profile.id) }
         .sheet(item: $ui.inspecting) { node in
